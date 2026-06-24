@@ -250,8 +250,9 @@ impl BorsTester {
             WebhookSecret::new(TEST_WEBHOOK_SECRET.to_string()),
             Some(oauth_client),
             ctx.clone(),
+            false,
         );
-        let app = create_app(state);
+        let app = create_app(state).await.unwrap();
         let bors = tokio::spawn(bors_process);
         (
             Self {

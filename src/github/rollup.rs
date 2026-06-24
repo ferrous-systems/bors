@@ -5,6 +5,7 @@ use crate::database::RegisterRollupMemberParams;
 use crate::github::api::client::GithubRepositoryClient;
 use crate::github::api::operations::MergeError;
 use crate::github::oauth::{OAuthClient, UserGitHubClient};
+use crate::github::{GitHubSession, OAuthAccessCode};
 use crate::permissions::PermissionType;
 use crate::server::ServerStateRef;
 use crate::utils::sort_queue::sort_queue_prs;
@@ -12,6 +13,7 @@ use anyhow::Context;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
+use axum_session::SessionNullSession;
 use futures::StreamExt;
 use itertools::Itertools;
 use rand::{Rng, distr::Alphanumeric};
@@ -23,19 +25,20 @@ use tracing::Instrument;
 /// Maximum number of PRs that can be rolled up at once.
 const ROLLUP_PR_LIMIT: u64 = 50;
 
-/// Query parameters received from GitHub's OAuth callback.
+/// Overlaps with query parameters received from GitHub's OAuth callback.
 ///
 /// Documentation: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#2-users-are-redirected-back-to-your-site-by-github
 #[derive(serde::Deserialize)]
-pub struct OAuthCallbackQuery {
+pub struct SubmitRollupQuery {
+    /// `Some` if `/rollup/submit` is used as the github oauth callback.
     /// Temporary code from GitHub to exchange for an access token (expires in 10m).
-    code: String,
-    /// State passed in the initial OAuth request - contains rollup info created from the queue page.
+    code: Option<OAuthAccessCode>,
+    /// Contains rollup info created from the queue page. Name chosen to overlap with OAuth state argument.
     state: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct OAuthRollupState {
+pub struct SubmitRollupState {
     pr_nums: Vec<u32>,
     repo_name: String,
     repo_owner: String,
@@ -102,29 +105,56 @@ where
     }
 }
 
-pub async fn oauth_callback_handler(
+pub async fn submit(
+    session: SessionNullSession,
     State(db): State<Arc<PgDbClient>>,
     State(oauth): State<Option<OAuthClient>>,
     State(ServerStateRef(state)): State<ServerStateRef>,
-    Query(callback): Query<OAuthCallbackQuery>,
-) -> Result<impl IntoResponse, RollupError> {
+    Query(rollup): Query<SubmitRollupQuery>,
+) -> Result<Response, RollupError> {
     let Some(oauth_client) = oauth else {
-        let error =
-            anyhow::anyhow!("OAuth not configured. Please set CLIENT_ID and CLIENT_SECRET.");
+        let error = anyhow::anyhow!(
+            "OAuth not configured. Please set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET."
+        );
         tracing::error!("{error}");
         return Err(error.into());
     };
 
-    let oauth_state: OAuthRollupState = serde_json::from_str(&callback.state)
-        .map_err(|_| anyhow::anyhow!("Invalid state parameter"))?;
+    if let Some(access_code) = rollup.code {
+        let access_token = oauth_client.get_github_access_token(access_code).await?;
+        GitHubSession::save(&session, access_token);
+    }
 
-    let repo_name = GithubRepoName::new(&oauth_state.repo_owner, &oauth_state.repo_name);
+    let Some(github_session) = GitHubSession::restore(&session) else {
+        tracing::info!("Missing gh access token, requesting gh auth");
+        return Ok(oauth_client
+            .request_authorization(
+                Some(rollup.state.as_str()),
+                Some(format!("{}/rollup/submit", state.get_web_url()).as_str()),
+            )
+            .into_response());
+    };
+
+    let rollup: SubmitRollupState =
+        serde_json::from_str(&rollup.state).context("Unable to deserialize state")?;
+
+    let authenticated_client =
+        oauth_client.get_authenticated_client(&github_session.access_token)?;
+    let repo_name = GithubRepoName::new(&rollup.repo_owner, &rollup.repo_name);
+
+    // don't 404 until after checking for the repo state to prevent timing-based detection
+    let is_invisible = !repo_name.is_visible_to_user(&authenticated_client).await?;
+
     let Some(repo_state) = state.get_repo(&repo_name) else {
         return Err(RollupError::BaseRepoNotFound { repo_name });
     };
 
+    if is_invisible {
+        return Err(RollupError::BaseRepoNotFound { repo_name });
+    }
+
     let user_client = oauth_client
-        .get_authenticated_client(repo_name.clone(), &callback.code)
+        .get_user_client(repo_name.clone(), authenticated_client)
         .await?;
 
     // The rollup author is expected to r+ the rollup, so they must have review permissions to
@@ -140,12 +170,12 @@ pub async fn oauth_callback_handler(
     let span = tracing::info_span!(
         "create_rollup",
         repo = %repo_name,
-        pr_nums = ?oauth_state.pr_nums
+        pr_nums = ?rollup.pr_nums
     );
 
     let pr = match create_rollup(
         db,
-        oauth_state,
+        rollup,
         state.get_web_url(),
         &repo_state.client,
         user_client,
@@ -175,12 +205,12 @@ pub async fn oauth_callback_handler(
 /// in the user's fork, then opens a PR to the upstream repository.
 async fn create_rollup(
     db: Arc<PgDbClient>,
-    rollup_state: OAuthRollupState,
+    rollup_state: SubmitRollupState,
     web_url: &str,
     gh_client: &GithubRepositoryClient,
     user_client: UserGitHubClient,
 ) -> Result<PullRequest, RollupError> {
-    let OAuthRollupState {
+    let SubmitRollupState {
         repo_name,
         repo_owner,
         mut pr_nums,
@@ -434,7 +464,7 @@ async fn create_rollup(
 #[cfg(test)]
 mod tests {
     use crate::bors::{PullRequestStatus, RollupMode};
-    use crate::github::rollup::OAuthRollupState;
+    use crate::github::rollup::SubmitRollupState;
     use crate::github::{GithubRepoName, PullRequestNumber};
     use crate::permissions::PermissionType;
     use crate::tests::{
@@ -1241,12 +1271,12 @@ also include this pls"
     }
 
     fn rollup_request(code: &str, repo: GithubRepoName, prs: &[PullRequestNumber]) -> ApiRequest {
-        let state = OAuthRollupState {
+        let state = SubmitRollupState {
             pr_nums: prs.iter().map(|v| v.0 as u32).collect(),
             repo_name: repo.name,
             repo_owner: repo.owner,
         };
-        ApiRequest::get("/oauth/callback")
+        ApiRequest::get("/rollup/submit")
             .query("code", code)
             .query("state", &serde_json::to_string(&state).unwrap())
     }

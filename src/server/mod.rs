@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_embed::ServeEmbed;
+use axum_session::{SessionConfig, SessionLayer, SessionNullSessionStore};
 use chrono::Utc;
 use http::{Request, StatusCode};
 use pulldown_cmark::Parser;
@@ -44,6 +45,7 @@ pub struct ServerState {
     webhook_secret: WebhookSecret,
     oauth: Option<OAuthClient>,
     ctx: Arc<BorsContext>,
+    insecure_cookies: bool,
 }
 
 impl ServerState {
@@ -53,6 +55,7 @@ impl ServerState {
         webhook_secret: WebhookSecret,
         oauth: Option<OAuthClient>,
         ctx: Arc<BorsContext>,
+        insecure_cookies: bool,
     ) -> Self {
         Self {
             repository_event_queue,
@@ -60,6 +63,7 @@ impl ServerState {
             webhook_secret,
             oauth,
             ctx,
+            insecure_cookies,
         }
     }
 
@@ -95,7 +99,7 @@ impl FromRef<ServerStateRef> for Arc<PgDbClient> {
 #[derive(Clone)]
 pub struct ServerStateRef(pub Arc<ServerState>);
 
-pub fn create_app(state: ServerState) -> Router {
+pub async fn create_app(state: ServerState) -> anyhow::Result<Router> {
     let compression_layer = CompressionLayer::new()
         .br(true)
         .gzip(true)
@@ -120,6 +124,15 @@ pub fn create_app(state: ServerState) -> Router {
             },
         );
 
+    let session_config = SessionConfig::default()
+        .with_cookie_same_site(axum_session::SameSite::Strict)
+        .with_http_only(true)
+        .with_key(axum_session::Key::generate())
+        .with_memory_lifetime(chrono::Duration::hours(2))
+        .with_secure(!state.insecure_cookies)
+        .with_table_name("web_sessions");
+    let session_store = SessionNullSessionStore::new(None, session_config).await?;
+
     #[derive(Embed, Clone)]
     #[folder = "web/assets/"]
     struct Assets;
@@ -127,7 +140,7 @@ pub fn create_app(state: ServerState) -> Router {
     let serve_assets = ServeEmbed::<Assets>::new();
 
     let api = create_api_router();
-    Router::new()
+    Ok(Router::new()
         .route("/", get(index_handler))
         .route("/help", get(help_handler))
         .route(
@@ -136,14 +149,15 @@ pub fn create_app(state: ServerState) -> Router {
         )
         .route("/github", post(github_webhook_handler))
         .route("/health", get(health_handler))
-        .route("/oauth/callback", get(rollup::oauth_callback_handler))
+        .route("/rollup/submit", get(rollup::submit))
         .nest("/api", api)
         .nest_service("/assets", serve_assets)
+        .layer(SessionLayer::new(session_store))
         .layer(ConcurrencyLimitLayer::new(100))
         .layer(CatchPanicLayer::custom(handle_panic))
         .layer(trace_layer)
         .with_state(ServerStateRef(Arc::new(state)))
-        .fallback(not_found_handler)
+        .fallback(not_found_handler))
 }
 
 fn create_api_router() -> Router<ServerStateRef> {
