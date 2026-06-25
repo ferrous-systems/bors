@@ -451,6 +451,7 @@ mod tests {
 
     use axum::extract::FromRequest;
     use hyper::StatusCode;
+    use parking_lot::Mutex;
     use sqlx::PgPool;
     use tokio::sync::mpsc;
 
@@ -458,7 +459,7 @@ mod tests {
     use crate::server::webhook::GitHubWebhook;
     use crate::server::webhook::WebhookSecret;
     use crate::server::{ServerState, ServerStateRef};
-    use crate::tests::{TEST_WEBHOOK_SECRET, create_webhook_request};
+    use crate::tests::{ExternalHttpMock, GitHub, TEST_WEBHOOK_SECRET, create_webhook_request};
     use crate::tests::{default_cmd_prefix, load_test_file};
     use crate::{BorsContext, CommandParser, PgDbClient, RepositoryStore};
 
@@ -1745,6 +1746,11 @@ mod tests {
         let db = Arc::new(PgDbClient::new(
             PgPool::connect_lazy("postgres://").unwrap(),
         ));
+
+        // not really used, no configuration needed
+        let github = Arc::new(Mutex::new(GitHub::default()));
+        let mock_github = ExternalHttpMock::start(github).await;
+
         let server_ref = ServerStateRef(Arc::new(ServerState::new(
             repository_tx,
             global_tx,
@@ -1753,6 +1759,7 @@ mod tests {
             Arc::new(BorsContext::new(
                 CommandParser::new(default_cmd_prefix()),
                 db,
+                mock_github.github_client(),
                 Arc::new(RepositoryStore::default()),
                 None,
                 "",

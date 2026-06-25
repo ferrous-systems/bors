@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use octocrab::Octocrab;
+
 use super::{RepositoryState, RepositoryStore};
 use crate::bors::gitops::Git;
 use crate::{PgDbClient, bors::command::CommandParser, github::GithubRepoName};
@@ -7,6 +9,8 @@ use crate::{PgDbClient, bors::command::CommandParser, github::GithubRepoName};
 pub struct BorsContext {
     pub parser: CommandParser,
     pub db: Arc<PgDbClient>,
+    /// GitHub client authenticated as the app
+    pub gh_app_client: Octocrab,
     pub repositories: Arc<RepositoryStore>,
     git: Option<Git>,
     web_url: String,
@@ -16,6 +20,7 @@ impl BorsContext {
     pub fn new(
         parser: CommandParser,
         db: Arc<PgDbClient>,
+        gh_app_client: Octocrab,
         repositories: Arc<RepositoryStore>,
         git: Option<Git>,
         web_url: &str,
@@ -23,6 +28,7 @@ impl BorsContext {
         Self {
             parser,
             db,
+            gh_app_client,
             repositories,
             git,
             web_url: web_url.trim_end_matches('/').to_string(),

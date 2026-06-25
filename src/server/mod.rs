@@ -1,7 +1,9 @@
 use crate::bors::event::BorsEvent;
 use crate::bors::{CommandPrefix, RepositoryState, format_help};
 use crate::database::{ApprovalStatus, QueueStatus};
-use crate::github::{GithubRepoName, PullRequestNumber, rollup};
+use crate::github::{
+    GH_ACCESS_TOKEN, GithubRepoName, OAuthAccessCode, OAuthAccessToken, PullRequestNumber, rollup,
+};
 use crate::templates::{
     HelpTemplate, HtmlTemplate, NotFoundTemplate, PullRequestStats, QueueTemplate, RepositoryView,
     RollupsInfo,
@@ -16,7 +18,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_embed::ServeEmbed;
-use axum_session::{SessionConfig, SessionLayer, SessionNullSessionStore};
+use axum_session::{SessionConfig, SessionLayer, SessionNullSession, SessionNullSessionStore};
 use chrono::Utc;
 use http::{Request, StatusCode};
 use pulldown_cmark::Parser;
@@ -264,25 +266,104 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "")
 }
 
-async fn index_handler(State(ServerStateRef(state)): State<ServerStateRef>) -> impl IntoResponse {
-    // If we manage exactly one repo, redirect to its queue page directly
-    if let Some(repo_name) = state.ctx.repositories.repository_names().pop()
-        && state.ctx.repositories.repo_count() == 1
-    {
-        return Redirect::temporary(&format!("/queue/{}", repo_name.name())).into_response();
-    };
-    help_handler(State(ServerStateRef(state)))
+#[derive(serde::Deserialize)]
+struct OAuthCallbackQuery {
+    code: Option<OAuthAccessCode>,
+}
+
+async fn index_handler(
+    session: SessionNullSession,
+    State(oauth): State<Option<OAuthClient>>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+    Query(OAuthCallbackQuery { code: access_code }): Query<OAuthCallbackQuery>,
+) -> impl IntoResponse {
+    if let Some(access_code) = access_code {
+        let Some(oauth_client) = oauth.as_ref() else {
+            let error = anyhow::anyhow!(
+                "OAuth not configured. Please set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET."
+            );
+            tracing::error!("{error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response();
+        };
+
+        let access_token = match oauth_client.get_github_access_token(access_code).await {
+            Ok(access_token) => access_token,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response();
+            }
+        };
+
+        session.set(GH_ACCESS_TOKEN, &access_token);
+    }
+
+    // If we manage exactly one repo and it's visible to the user, redirect to its queue page directly
+    if state.ctx.repositories.repo_count() == 1 {
+        let repo = state.ctx.repositories.repositories().pop().unwrap();
+        let repo_name = repo.repository();
+        let redirect = Redirect::temporary(&format!("/queue/{}", repo_name.name())).into_response();
+        if repo.public {
+            return redirect;
+        }
+        if let Some(access_token) = session.get::<OAuthAccessToken>(GH_ACCESS_TOKEN) {
+            let oauth_client = oauth.as_ref().unwrap(); // access token only stored in session storage if oauth client configured
+            if let Ok(authenticated_client) = oauth_client.get_authenticated_client(&access_token) {
+                match repo_name.is_visible_to_user(&authenticated_client).await {
+                    Ok(true) => return redirect,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!("{error}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}"))
+                            .into_response();
+                    }
+                }
+            }
+        }
+    }
+
+    help_handler(session, State(oauth), State(ServerStateRef(state)))
         .await
         .into_response()
 }
 
-async fn help_handler(State(ServerStateRef(state)): State<ServerStateRef>) -> impl IntoResponse {
+async fn help_handler(
+    session: SessionNullSession,
+    State(oauth): State<Option<OAuthClient>>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+) -> impl IntoResponse {
+    let authenticated_client = oauth.and_then(|oauth_client| {
+        let Some(access_token) = session.get::<OAuthAccessToken>(GH_ACCESS_TOKEN) else {
+            tracing::info!("no access token, client not authenticated");
+            return None;
+        };
+        tracing::info!("getting authenticated client...");
+        oauth_client.get_authenticated_client(&access_token).ok()
+    });
+
     let mut repos = Vec::with_capacity(state.ctx.repositories.repo_count());
-    for repo in state.ctx.repositories.repository_names() {
+    for repo_state in state.ctx.repositories.repositories() {
+        let repo = repo_state.repository();
+        if !repo_state.public {
+            tracing::info!("repo is not public: {repo}");
+            let Some(authenticated_client) = authenticated_client.as_ref() else {
+                tracing::info!("no authenticated client, skipping");
+                continue;
+            };
+            match repo.is_visible_to_user(authenticated_client).await {
+                Ok(true) => tracing::info!("repo is visible to user"),
+                Ok(false) => {
+                    tracing::info!("repo not visible to user");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!("omitting repo {} from list: {error}", repo);
+                    continue;
+                }
+            }
+        }
         let treeclosed = state
             .ctx
             .db
-            .repo_db(&repo)
+            .repo_db(repo)
             .await
             .ok()
             .flatten()

@@ -178,6 +178,7 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
     let ctx = Arc::new(BorsContext::new(
         CommandParser::new(opts.cmd_prefix.clone().into()),
         db.clone(),
+        client,
         repos.clone(),
         git,
         &opts.web_url,
@@ -189,7 +190,6 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         ..
     } = create_bors_process(
         ctx.clone(),
-        client,
         team_api,
         chrono::Duration::from_std(MERGE_QUEUE_MAX_INTERVAL).unwrap(),
     );

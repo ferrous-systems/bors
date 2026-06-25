@@ -33,7 +33,6 @@ use crate::permissions::PermissionType;
 use crate::{PgDbClient, TeamApiClient, load_repositories};
 use anyhow::Context;
 use futures::TryFutureExt;
-use octocrab::Octocrab;
 use pr_events::{
     handle_pull_request_closed, handle_pull_request_converted_to_draft, handle_pull_request_edited,
     handle_pull_request_merged, handle_pull_request_opened, handle_pull_request_ready_for_review,
@@ -233,7 +232,6 @@ pub async fn handle_bors_repository_event(
 pub async fn handle_bors_global_event(
     event: BorsGlobalEvent,
     ctx: Arc<BorsContext>,
-    gh_client: &Octocrab,
     team_api_client: &TeamApiClient,
     senders: QueueSenders,
 ) -> anyhow::Result<()> {
@@ -241,9 +239,7 @@ pub async fn handle_bors_global_event(
     match event {
         BorsGlobalEvent::InstallationsChanged => {
             let span = tracing::info_span!("Installations changed");
-            reload_repos(ctx, gh_client, team_api_client)
-                .instrument(span)
-                .await?;
+            reload_repos(ctx, team_api_client).instrument(span).await?;
         }
         BorsGlobalEvent::RefreshConfig => {
             let span = tracing::info_span!("Refresh config");
@@ -616,10 +612,9 @@ async fn handle_comment(
 
 async fn reload_repos(
     ctx: Arc<BorsContext>,
-    gh_client: &Octocrab,
     team_api_client: &TeamApiClient,
 ) -> anyhow::Result<()> {
-    let reloaded_repos = load_repositories(gh_client, team_api_client).await?;
+    let reloaded_repos = load_repositories(&ctx.gh_app_client, team_api_client).await?;
     for repo in ctx.repositories.repositories() {
         if !reloaded_repos.contains_key(repo.repository()) {
             tracing::warn!("Repository {} was not reloaded", repo.repository());
