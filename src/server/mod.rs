@@ -1,9 +1,7 @@
 use crate::bors::event::BorsEvent;
 use crate::bors::{CommandPrefix, RepositoryState, format_help};
 use crate::database::{ApprovalStatus, QueueStatus};
-use crate::github::{
-    GH_ACCESS_TOKEN, GithubRepoName, OAuthAccessCode, OAuthAccessToken, PullRequestNumber, rollup,
-};
+use crate::github::{GitHubSession, GithubRepoName, OAuthAccessCode, PullRequestNumber, rollup};
 use crate::templates::{
     HelpTemplate, HtmlTemplate, NotFoundTemplate, PullRequestStats, QueueTemplate, RepositoryView,
     RollupsInfo,
@@ -146,7 +144,7 @@ pub async fn create_app(state: ServerState) -> anyhow::Result<Router> {
         .route("/", get(index_handler))
         .route("/help", get(help_handler))
         .route(
-            "/queue/{repo_name}",
+            "/queue/{repo_owner}/{repo_name}",
             get(queue_handler).layer(compression_layer),
         )
         .route("/github", post(github_webhook_handler))
@@ -293,7 +291,7 @@ async fn index_handler(
             }
         };
 
-        session.set(GH_ACCESS_TOKEN, &access_token);
+        GitHubSession::save(&session, access_token);
     }
 
     // If we manage exactly one repo and it's visible to the user, redirect to its queue page directly
@@ -304,9 +302,11 @@ async fn index_handler(
         if repo.public {
             return redirect;
         }
-        if let Some(access_token) = session.get::<OAuthAccessToken>(GH_ACCESS_TOKEN) {
+        if let Some(github_session) = GitHubSession::restore(&session) {
             let oauth_client = oauth.as_ref().unwrap(); // access token only stored in session storage if oauth client configured
-            if let Ok(authenticated_client) = oauth_client.get_authenticated_client(&access_token) {
+            if let Ok(authenticated_client) =
+                oauth_client.get_authenticated_client(&github_session.access_token)
+            {
                 match repo_name.is_visible_to_user(&authenticated_client).await {
                     Ok(true) => return redirect,
                     Ok(false) => {}
@@ -331,12 +331,14 @@ async fn help_handler(
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> impl IntoResponse {
     let authenticated_client = oauth.and_then(|oauth_client| {
-        let Some(access_token) = session.get::<OAuthAccessToken>(GH_ACCESS_TOKEN) else {
+        let Some(github_session) = GitHubSession::restore(&session) else {
             tracing::info!("no access token, client not authenticated");
             return None;
         };
         tracing::info!("getting authenticated client...");
-        oauth_client.get_authenticated_client(&access_token).ok()
+        oauth_client
+            .get_authenticated_client(&github_session.access_token)
+            .ok()
     });
 
     let mut repos = Vec::with_capacity(state.ctx.repositories.repo_count());
@@ -369,7 +371,7 @@ async fn help_handler(
             .flatten()
             .is_some_and(|repo| repo.tree_state.is_closed());
         repos.push(RepositoryView {
-            name: repo.name().to_string(),
+            name: repo.to_string(),
             treeclosed,
         });
     }
@@ -413,20 +415,43 @@ impl<'de> Deserialize<'de> for PullRequestList {
 }
 
 pub async fn queue_handler(
-    Path(repo_name): Path<String>,
+    session: SessionNullSession,
+    Path((repo_owner, repo_name)): Path<(String, String)>,
     State(db): State<Arc<PgDbClient>>,
     State(oauth): State<Option<OAuthClient>>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
     Query(params): Query<QueueParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let repo = match db.repo_by_name(&repo_name).await? {
-        Some(repo) => repo,
-        None => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                format!("Repository {repo_name} not found"),
-            )
-                .into_response());
+    let repo_name = GithubRepoName::new(&repo_owner, &repo_name);
+    let mut is_invisible = true;
+    if let Some(github_session) = GitHubSession::restore(&session) {
+        let oauth_client = oauth.as_ref().unwrap(); // always Some if there's an access token
+        let authenticated_client =
+            oauth_client.get_authenticated_client(&github_session.access_token)?;
+        if repo_name.is_visible_to_user(&authenticated_client).await? {
+            tracing::error!("repository is not visible to user");
+            is_invisible = false;
         }
+    }
+
+    let not_found = (
+        StatusCode::NOT_FOUND,
+        format!("Repository {repo_name} not found"),
+    )
+        .into_response();
+    let Some(repo) = state.get_repo(&repo_name) else {
+        return Ok(not_found);
+    };
+    if !repo.public && is_invisible {
+        return Ok(not_found);
+    }
+
+    let Some(repo) = db.repo_db(&repo_name).await? else {
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Unable to retrieve repo state"),
+        )
+            .into_response());
     };
 
     // Perform the queries concurrently to save a bit of time
