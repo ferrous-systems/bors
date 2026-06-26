@@ -123,11 +123,31 @@ const GITHUB_SESSION_ID: &str = "github-session";
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct GitHubSession {
     pub access_token: AccessToken,
+    pub username: String,
+    pub html_url: String,
 }
 
 impl GitHubSession {
-    pub fn save(session: &SessionNullSession, access_token: AccessToken) {
-        session.set(GITHUB_SESSION_ID, GitHubSession { access_token });
+    pub async fn save(
+        session: &SessionNullSession,
+        oauth_client: &OAuthClient,
+        access_token: AccessToken,
+    ) -> anyhow::Result<()> {
+        let authenticated_client = oauth_client.get_authenticated_client(&access_token)?;
+        let user = authenticated_client
+            .current()
+            .user()
+            .await
+            .context("Unable to fetch current GitHub user")?;
+        session.set(
+            GITHUB_SESSION_ID,
+            GitHubSession {
+                access_token,
+                username: user.login,
+                html_url: user.html_url.to_string(),
+            },
+        );
+        Ok(())
     }
 
     pub fn restore(session: &SessionNullSession) -> Option<GitHubSession> {

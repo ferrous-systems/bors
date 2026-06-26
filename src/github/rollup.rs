@@ -122,7 +122,10 @@ pub async fn submit(
 
     if let Some(access_code) = rollup.code {
         let access_token = oauth_client.get_github_access_token(access_code).await?;
-        GitHubSession::save(&session, access_token);
+        if let Err(error) = GitHubSession::save(&session, &oauth_client, access_token).await {
+            tracing::error!("{error}");
+            return Err(error.into());
+        }
     }
 
     let Some(github_session) = GitHubSession::restore(&session) else {

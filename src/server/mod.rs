@@ -257,7 +257,13 @@ fn handle_panic(_err: Box<dyn Any + Send + 'static>) -> Response {
 }
 
 async fn not_found_handler() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, HtmlTemplate(NotFoundTemplate {}))
+    (
+        StatusCode::NOT_FOUND,
+        HtmlTemplate(NotFoundTemplate {
+            login_url: None,
+            github_user: None,
+        }),
+    )
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -291,7 +297,10 @@ async fn index_handler(
             }
         };
 
-        GitHubSession::save(&session, access_token);
+        if let Err(error) = GitHubSession::save(&session, &oauth_client, access_token).await {
+            // log the error, but don't return an error status code
+            tracing::error!("{error}");
+        }
     }
 
     // If we manage exactly one repo and it's visible to the user, redirect to its queue page directly
@@ -330,8 +339,9 @@ async fn help_handler(
     State(oauth): State<Option<OAuthClient>>,
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> impl IntoResponse {
-    let authenticated_client = oauth.and_then(|oauth_client| {
-        let Some(github_session) = GitHubSession::restore(&session) else {
+    let github_session = GitHubSession::restore(&session);
+    let authenticated_client = oauth.as_ref().and_then(|oauth_client| {
+        let Some(github_session) = github_session.as_ref() else {
             tracing::info!("no access token, client not authenticated");
             return None;
         };
@@ -383,6 +393,10 @@ async fn help_handler(
     pulldown_cmark::html::push_html(&mut help_html, markdown);
 
     HtmlTemplate(HelpTemplate {
+        login_url: oauth
+            .as_ref()
+            .map(|oauth_client| oauth_client.request_authorization(None, None)),
+        github_user: github_session.as_ref().map(Into::into),
         repos,
         help: help_html,
         cmd_prefix: state.get_cmd_prefix().as_ref().to_string(),
@@ -424,7 +438,8 @@ pub async fn queue_handler(
 ) -> Result<impl IntoResponse, AppError> {
     let repo_name = GithubRepoName::new(&repo_owner, &repo_name);
     let mut is_invisible = true;
-    if let Some(github_session) = GitHubSession::restore(&session) {
+    let github_session = GitHubSession::restore(&session);
+    if let Some(github_session) = github_session.as_ref() {
         let oauth_client = oauth.as_ref().unwrap(); // always Some if there's an access token
         let authenticated_client =
             oauth_client.get_authenticated_client(&github_session.access_token)?;
@@ -554,9 +569,13 @@ pub async fn queue_handler(
     }
 
     Ok(HtmlTemplate(QueueTemplate {
-        oauth_client_id: oauth
-            .as_ref()
-            .map(|client| client.config().client_id().to_string()),
+        login_url: oauth.as_ref().map(|client| {
+            client.request_authorization(
+                None,
+                Some(&format!("{}/queue/{}", state.get_web_url(), repo.name)),
+            )
+        }),
+        github_user: github_session.as_ref().map(Into::into),
         repo_name: repo.name.name().to_string(),
         repo_owner: repo.name.owner().to_string(),
         repo_url: format!("https://github.com/{}", repo.name),
