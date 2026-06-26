@@ -17,7 +17,7 @@ mod labels;
 mod oauth;
 pub mod rollup;
 
-pub use oauth::{OAuthClient, OAuthConfig};
+pub use oauth::{AccessCode as OAuthAccessCode, GitHubSession, OAuthClient, OAuthConfig};
 
 pub use crate::server::webhook::WebhookSecret;
 pub use api::operations::{MergeResult, attempt_merge};
@@ -47,6 +47,22 @@ impl GithubRepoName {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub async fn is_visible_to_user(&self, client: &Octocrab) -> anyhow::Result<bool> {
+        match client
+            .get::<octocrab::models::Repository, _, _>(
+                format!("/repos/{}/{}", self.owner(), self.name()),
+                None::<&()>,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(octocrab::Error::GitHub { .. }) => Ok(false),
+            Err(err) => {
+                Err(anyhow::anyhow!(err).context("Failed to test repository access for user"))
+            }
+        }
     }
 }
 

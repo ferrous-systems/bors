@@ -94,6 +94,7 @@ pub async fn load_repositories(
                 installation_client.clone(),
                 team_api_client,
                 name.clone(),
+                repo.private,
             )
             .await
             .map_err(|error| {
@@ -144,6 +145,7 @@ async fn create_repo_state(
     repo_client: Octocrab,
     team_api_client: &TeamApiClient,
     name: GithubRepoName,
+    private: Option<bool>,
 ) -> anyhow::Result<RepositoryState> {
     tracing::info!("Found repository {name}");
 
@@ -160,6 +162,7 @@ async fn create_repo_state(
         client,
         config: ArcSwap::new(Arc::new(config)),
         permissions: ArcSwap::new(Arc::new(permissions)),
+        public: !private.unwrap_or(false),
     })
 }
 

@@ -11,7 +11,6 @@ use crate::bors::mergeability_queue::{
 use crate::bors::{handle_bors_global_event, handle_bors_repository_event};
 use crate::{BorsContext, BorsGlobalEvent, BorsRepositoryEvent, TeamApiClient};
 use anyhow::Error;
-use octocrab::Octocrab;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -36,7 +35,6 @@ pub struct BorsProcess {
 /// them.
 pub fn create_bors_process(
     ctx: Arc<BorsContext>,
-    gh_client: Octocrab,
     team_api: TeamApiClient,
     merge_queue_max_interval: chrono::Duration,
 ) -> BorsProcess {
@@ -70,7 +68,7 @@ pub fn create_bors_process(
         {
             let _ = tokio::join!(
                 consume_repository_events(ctx.clone(), repository_rx, senders2.clone()),
-                consume_global_events(ctx.clone(), global_rx, senders2, gh_client, team_api),
+                consume_global_events(ctx.clone(), global_rx, senders2, team_api),
                 consume_build_queue_events(ctx.clone(), build_queue_rx, merge_queue_tx),
                 merge_queue_fut
             );
@@ -87,7 +85,7 @@ pub fn create_bors_process(
                 _ = consume_repository_events(ctx.clone(), repository_rx, senders2.clone()) => {
                     tracing::error!("Repository event handling process has ended");
                 }
-                _ = consume_global_events(ctx.clone(), global_rx, senders2, gh_client, team_api) => {
+                _ = consume_global_events(ctx.clone(), global_rx, senders2, team_api) => {
                     tracing::error!("Global event handling process has ended");
                 }
                 _ = consume_mergeability_queue_events(ctx.clone(), mergeability_queue_rx) => {
@@ -167,15 +165,13 @@ async fn consume_global_events(
     ctx: Arc<BorsContext>,
     mut global_rx: mpsc::Receiver<BorsGlobalEvent>,
     senders: QueueSenders,
-    gh_client: Octocrab,
     team_api: TeamApiClient,
 ) {
     while let Some(event) = global_rx.recv().await {
         let span = tracing::info_span!("GlobalEvent");
-        if let Err(error) =
-            handle_bors_global_event(event, ctx.clone(), &gh_client, &team_api, senders.clone())
-                .instrument(span.clone())
-                .await
+        if let Err(error) = handle_bors_global_event(event, ctx.clone(), &team_api, senders.clone())
+            .instrument(span.clone())
+            .await
         {
             handle_root_error(span, error);
         }

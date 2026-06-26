@@ -81,12 +81,16 @@ struct Opts {
         default_value = "https://team-api.infra.rust-lang.org"
     )]
     permissions: String,
+
+    /// Disable the use of `Secure` cookies for session management. Only recommended in local dev.
+    #[arg(long, env = "INSECURE_COOKIES")]
+    insecure_cookies: bool,
 }
 
 /// Starts a server that receives GitHub webhooks and generates events into a queue
 /// that is then handled by the Bors process.
 async fn webhook_server(state: ServerState) -> anyhow::Result<()> {
-    let app = create_app(state);
+    let app = create_app(state).await?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -174,6 +178,7 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
     let ctx = Arc::new(BorsContext::new(
         CommandParser::new(opts.cmd_prefix.clone().into()),
         db.clone(),
+        client,
         repos.clone(),
         git,
         &opts.web_url,
@@ -185,7 +190,6 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         ..
     } = create_bors_process(
         ctx.clone(),
-        client,
         team_api,
         chrono::Duration::from_std(MERGE_QUEUE_MAX_INTERVAL).unwrap(),
     );
@@ -274,6 +278,7 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         WebhookSecret::new(opts.webhook_secret),
         oauth_client,
         ctx,
+        opts.insecure_cookies,
     );
     let server_process = webhook_server(state);
 

@@ -220,6 +220,7 @@ impl BorsTester {
         let ctx = Arc::new(BorsContext::new(
             CommandParser::new("@bors".to_string().into()),
             db.clone(),
+            mock.github_client(),
             repos.clone(),
             // Create a fake git repo, as we want to enable testing handlers that use
             // local git ops, but we do not currently mock git in tests.
@@ -236,7 +237,6 @@ impl BorsTester {
             gitops_queue_rx,
         } = create_bors_process(
             ctx.clone(),
-            mock.github_client(),
             mock.team_api_client(),
             chrono::Duration::seconds(1),
         );
@@ -250,8 +250,9 @@ impl BorsTester {
             WebhookSecret::new(TEST_WEBHOOK_SECRET.to_string()),
             Some(oauth_client),
             ctx.clone(),
+            false,
         );
-        let app = create_app(state);
+        let app = create_app(state).await.unwrap();
         let bors = tokio::spawn(bors_process);
         (
             Self {

@@ -1,7 +1,7 @@
 use crate::bors::event::BorsEvent;
 use crate::bors::{CommandPrefix, RepositoryState, format_help};
 use crate::database::{ApprovalStatus, QueueStatus};
-use crate::github::{GithubRepoName, PullRequestNumber, rollup};
+use crate::github::{GitHubSession, GithubRepoName, OAuthAccessCode, PullRequestNumber, rollup};
 use crate::templates::{
     HelpTemplate, HtmlTemplate, NotFoundTemplate, PullRequestStats, QueueTemplate, RepositoryView,
     RollupsInfo,
@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_embed::ServeEmbed;
+use axum_session::{SessionConfig, SessionLayer, SessionNullSession, SessionNullSessionStore};
 use chrono::Utc;
 use http::{Request, StatusCode};
 use pulldown_cmark::Parser;
@@ -44,6 +45,7 @@ pub struct ServerState {
     webhook_secret: WebhookSecret,
     oauth: Option<OAuthClient>,
     ctx: Arc<BorsContext>,
+    insecure_cookies: bool,
 }
 
 impl ServerState {
@@ -53,6 +55,7 @@ impl ServerState {
         webhook_secret: WebhookSecret,
         oauth: Option<OAuthClient>,
         ctx: Arc<BorsContext>,
+        insecure_cookies: bool,
     ) -> Self {
         Self {
             repository_event_queue,
@@ -60,6 +63,7 @@ impl ServerState {
             webhook_secret,
             oauth,
             ctx,
+            insecure_cookies,
         }
     }
 
@@ -95,7 +99,7 @@ impl FromRef<ServerStateRef> for Arc<PgDbClient> {
 #[derive(Clone)]
 pub struct ServerStateRef(pub Arc<ServerState>);
 
-pub fn create_app(state: ServerState) -> Router {
+pub async fn create_app(state: ServerState) -> anyhow::Result<Router> {
     let compression_layer = CompressionLayer::new()
         .br(true)
         .gzip(true)
@@ -120,6 +124,15 @@ pub fn create_app(state: ServerState) -> Router {
             },
         );
 
+    let session_config = SessionConfig::default()
+        .with_cookie_same_site(axum_session::SameSite::Strict)
+        .with_http_only(true)
+        .with_key(axum_session::Key::generate())
+        .with_memory_lifetime(chrono::Duration::hours(2))
+        .with_secure(!state.insecure_cookies)
+        .with_table_name("web_sessions");
+    let session_store = SessionNullSessionStore::new(None, session_config).await?;
+
     #[derive(Embed, Clone)]
     #[folder = "web/assets/"]
     struct Assets;
@@ -127,23 +140,24 @@ pub fn create_app(state: ServerState) -> Router {
     let serve_assets = ServeEmbed::<Assets>::new();
 
     let api = create_api_router();
-    Router::new()
+    Ok(Router::new()
         .route("/", get(index_handler))
         .route("/help", get(help_handler))
         .route(
-            "/queue/{repo_name}",
+            "/queue/{repo_owner}/{repo_name}",
             get(queue_handler).layer(compression_layer),
         )
         .route("/github", post(github_webhook_handler))
         .route("/health", get(health_handler))
-        .route("/oauth/callback", get(rollup::oauth_callback_handler))
+        .route("/rollup/submit", get(rollup::submit))
         .nest("/api", api)
         .nest_service("/assets", serve_assets)
+        .layer(SessionLayer::new(session_store))
         .layer(ConcurrencyLimitLayer::new(100))
         .layer(CatchPanicLayer::custom(handle_panic))
         .layer(trace_layer)
         .with_state(ServerStateRef(Arc::new(state)))
-        .fallback(not_found_handler)
+        .fallback(not_found_handler))
 }
 
 fn create_api_router() -> Router<ServerStateRef> {
@@ -243,38 +257,131 @@ fn handle_panic(_err: Box<dyn Any + Send + 'static>) -> Response {
 }
 
 async fn not_found_handler() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, HtmlTemplate(NotFoundTemplate {}))
+    (
+        StatusCode::NOT_FOUND,
+        HtmlTemplate(NotFoundTemplate {
+            login_url: None,
+            github_user: None,
+        }),
+    )
 }
 
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "")
 }
 
-async fn index_handler(State(ServerStateRef(state)): State<ServerStateRef>) -> impl IntoResponse {
-    // If we manage exactly one repo, redirect to its queue page directly
-    if let Some(repo_name) = state.ctx.repositories.repository_names().pop()
-        && state.ctx.repositories.repo_count() == 1
-    {
-        return Redirect::temporary(&format!("/queue/{}", repo_name.name())).into_response();
-    };
-    help_handler(State(ServerStateRef(state)))
+#[derive(serde::Deserialize)]
+struct OAuthCallbackQuery {
+    code: Option<OAuthAccessCode>,
+}
+
+async fn index_handler(
+    session: SessionNullSession,
+    State(oauth): State<Option<OAuthClient>>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+    Query(OAuthCallbackQuery { code: access_code }): Query<OAuthCallbackQuery>,
+) -> impl IntoResponse {
+    if let Some(access_code) = access_code {
+        let Some(oauth_client) = oauth.as_ref() else {
+            let error = anyhow::anyhow!(
+                "OAuth not configured. Please set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET."
+            );
+            tracing::error!("{error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response();
+        };
+
+        let access_token = match oauth_client.get_github_access_token(access_code).await {
+            Ok(access_token) => access_token,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response();
+            }
+        };
+
+        if let Err(error) = GitHubSession::save(&session, &oauth_client, access_token).await {
+            // log the error, but don't return an error status code
+            tracing::error!("{error}");
+        }
+    }
+
+    // If we manage exactly one repo and it's visible to the user, redirect to its queue page directly
+    if state.ctx.repositories.repo_count() == 1 {
+        let repo = state.ctx.repositories.repositories().pop().unwrap();
+        let repo_name = repo.repository();
+        let redirect = Redirect::temporary(&format!("/queue/{}", repo_name.name())).into_response();
+        if repo.public {
+            return redirect;
+        }
+        if let Some(github_session) = GitHubSession::restore(&session) {
+            let oauth_client = oauth.as_ref().unwrap(); // access token only stored in session storage if oauth client configured
+            if let Ok(authenticated_client) =
+                oauth_client.get_authenticated_client(&github_session.access_token)
+            {
+                match repo_name.is_visible_to_user(&authenticated_client).await {
+                    Ok(true) => return redirect,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!("{error}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}"))
+                            .into_response();
+                    }
+                }
+            }
+        }
+    }
+
+    help_handler(session, State(oauth), State(ServerStateRef(state)))
         .await
         .into_response()
 }
 
-async fn help_handler(State(ServerStateRef(state)): State<ServerStateRef>) -> impl IntoResponse {
+async fn help_handler(
+    session: SessionNullSession,
+    State(oauth): State<Option<OAuthClient>>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+) -> impl IntoResponse {
+    let github_session = GitHubSession::restore(&session);
+    let authenticated_client = oauth.as_ref().and_then(|oauth_client| {
+        let Some(github_session) = github_session.as_ref() else {
+            tracing::info!("no access token, client not authenticated");
+            return None;
+        };
+        tracing::info!("getting authenticated client...");
+        oauth_client
+            .get_authenticated_client(&github_session.access_token)
+            .ok()
+    });
+
     let mut repos = Vec::with_capacity(state.ctx.repositories.repo_count());
-    for repo in state.ctx.repositories.repository_names() {
+    for repo_state in state.ctx.repositories.repositories() {
+        let repo = repo_state.repository();
+        if !repo_state.public {
+            tracing::info!("repo is not public: {repo}");
+            let Some(authenticated_client) = authenticated_client.as_ref() else {
+                tracing::info!("no authenticated client, skipping");
+                continue;
+            };
+            match repo.is_visible_to_user(authenticated_client).await {
+                Ok(true) => tracing::info!("repo is visible to user"),
+                Ok(false) => {
+                    tracing::info!("repo not visible to user");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!("omitting repo {} from list: {error}", repo);
+                    continue;
+                }
+            }
+        }
         let treeclosed = state
             .ctx
             .db
-            .repo_db(&repo)
+            .repo_db(repo)
             .await
             .ok()
             .flatten()
             .is_some_and(|repo| repo.tree_state.is_closed());
         repos.push(RepositoryView {
-            name: repo.name().to_string(),
+            name: repo.to_string(),
             treeclosed,
         });
     }
@@ -286,6 +393,10 @@ async fn help_handler(State(ServerStateRef(state)): State<ServerStateRef>) -> im
     pulldown_cmark::html::push_html(&mut help_html, markdown);
 
     HtmlTemplate(HelpTemplate {
+        login_url: oauth
+            .as_ref()
+            .map(|oauth_client| oauth_client.request_authorization(None, None)),
+        github_user: github_session.as_ref().map(Into::into),
         repos,
         help: help_html,
         cmd_prefix: state.get_cmd_prefix().as_ref().to_string(),
@@ -318,20 +429,44 @@ impl<'de> Deserialize<'de> for PullRequestList {
 }
 
 pub async fn queue_handler(
-    Path(repo_name): Path<String>,
+    session: SessionNullSession,
+    Path((repo_owner, repo_name)): Path<(String, String)>,
     State(db): State<Arc<PgDbClient>>,
     State(oauth): State<Option<OAuthClient>>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
     Query(params): Query<QueueParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let repo = match db.repo_by_name(&repo_name).await? {
-        Some(repo) => repo,
-        None => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                format!("Repository {repo_name} not found"),
-            )
-                .into_response());
+    let repo_name = GithubRepoName::new(&repo_owner, &repo_name);
+    let mut is_invisible = true;
+    let github_session = GitHubSession::restore(&session);
+    if let Some(github_session) = github_session.as_ref() {
+        let oauth_client = oauth.as_ref().unwrap(); // always Some if there's an access token
+        let authenticated_client =
+            oauth_client.get_authenticated_client(&github_session.access_token)?;
+        if repo_name.is_visible_to_user(&authenticated_client).await? {
+            tracing::error!("repository is not visible to user");
+            is_invisible = false;
         }
+    }
+
+    let not_found = (
+        StatusCode::NOT_FOUND,
+        format!("Repository {repo_name} not found"),
+    )
+        .into_response();
+    let Some(repo) = state.get_repo(&repo_name) else {
+        return Ok(not_found);
+    };
+    if !repo.public && is_invisible {
+        return Ok(not_found);
+    }
+
+    let Some(repo) = db.repo_db(&repo_name).await? else {
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Unable to retrieve repo state"),
+        )
+            .into_response());
     };
 
     // Perform the queries concurrently to save a bit of time
@@ -434,9 +569,13 @@ pub async fn queue_handler(
     }
 
     Ok(HtmlTemplate(QueueTemplate {
-        oauth_client_id: oauth
-            .as_ref()
-            .map(|client| client.config().client_id().to_string()),
+        login_url: oauth.as_ref().map(|client| {
+            client.request_authorization(
+                None,
+                Some(&format!("{}/queue/{}", state.get_web_url(), repo.name)),
+            )
+        }),
+        github_user: github_session.as_ref().map(Into::into),
         repo_name: repo.name.name().to_string(),
         repo_owner: repo.name.owner().to_string(),
         repo_url: format!("https://github.com/{}", repo.name),

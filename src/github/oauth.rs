@@ -1,8 +1,19 @@
 use crate::github::api::client::GithubRepositoryClient;
 use crate::github::{GithubRepoName, GithubUser, prepare_octocrab_client};
 use anyhow::Context;
+use axum_session::SessionNullSession;
+use octocrab::Octocrab;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
+use std::fmt::Write;
+
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+pub struct AccessCode(String);
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub struct AccessToken(String);
 
 /// Client that handles OAuth authentication used for rollups.
 /// It is able to provide a GitHub client authenticated as a given GitHub user.
@@ -26,12 +37,10 @@ impl OAuthClient {
         &self.config
     }
 
-    /// Create a GitHub client authenticated as a user with the given OAuth exchange code.
-    pub async fn get_authenticated_client(
+    pub async fn get_github_access_token(
         &self,
-        repo: GithubRepoName,
-        code: &str,
-    ) -> anyhow::Result<UserGitHubClient> {
+        AccessCode(code): AccessCode,
+    ) -> anyhow::Result<AccessToken> {
         tracing::info!("Exchanging OAuth code for access token");
         let client = reqwest::Client::new();
         let token_response = client
@@ -39,7 +48,7 @@ impl OAuthClient {
             .form(&[
                 ("client_id", self.config.client_id()),
                 ("client_secret", self.config.client_secret()),
-                ("code", code),
+                ("code", &code),
             ])
             .send()
             .await
@@ -57,22 +66,92 @@ impl OAuthClient {
             .ok_or_else(|| anyhow::anyhow!("No OAuth access token in response"))?;
 
         tracing::info!("Retrieved OAuth access token");
+        Ok(AccessToken(access_token.to_owned()))
+    }
 
-        let user_client = prepare_octocrab_client(&self.github_api_base_url)?
-            .user_access_token(access_token.clone())
-            .build()?;
-        let user = user_client
+    pub fn get_authenticated_client(
+        &self,
+        AccessToken(access_token): &AccessToken,
+    ) -> anyhow::Result<Octocrab> {
+        prepare_octocrab_client(&self.github_api_base_url)
+            .context("Invalid GitHub client configuration")?
+            .user_access_token(access_token.as_str())
+            .build()
+            .context("Unable to build GitHub client")
+    }
+
+    /// Create a GitHub client authenticated as a user with the given OAuth exchange code.
+    pub async fn get_user_client(
+        &self,
+        repo: GithubRepoName,
+        authenticated_client: Octocrab,
+    ) -> anyhow::Result<UserGitHubClient> {
+        let user = authenticated_client
             .current()
             .user()
             .await
             .context("Cannot get user authenticated with OAuth")?;
 
         let client_repo = GithubRepoName::new(&user.login, repo.name());
-        let client = GithubRepositoryClient::new(user.html_url.clone(), user_client, client_repo);
+        let client =
+            GithubRepositoryClient::new(user.html_url.clone(), authenticated_client, client_repo);
         Ok(UserGitHubClient {
             user: user.into(),
             client,
         })
+    }
+
+    pub fn request_authorization(&self, state: Option<&str>, redirect_uri: Option<&str>) -> String {
+        let mut url = format!(
+            "{base_url}/login/oauth/authorize?client_id={client_id}&scope={scope}",
+            base_url = self.github_base_url,
+            client_id = self.config.client_id(),
+            scope = "public_repo,workflow",
+        );
+        if let Some(state) = state {
+            write!(&mut url, "&state={state}").unwrap();
+        }
+        if let Some(redirect_uri) = redirect_uri {
+            write!(&mut url, "&redirect_uri={redirect_uri}").unwrap();
+        }
+        url
+    }
+}
+
+const GITHUB_SESSION_ID: &str = "github-session";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct GitHubSession {
+    pub access_token: AccessToken,
+    pub username: String,
+    pub html_url: String,
+}
+
+impl GitHubSession {
+    pub async fn save(
+        session: &SessionNullSession,
+        oauth_client: &OAuthClient,
+        access_token: AccessToken,
+    ) -> anyhow::Result<()> {
+        let authenticated_client = oauth_client.get_authenticated_client(&access_token)?;
+        let user = authenticated_client
+            .current()
+            .user()
+            .await
+            .context("Unable to fetch current GitHub user")?;
+        session.set(
+            GITHUB_SESSION_ID,
+            GitHubSession {
+                access_token,
+                username: user.login,
+                html_url: user.html_url.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn restore(session: &SessionNullSession) -> Option<GitHubSession> {
+        session.get(GITHUB_SESSION_ID)
     }
 }
 
