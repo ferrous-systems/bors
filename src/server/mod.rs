@@ -509,7 +509,7 @@ struct OAuthCallbackQuery {
 async fn oauth_callback(
     session: SessionNullSession,
     State(oauth): State<Option<OAuthClient>>,
-    State(ServerStateRef(state)): State<ServerStateRef>,
+    // State(ServerStateRef(state)): State<ServerStateRef>,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
     let Some(oauth_client) = oauth else {
@@ -532,22 +532,38 @@ async fn oauth_callback(
         }
     }
 
-    let mut endpoint = String::new();
+    tracing::info!("saved github session to id: {}", session.get_session_id());
+
+    let mut endpoint = None;
     if let Some(query_state) = query.state {
         // if the endpoint can't be decoded, fallback to /
         if let Ok(bytes) = BASE64_URL_SAFE.decode(query_state) {
             if let Ok(bytes_str) = std::str::from_utf8(&bytes) {
-                endpoint = bytes_str.to_string()
+                endpoint = Some(bytes_str.to_string());
             }
         }
     }
 
-    Redirect::to(&format!(
-        "{base_url}/{endpoint}",
-        base_url = state.get_web_url(),
-        endpoint = endpoint,
-    ))
-    .into_response()
+    // Redirect::to("/").into_response()
+
+    let target = endpoint.as_deref().unwrap_or("/");
+    tracing::info!("redirecting after oauth to: {target}");
+    Redirect::to(target).into_response()
+
+    // let mut target = state.get_web_url().to_string();
+    // if !target.ends_with('/') && !endpoint.starts_with('/') {
+    //     target.push('/');
+    //     // write!(&mut target, "/").unwrap();
+    // }
+    // target.push_str(&endpoint);
+    // // write!(&mut target, )
+    // // let target = format!(
+    // //     "{base_url}{endpoint}",
+    // //     base_url = state.get_web_url(),
+    // //     endpoint = endpoint,
+    // // );
+    // tracing::info!("redirecting after oauth to: {target}");
+    // Redirect::to(&target).into_response()
 }
 
 #[cfg(test)]

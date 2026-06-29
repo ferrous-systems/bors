@@ -690,14 +690,17 @@ Average duration of recent auto builds: {{ format_duration(*average_build_durati
             })
             .filter(num => num !== null);
 
-        const state = JSON.stringify({
-          pr_nums: nums,
-          repo_name: "{{ repo_name }}",
-          repo_owner: "{{ repo_owner }}",
-        });
+        // const state = JSON.stringify({
+        //   pr_nums: nums,
+        //   repo_name: "{{ repo_name }}",
+        //   repo_owner: "{{ repo_owner }}",
+        // });
 
         const submitUrl = new URL("/rollup/submit", window.location.href);
-        submitUrl.searchParams.set("state", JSON.stringify(state))
+        submitUrl.searchParams.set("pr_nums", btoa(JSON.stringify(nums)));
+        submitUrl.searchParams.set("repo_owner", "{{ repo_owner }}");
+        submitUrl.searchParams.set("repo_name", "{{ repo_name }}");
+        // submitUrl.searchParams.set("state", JSON.stringify(state))
         window.location.href = submitUrl.toString();
     });
     {% endif %}

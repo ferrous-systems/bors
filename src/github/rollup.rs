@@ -10,10 +10,12 @@ use crate::permissions::PermissionType;
 use crate::server::ServerStateRef;
 use crate::utils::sort_queue::sort_queue_prs;
 use anyhow::Context;
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_session::SessionNullSession;
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE;
 use futures::StreamExt;
 use itertools::Itertools;
 use rand::{Rng, distr::Alphanumeric};
@@ -25,15 +27,9 @@ use tracing::Instrument;
 /// Maximum number of PRs that can be rolled up at once.
 const ROLLUP_PR_LIMIT: u64 = 50;
 
-/// Overlaps with query parameters received from GitHub's OAuth callback.
-#[derive(serde::Deserialize)]
-pub struct SubmitRollupQuery {
-    state: String,
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
-struct SubmitRollupState {
-    pr_nums: Vec<u32>,
+pub struct SubmitRollupQuery {
+    pr_nums: String,
     repo_name: String,
     repo_owner: String,
 }
@@ -105,7 +101,10 @@ pub async fn submit(
     State(oauth): State<Option<OAuthClient>>,
     State(ServerStateRef(state)): State<ServerStateRef>,
     Query(rollup): Query<SubmitRollupQuery>,
+    request: Request,
 ) -> Result<Response, RollupError> {
+    tracing::info!("rollup for session: {}", session.get_session_id());
+
     let Some(oauth_client) = oauth else {
         let error = anyhow::anyhow!(
             "OAuth not configured. Please set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET."
@@ -116,13 +115,17 @@ pub async fn submit(
 
     let Some(github_session) = GitHubSession::restore(&session) else {
         tracing::info!("Missing gh access token, requesting gh auth");
-        let redirect =
-            oauth_client.authorization_url(Some(format!("/rollup/submit?state={}", rollup.state)));
+        let redirect = oauth_client
+            .authorization_url(Some(request.uri().path_and_query().unwrap().to_string()));
+        session.set("hi", "hey");
         return Ok(Redirect::to(&redirect).into_response());
     };
 
-    let rollup: SubmitRollupState =
-        serde_json::from_str(&rollup.state).context("Unable to deserialize state")?;
+    let decoded_pr_nums = BASE64_URL_SAFE
+        .decode(&rollup.pr_nums)
+        .context("Expecte pr_nums to be base64")?;
+    let pr_nums: Vec<u32> =
+        serde_json::from_slice(&decoded_pr_nums).context("Unable to deserialize pr_nums")?;
 
     let authenticated_client =
         oauth_client.get_authenticated_client(&github_session.access_token)?;
@@ -156,12 +159,13 @@ pub async fn submit(
     let span = tracing::info_span!(
         "create_rollup",
         repo = %repo_name,
-        pr_nums = ?rollup.pr_nums
+        pr_nums = ?pr_nums
     );
 
     let pr = match create_rollup(
         db,
         rollup,
+        pr_nums,
         state.get_web_url(),
         &repo_state.client,
         user_client,
@@ -191,15 +195,16 @@ pub async fn submit(
 /// in the user's fork, then opens a PR to the upstream repository.
 async fn create_rollup(
     db: Arc<PgDbClient>,
-    rollup_state: SubmitRollupState,
+    rollup_state: SubmitRollupQuery,
+    mut pr_nums: Vec<u32>,
     web_url: &str,
     gh_client: &GithubRepositoryClient,
     user_client: UserGitHubClient,
 ) -> Result<PullRequest, RollupError> {
-    let SubmitRollupState {
+    let SubmitRollupQuery {
         repo_name,
         repo_owner,
-        mut pr_nums,
+        ..
     } = rollup_state;
     // Repository where we will create the PR
     let base_repo = GithubRepoName::new(&repo_owner, &repo_name);
@@ -450,13 +455,14 @@ async fn create_rollup(
 #[cfg(test)]
 mod tests {
     use crate::bors::{PullRequestStatus, RollupMode};
-    use crate::github::rollup::SubmitRollupState;
     use crate::github::{GithubRepoName, PullRequestNumber};
     use crate::permissions::PermissionType;
     use crate::tests::{
         ApiRequest, ApiResponse, BorsTester, Comment, Commit, GitHub, MergeBehavior, PullRequest,
         Repo, User, default_repo_name, run_test,
     };
+    use base64::Engine;
+    use base64::prelude::BASE64_URL_SAFE;
     use http::StatusCode;
     use std::collections::{HashMap, HashSet};
 
@@ -1248,11 +1254,12 @@ also include this pls"
     }
 
     fn rollup_request(repo: GithubRepoName, prs: &[PullRequestNumber]) -> ApiRequest {
-        let state = SubmitRollupState {
-            pr_nums: prs.iter().map(|v| v.0 as u32).collect(),
-            repo_name: repo.name,
-            repo_owner: repo.owner,
-        };
-        ApiRequest::get("/rollup/submit").query("state", &serde_json::to_string(&state).unwrap())
+        ApiRequest::get("/rollup/submit")
+            .query(
+                "pr_nums",
+                &BASE64_URL_SAFE.encode(serde_json::to_string(prs).unwrap()),
+            )
+            .query("repo_name", repo.name())
+            .query("repo_owner", repo.owner())
     }
 }
