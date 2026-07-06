@@ -104,12 +104,12 @@ impl TeamApiClient {
 
         let (review_users, try_users, known_usernames, known_teams) = tokio::try_join!(
             async {
-                self.load_users(repo.name(), PermissionType::Review)
+                self.load_users(repo, PermissionType::Review)
                     .await
                     .map_err(|error| anyhow::anyhow!("Cannot load review users: {error:?}"))
             },
             async {
-                self.load_users(repo.name(), PermissionType::Try)
+                self.load_users(repo, PermissionType::Try)
                     .await
                     .map_err(|error| anyhow::anyhow!("Cannot load try users: {error:?}"))
             },
@@ -147,7 +147,7 @@ impl TeamApiClient {
     /// or from directory for local environment.
     async fn load_users(
         &self,
-        repository_name: &str,
+        repo_name: &GithubRepoName,
         permission: PermissionType,
     ) -> anyhow::Result<HashSet<UserId>> {
         let permission = match permission {
@@ -157,7 +157,7 @@ impl TeamApiClient {
 
         let data = match &self.team_source {
             TeamSource::Url(base_url) => {
-                let normalized_name = repository_name.replace('-', "_");
+                let normalized_name = repo_name.name().replace('-', "_");
                 let url =
                     format!("{base_url}/v1/permissions/bors.{normalized_name}.{permission}.json",);
                 reqwest::get(url)
@@ -168,7 +168,11 @@ impl TeamApiClient {
                     .await?
             }
             TeamSource::Directory(base_path) => {
-                let path = format!("{base_path}/bors.{permission}.json");
+                let path = format!(
+                    "{base_path}/bors.{repo_owner}.{repo_name}.{permission}.json",
+                    repo_owner = repo_name.owner().replace('-', "_"),
+                    repo_name = repo_name.name().replace('-', "_"),
+                );
                 std::fs::read_to_string(&path).map_err(|error| {
                     anyhow::anyhow!("Could not read users from a file '{path}': {error:?}")
                 })?
