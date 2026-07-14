@@ -643,6 +643,14 @@ async fn reload_repos(
             }
         };
 
+        if let Err(err) = ctx
+            .db
+            .insert_repo_if_not_exists(&name, crate::TreeState::Open)
+            .await
+        {
+            tracing::warn!("Failed to insert repository {name}: {err}")
+        }
+
         if ctx.repositories.insert(repo) {
             tracing::info!("Repository {name} was added");
         } else {
