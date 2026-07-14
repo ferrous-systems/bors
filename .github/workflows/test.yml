@@ -8,9 +8,7 @@ on:
     branches:
       - main
       - automation/bors/auto
-      - automation/bors/auto-merge
       - automation/bors/try
-      - automation/bors/try-merge
 
 permissions:
   contents: read
