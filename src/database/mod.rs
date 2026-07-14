@@ -456,12 +456,14 @@ pub struct PullRequestModel {
     mergeable_state_is_stale: bool,
     /// Approval status including approver and approved commit SHA.
     pub approval_status: ApprovalStatus,
-    /// Temporary permissions granted to the PR author by a reviewer (try or review).
-    pub delegated_permission: Option<DelegatedPermission>,
+    /// Pull request-scoped permissions (try or review) granted to a GitHub user by a reviewer.
+    pub delegation: DelegationStatus,
     /// Priority for merge queue ordering. Higher priority PRs are merged first.
     pub priority: Option<i32>,
     /// Rollup mode determining if this PR can be included in rollup builds.
     pub rollup: Option<RollupMode>,
+    /// Optional note that can be attached while approving or setting the rollup mode or priority.
+    note: Option<String>,
     /// The (latest) try build associated with this PR, if any.
     pub try_build: Option<BuildModel>,
     /// The (latest) auto merge build associated with this PR, if any.
@@ -538,6 +540,58 @@ impl PullRequestModel {
             | QueueStatus::NotOpen => false,
         }
     }
+
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+}
+
+#[derive(Debug)]
+pub enum DelegationStatus {
+    NotDelegated,
+    Delegated(Delegation),
+}
+
+#[derive(Debug)]
+pub struct Delegation {
+    /// GitHub ID of the user who was delegated the permissions.
+    delegatee: u64,
+    permission: DelegatedPermission,
+}
+
+impl Delegation {
+    pub fn delegatee(&self) -> u64 {
+        self.delegatee
+    }
+
+    pub fn permission(&self) -> DelegatedPermission {
+        self.permission
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for DelegationStatus {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <(Option<i64>, Option<String>) as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for DelegationStatus {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, BoxDynError> {
+        let (delegatee, permission) =
+            <(Option<i64>, Option<String>) as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+
+        match (delegatee, permission) {
+            (Some(delegatee), Some(permission)) => Ok(DelegationStatus::Delegated(Delegation {
+                delegatee: delegatee as u64,
+                permission: DelegatedPermission::from_str(&permission)?,
+            })),
+            (None, None) => Ok(DelegationStatus::NotDelegated),
+            (delegatee, permission) => Err(format!(
+                "Inconsistent delegation status: delegatee={delegatee:?}, permission={permission:?}"
+            )
+            .into()),
+        }
+    }
 }
 
 /// Describes whether a workflow is a Github Actions workflow or if it's a job from some external
@@ -601,6 +655,8 @@ pub enum TreeState {
         priority: u32,
         /// URL to a PR comment that closed the tree.
         source: String,
+        /// Optional reason that specifies why was the tree closed.
+        reason: Option<String>,
     },
 }
 
@@ -616,6 +672,13 @@ impl TreeState {
         }
     }
 
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            TreeState::Closed { reason, .. } => reason.as_deref(),
+            TreeState::Open => None,
+        }
+    }
+
     pub fn comment_source(&self) -> Option<&str> {
         match self {
             TreeState::Closed { source, .. } => Some(source),
@@ -626,19 +689,22 @@ impl TreeState {
 
 impl sqlx::Type<sqlx::Postgres> for TreeState {
     fn type_info() -> sqlx::postgres::PgTypeInfo {
-        <(Option<i32>, Option<String>) as sqlx::Type<sqlx::Postgres>>::type_info()
+        <(Option<i32>, Option<String>, Option<String>) as sqlx::Type<sqlx::Postgres>>::type_info()
     }
 }
 
 impl sqlx::Decode<'_, sqlx::Postgres> for TreeState {
     fn decode(value: <Postgres as Database>::ValueRef<'_>) -> Result<Self, BoxDynError> {
-        let data = <(Option<i32>, Option<String>) as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+        let data = <(Option<i32>, Option<String>, Option<String>) as sqlx::Decode<
+            sqlx::Postgres,
+        >>::decode(value)?;
         match data {
-            (Some(priority), Some(source)) => Ok(TreeState::Closed {
+            (Some(priority), Some(source), reason) => Ok(TreeState::Closed {
                 priority: priority as u32,
+                reason,
                 source,
             }),
-            (None, None) => Ok(TreeState::Open),
+            (None, None, _) => Ok(TreeState::Open),
             _ => Err(
                 "Cannot deserialize TreeState, priority is non-NULL, but source is NULL"
                     .to_string()
@@ -793,9 +859,10 @@ pub fn pr_needs_update_in_db(db_pr: &PullRequestModel, gh_pr: &PullRequest) -> b
         mergeable_state: _,
         mergeable_state_is_stale: _,
         approval_status: _,
-        delegated_permission: _,
+        delegation: _,
         priority: _,
         rollup: _,
+        note: _,
         try_build: _,
         auto_build: _,
         created_at: _,

@@ -1,3 +1,5 @@
+use crate::bors::PullRequestStatus;
+use crate::github::GithubRepoName;
 use crate::github::api::client::HideCommentReason;
 use crate::tests::github::CommentMsg;
 use crate::tests::mock::app::{AppHandler, default_app_id};
@@ -9,6 +11,7 @@ use graphql_parser::query::{Definition, Document, OperationDefinition, Selection
 use http::HeaderValue;
 use http::header::AUTHORIZATION;
 use octocrab::Octocrab;
+use octocrab::models::pulls::MergeableState;
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::HashMap;
@@ -52,6 +55,7 @@ struct GitHubUser {
     received_events_url: Url,
     r#type: String,
     site_admin: bool,
+    email: Option<String>,
 }
 
 impl From<User> for GitHubUser {
@@ -101,6 +105,7 @@ impl From<User> for GitHubUser {
                 .unwrap(),
             r#type: "User".to_string(),
             site_admin: false,
+            email: None,
         }
     }
 }
@@ -150,6 +155,7 @@ impl GitHubMockServer {
             mock_repo_list(github.clone(), &mock_server).await;
             mock_oauth(github.clone(), &mock_server).await;
             mock_graphql(github.clone(), &mock_server).await;
+            mock_users(github.clone(), &mock_server).await;
 
             // Repositories are mocked separately to make it easier to
             // pass comm. channels to them.
@@ -319,11 +325,85 @@ async fn mock_graphql(github: Arc<Mutex<GitHub>>, mock_server: &MockServer) {
                     });
                     ResponseTemplate::new(200).set_body_json(response)
                 }
+                "repository" => {
+                    #[derive(serde::Deserialize)]
+                    struct Variables {
+                        owner: String,
+                        name: String,
+                        base_branch: String,
+                    }
+                    let data: Variables = serde_json::from_value(body.variables).unwrap();
+                    let prs = github
+                        .lock()
+                        .get_repo(GithubRepoName::new(&data.owner, &data.name))
+                        .lock()
+                        .pulls()
+                        .values()
+                        .filter(|pr| {
+                            pr.merged_at.is_none()
+                                && pr.closed_at.is_none()
+                                && pr.base_branch.name() == data.base_branch
+                        })
+                        .take(100)
+                        .map(|pr| {
+                            serde_json::json!({
+                                "number": pr.number.0,
+                                "mergedAt": pr.merged_at,
+                                "closedAt": pr.closed_at,
+                                "isDraft": pr.status == PullRequestStatus::Draft,
+                                "mergeable": match pr.mergeable_state {
+                                    MergeableState::Unknown => "UNKNOWN",
+                                    MergeableState::Clean => "MERGEABLE",
+                                    _ => "CONFLICTING",
+                                },
+                                "labels": {
+                                    "nodes": pr.labels.iter().map(|label| serde_json::json!({ "name": label })).collect::<Vec<_>>(),
+                                    "pageInfo": {
+                                        "endCursor": "",
+                                        "hasNextPage": false
+                                    }
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let response = serde_json::json!({
+                        "data": {
+                            "repository": {
+                                "pullRequests": {
+                                    "nodes": prs,
+                                    "pageInfo": {
+                                        "endCursor": "",
+                                        "hasNextPage": false
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ResponseTemplate::new(200).set_body_json(response)
+                }
                 _ => panic!("Unexpected GraphQL operation {}", operation.name),
             }
         },
         "POST",
         "^/graphql$".to_string(),
+    )
+    .mount(mock_server)
+    .await;
+}
+
+async fn mock_users(github: Arc<Mutex<GitHub>>, mock_server: &MockServer) {
+    dynamic_mock_req(
+        move |_: &Request, [username]: [&str; 1]| {
+            let gh = github.lock();
+            match gh.get_user(username) {
+                Some(user) => {
+                    ResponseTemplate::new(200).set_body_json(GitHubUser::from(user.clone()))
+                }
+                None => ResponseTemplate::new(404),
+            }
+        },
+        "GET",
+        "^/users/(.*)$".to_string(),
     )
     .mount(mock_server)
     .await;

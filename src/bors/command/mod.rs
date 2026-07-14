@@ -84,6 +84,32 @@ impl FromStr for RollupMode {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum Delegatee {
+    /// Delegate to the PR author.
+    PullRequestAuthor,
+    /// Legacy way to delegate to the PR author, via e.g. `@bors delegate=try`.
+    PullRequestAuthorLegacy,
+    /// Delegate to a specific user.
+    User(String),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DelegateCommand {
+    pub delegatee: Delegatee,
+    pub permission: DelegatedPermission,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SquashCommitMessage {
+    /// Automatically generate a commit message based on the messages of the squashed commits.
+    AutoGenerate,
+    /// Set the commit message to the PR body.
+    PullRequestDescription,
+    /// Set an explicit commit message.
+    Explicit(String),
+}
+
 /// Bors command specified by a user.
 ///
 /// When modifying commands, remember to also update:
@@ -99,6 +125,8 @@ pub enum BorsCommand {
         priority: Option<Priority>,
         /// Rollup status of the commit.
         rollup: Option<RollupMode>,
+        /// Optional note attached at the end of the command.
+        note: Option<String>,
     },
     /// Unapprove a commit.
     Unapprove,
@@ -116,24 +144,33 @@ pub enum BorsCommand {
     /// Cancel a try build currently running on a given PR.
     TryCancel,
     /// Set the priority of a PR.
-    SetPriority(Priority),
+    SetPriority {
+        priority: Priority,
+        note: Option<String>,
+    },
     /// Get information about the current PR.
     Info,
     /// Delegate approval authority to the pull request author.
-    SetDelegate(DelegatedPermission),
+    Delegate(DelegateCommand),
     /// Revoke any previously granted delegation.
     Undelegate,
     /// Set the rollup mode of a PRstatus.
-    SetRollupMode(RollupMode),
+    SetRollupMode {
+        rollup_mode: RollupMode,
+        note: Option<String>,
+    },
     /// Open the repository tree for merging.
     OpenTree,
     /// Set the tree closed with a priority level.
-    TreeClosed(Priority),
+    TreeClosed {
+        priority: Priority,
+        reason: Option<String>,
+    },
     /// Clear a failed auto build status from an approved PR.
     /// This will cause the merge queue to eventually attempt to try to test the PR again.
     Retry,
     /// Cancel an auto build currently running on a given PR (without removing it from the queue).
     Cancel,
     /// Squash all commits of a pull request into a single commit.
-    Squash { commit_message: Option<String> },
+    Squash { commit_message: SquashCommitMessage },
 }

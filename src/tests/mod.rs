@@ -4,8 +4,8 @@ use crate::bors::{
     WAIT_FOR_PR_STATUS_REFRESH, WAIT_FOR_WEBHOOK_COMPLETED,
 };
 use crate::database::{
-    BuildModel, BuildStatus, DelegatedPermission, MergeableState, OctocrabMergeableState,
-    PullRequestModel, WorkflowStatus,
+    BuildModel, BuildStatus, DelegatedPermission, DelegationStatus, MergeableState,
+    OctocrabMergeableState, PullRequestModel, WorkflowStatus,
 };
 use crate::github::PullRequestNumber;
 use crate::{
@@ -54,6 +54,7 @@ pub use github::Branch;
 pub use github::Comment;
 pub use github::Commit;
 pub use github::GitHub;
+pub use github::GitUser;
 pub use github::Permissions;
 pub use github::PrIdentifier;
 pub use github::PullRequest;
@@ -469,7 +470,7 @@ impl BorsTester {
     #[allow(unused)]
     pub fn dump_mergeability_queue(&self) {
         eprintln!("Mergeability queue contents:");
-        let prs = self.senders.mergeability_queue().get_queue_prs();
+        let prs = self.senders.mergeability_queue().get_queue_entries();
         for pr in prs {
             eprintln!("{pr:?}");
         }
@@ -1422,11 +1423,36 @@ impl PullRequestProxy {
     }
 
     #[track_caller]
-    pub fn expect_delegated(&self, delegation_type: DelegatedPermission) -> &Self {
-        assert_eq!(
-            self.require_db_pr().delegated_permission.as_ref().unwrap(),
-            &delegation_type
-        );
+    pub fn expect_note(&self, note: Option<&str>) -> &Self {
+        assert_eq!(self.require_db_pr().note(), note);
+        self
+    }
+
+    #[track_caller]
+    pub fn expect_not_delegated(&self) -> &Self {
+        assert!(matches!(
+            self.require_db_pr().delegation,
+            DelegationStatus::NotDelegated
+        ));
+        self
+    }
+
+    #[track_caller]
+    pub fn expect_delegated(
+        &self,
+        delegatee_id: u64,
+        delegated_permission: DelegatedPermission,
+    ) -> &Self {
+        let delegation = &self.require_db_pr().delegation;
+        match delegation {
+            DelegationStatus::NotDelegated => {
+                panic!("PR was supposed to be delegated to {delegatee_id}, but it is not delegated")
+            }
+            DelegationStatus::Delegated(delegation) => {
+                assert_eq!(delegation.delegatee(), delegatee_id);
+                assert_eq!(delegation.permission(), delegated_permission);
+            }
+        }
         self
     }
 

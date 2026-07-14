@@ -38,7 +38,12 @@ pub(super) async fn command_retry(
         merge_queue_tx.notify().await?;
 
         // Retrying is essentially like a reapproval
-        handle_label_trigger(&repo_state, pr.github, LabelTrigger::Approved).await?;
+        handle_label_trigger(
+            &repo_state,
+            &pr.github.clone().into(),
+            LabelTrigger::Approved,
+        )
+        .await?;
     } else {
         let pending_auto_build = pr_model
             .auto_build
@@ -147,7 +152,7 @@ async fn notify_of_invalid_retry_state(
 mod tests {
     use crate::tests::{BorsTester, Comment, GitHub, User, run_test};
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn retry_command_insufficient_privileges(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(Comment::from("@bors retry").with_author(User::unprivileged()))
@@ -161,7 +166,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn retry_invalid_state_error(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors retry").await?;
@@ -174,7 +179,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn retry_invalid_state_error_pending_build_hint(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -194,7 +199,7 @@ mod tests {
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn retry_auto_build(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -213,7 +218,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn retry_apply_label(pool: sqlx::PgPool) {
         let gh = GitHub::default().with_default_config(
             r#"
@@ -237,7 +242,7 @@ auto_build_failed = ["-foo"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_no_running_build(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors cancel").await?;
@@ -247,7 +252,7 @@ auto_build_failed = ["-foo"]
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_while_try_build_is_running(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
@@ -263,7 +268,7 @@ auto_build_failed = ["-foo"]
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_cancel_workflows(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -290,7 +295,7 @@ auto_build_failed = ["-foo"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_error(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;

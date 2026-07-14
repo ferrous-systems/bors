@@ -168,6 +168,29 @@ impl QueueTemplate {
         let percent = ((elapsed.as_secs_f64() / average_duration.as_secs_f64()) * 100.0) as u32;
         percent.min(100)
     }
+
+    fn compute_title(&self, pr: &PullRequestModel) -> Option<String> {
+        let is_rollup = self.rollups_info.rollups.contains_key(&pr.number);
+
+        let mut title = String::new();
+        if is_rollup {
+            title.push_str("Select PRs of this rollup");
+        }
+        if let Some(note) = pr.note() {
+            if !title.is_empty() {
+                title.push('\n');
+            }
+            write!(title, "Note: {note}").unwrap();
+        }
+
+        if !title.is_empty() { Some(title) } else { None }
+    }
+
+    fn has_significant_perf(&self, pr: &PullRequestModel) -> bool {
+        // This is a special note added by rustc-perf when it performs a try benchmark on a PR
+        // and the result is significant
+        pr.note() == Some("rustc-perf")
+    }
 }
 
 #[derive(Template)]

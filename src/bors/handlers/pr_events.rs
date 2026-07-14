@@ -16,7 +16,6 @@ use crate::bors::{AUTO_BRANCH_NAME, BorsContext, hide_tagged_comments};
 use crate::bors::{PullRequestStatus, RepositoryState};
 use crate::database::{PullRequestModel, UpsertPullRequestParams};
 use crate::github::CommitSha;
-use crate::utils::text::pluralize;
 use std::sync::Arc;
 
 pub(super) async fn handle_pull_request_edited(
@@ -249,9 +248,7 @@ pub(super) async fn handle_push_to_branch(
 
     if !affected_prs.is_empty() {
         tracing::info!(
-            "Adding {} {} to the mergeability queue due to a new commit pushed to base branch `{}`",
-            affected_prs.len(),
-            pluralize("PR", affected_prs.len()),
+            "Adding a batch to the mergeability queue due to a new commit pushed to base branch `{}`",
             payload.branch
         );
 
@@ -262,9 +259,7 @@ pub(super) async fn handle_push_to_branch(
             .flatten()
             .map(|pr| pr.number);
 
-        for pr in affected_prs {
-            mergeability_queue.enqueue_pr(&pr, merged_pr);
-        }
+        mergeability_queue.enqueue_batch(repo_state.repository(), &payload.branch, merged_pr);
     }
 
     Ok(())
@@ -332,7 +327,7 @@ mod tests {
         tests::{User, default_branch_name, run_test},
     };
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_on_base_edited(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -356,7 +351,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn edit_pr_do_nothing_when_base_not_edited(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -370,7 +365,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn change_pr_base_branch_warning(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let branch = ctx.create_branch("beta");
@@ -385,7 +380,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_on_push(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -405,7 +400,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn push_to_pr_do_nothing_when_not_approved(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.push_to_pr((), Commit::from_sha("foo")).await?;
@@ -416,7 +411,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn push_to_pr_do_nothing_when_build_failed(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -433,7 +428,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn push_to_pr_do_not_send_mergeability_notification(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -456,7 +451,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn push_to_pr_hide_previous_mergeability_notification(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -482,7 +477,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn edit_pr_while_in_mergeability_queue(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -510,7 +505,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn edit_pr_while_not_in_mergeability_queue(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -537,7 +532,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn store_base_branch_on_pr_opened(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
@@ -550,7 +545,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn update_base_branch_on_pr_edited(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let branch = ctx.create_branch("foo");
@@ -564,7 +559,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn update_mergeability_state_on_pr_edited(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.edit_pr((), |pr| {
@@ -580,7 +575,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn open_close_and_reopen_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
@@ -597,7 +592,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_on_close(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -609,7 +604,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn open_draft_pr_and_convert_to_ready_for_review(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx
@@ -627,7 +622,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn open_pr_and_convert_to_draft(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
@@ -641,7 +636,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn assign_pr_updates_assignees(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
@@ -655,7 +650,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unassign_pr_updates_assignees(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
@@ -670,7 +665,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn open_and_merge_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
@@ -684,7 +679,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn mergeability_queue_processes_pr_base_change(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let branch = ctx.create_branch("beta");
@@ -705,7 +700,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn enqueue_prs_on_push_to_branch(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx
@@ -729,7 +724,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn conflict_message_disabled_in_config(pool: sqlx::PgPool) {
         let gh = GitHub::default().with_default_config(
             r#"
@@ -753,7 +748,7 @@ report_merge_conflicts = false
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn conflict_message_unknown_sha(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx
@@ -778,7 +773,7 @@ report_merge_conflicts = false
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn conflict_message_unknown_sha_approved(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx
@@ -805,7 +800,7 @@ report_merge_conflicts = false
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn conflict_message_known_sha(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr2 = ctx
@@ -840,42 +835,7 @@ report_merge_conflicts = false
             .await;
     }
 
-    #[sqlx::test]
-    async fn conflict_message_known_sha_race_condition(pool: sqlx::PgPool) {
-        run_test(pool, async |ctx: &mut BorsTester| {
-            let pr2 = ctx
-                .open_pr((), |_| {})
-                .await?;
-            ctx.approve(pr2.id()).await?;
-            ctx.start_and_finish_auto_build(pr2.id()).await?;
-            let commit = ctx.auto_branch().get_commit().clone();
-
-            // Drain the queue
-            ctx.drain_mergeability_queue().await?;
-
-            // Open a new PR
-            let pr3 = ctx
-                .open_pr((), |_| {})
-                .await?;
-            ctx.pr(pr3.id()).await.expect_mergeable_state(MergeableState::Mergeable);
-            ctx
-                .modify_pr_in_gh(pr3.id(), |pr| {
-                    pr.mergeable_state = OctocrabMergeableState::Dirty;
-                });
-
-            // Now PR 3 is in the mergeability queue. We do not drain it, so after the push,
-            // the conflict source will not get updated. So we will lose the conflict source
-            // information.
-            ctx.push_to_branch(default_branch_name(), commit).await?;
-            ctx.run_mergeability_check().await?;
-            assert_snapshot!(ctx.get_next_comment_text(pr3.id()).await?, @":umbrella: The latest upstream changes made this pull request unmergeable. Please [resolve the merge conflicts by rebasing](https://rustc-dev-guide.rust-lang.org/git.html#rebasing-and-conflicts).");
-
-            Ok(())
-        })
-            .await;
-    }
-
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn conflict_label(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::default().append_to_default_config(
@@ -904,7 +864,7 @@ conflict = ["+conflict"]
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn enqueue_prs_on_pr_opened(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx
@@ -921,7 +881,7 @@ conflict = ["+conflict"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn enqueue_prs_on_pr_reopened(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_pr_in_gh((), |pr| {
@@ -942,7 +902,7 @@ conflict = ["+conflict"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn enqueue_prs_on_push_to_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.push_to_pr((), Commit::from_sha("foo")).await?;
@@ -958,7 +918,7 @@ conflict = ["+conflict"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_pending_auto_build_on_push_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -983,7 +943,7 @@ conflict = ["+conflict"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_pending_auto_build_on_push_error_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_repo((), |repo| {
@@ -1007,7 +967,7 @@ conflict = ["+conflict"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_pending_auto_build_on_push_updates_check_run(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1029,7 +989,7 @@ conflict = ["+conflict"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_pending_auto_build_on_close(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1052,7 +1012,7 @@ conflict = ["+conflict"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn process_bors_commands_in_pr_description(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx

@@ -13,7 +13,7 @@ use crate::bors::handlers::refresh::{
     reload_mergeability_status, reload_repository_config, reload_repository_permissions,
 };
 use crate::bors::handlers::review::{
-    command_approve, command_close_tree, command_open_tree, command_unapprove,
+    TreeCloseArguments, command_approve, command_close_tree, command_open_tree, command_unapprove,
 };
 use crate::bors::handlers::trybuild::{command_try_build, command_try_cancel};
 use crate::bors::handlers::workflow::{
@@ -27,8 +27,10 @@ use crate::bors::{
     AUTO_BRANCH_NAME, BorsContext, CommandPrefix, Comment, PullRequestStatus, RepositoryState,
     TRY_BRANCH_NAME,
 };
-use crate::database::{DelegatedPermission, PullRequestModel};
-use crate::github::{CommitSha, GithubUser, LabelTrigger, PullRequest, PullRequestNumber};
+use crate::database::{DelegatedPermission, DelegationStatus, PullRequestModel};
+use crate::github::{
+    CommitSha, GithubUser, LabelTrigger, PullRequest, PullRequestInfo, PullRequestNumber,
+};
 use crate::permissions::PermissionType;
 use crate::{PgDbClient, TeamApiClient, load_repositories};
 use anyhow::Context;
@@ -396,6 +398,7 @@ async fn handle_comment(
                         approver,
                         priority,
                         rollup,
+                        note,
                     } => {
                         let span = tracing::info_span!("Approve");
                         command_approve(
@@ -407,6 +410,7 @@ async fn handle_comment(
                             &approver,
                             priority,
                             rollup,
+                            note,
                             senders.merge_queue(),
                         )
                         .instrument(span)
@@ -424,15 +428,18 @@ async fn handle_comment(
                         .instrument(span)
                         .await
                     }
-                    BorsCommand::TreeClosed(priority) => {
+                    BorsCommand::TreeClosed { priority, reason } => {
                         let span = tracing::info_span!("TreeClosed");
                         command_close_tree(
                             repo,
                             database,
                             pr,
                             &comment.author,
-                            priority,
-                            &comment.html_url,
+                            TreeCloseArguments {
+                                priority,
+                                reason,
+                                comment_url: &comment.html_url,
+                            },
                             senders.merge_queue(),
                         )
                         .instrument(span)
@@ -444,20 +451,20 @@ async fn handle_comment(
                             .instrument(span)
                             .await
                     }
-                    BorsCommand::SetPriority(priority) => {
+                    BorsCommand::SetPriority { priority, note } => {
                         let span = tracing::info_span!("Priority");
-                        command_set_priority(repo, database, pr, &comment.author, priority)
+                        command_set_priority(repo, database, pr, &comment.author, priority, note)
                             .instrument(span)
                             .await
                     }
-                    BorsCommand::SetDelegate(delegate_type) => {
+                    BorsCommand::Delegate(cmd) => {
                         let span = tracing::info_span!("Delegate");
                         command_delegate(
                             repo,
                             database,
                             pr,
                             &comment.author,
-                            delegate_type,
+                            cmd,
                             ctx.parser.prefix(),
                         )
                         .instrument(span)
@@ -509,9 +516,9 @@ async fn handle_comment(
                         let span = tracing::info_span!("Info");
                         command_info(repo, pr, database).instrument(span).await
                     }
-                    BorsCommand::SetRollupMode(rollup) => {
+                    BorsCommand::SetRollupMode { rollup_mode, note } => {
                         let span = tracing::info_span!("Rollup");
-                        command_set_rollup(repo, database, pr, &comment.author, rollup)
+                        command_set_rollup(repo, database, pr, &comment.author, rollup_mode, note)
                             .instrument(span)
                             .await
                     }
@@ -598,10 +605,12 @@ async fn handle_comment(
                     }
                     CommandParseError::UnclosedQuote => "Unclosed quote in argument.".to_string(),
                 };
+                let help_url = ctx.get_web_url();
                 writeln!(
                     message,
-                    " Run `{} help` to see available commands.",
-                    ctx.parser.prefix()
+                    " Run `{} help` or go to <{help_url}{}help> to see available commands.",
+                    ctx.parser.prefix(),
+                    if help_url.ends_with('/') { "" } else { "/" },
                 )?;
                 tracing::warn!("{}", message);
                 repo.client
@@ -683,19 +692,23 @@ async fn has_permission(
         return Ok(true);
     }
 
-    if user.id != pr.github.author.id {
-        return Ok(false);
-    }
-
-    let is_delegated = pr
-        .db
-        .delegated_permission
-        .is_some_and(|perm| match permission {
-            PermissionType::Review => matches!(perm, DelegatedPermission::Review),
-            PermissionType::Try => {
-                matches!(perm, DelegatedPermission::Try | DelegatedPermission::Review)
+    let is_delegated = match &pr.db.delegation {
+        DelegationStatus::NotDelegated => false,
+        DelegationStatus::Delegated(delegation) => {
+            if delegation.delegatee() == *user.id {
+                match delegation.permission() {
+                    DelegatedPermission::Review => {
+                        matches!(permission, PermissionType::Review | PermissionType::Try)
+                    }
+                    DelegatedPermission::Try => {
+                        matches!(permission, PermissionType::Try)
+                    }
+                }
+            } else {
+                false
             }
-        });
+        }
+    };
 
     Ok(is_delegated)
 }
@@ -751,7 +764,7 @@ pub async fn unapprove_pr(
     repo_state: &RepositoryState,
     db: &PgDbClient,
     pr_db: &PullRequestModel,
-    pr_gh: &PullRequest,
+    pr_gh: &PullRequestInfo,
 ) -> anyhow::Result<()> {
     db.unapprove(pr_db).await?;
     handle_label_trigger(repo_state, pr_gh, LabelTrigger::Unapproved).await?;
@@ -817,7 +830,7 @@ pub async fn invalidate_pr(
     // Step 1: unapprove the pull request if it was approved
     // This happens everytime the PR is invalidated, if it was approved before
     let pr_unapproved = if pr_db.is_approved() {
-        unapprove_pr(repo_state, db, pr_db, pr_gh).await?;
+        unapprove_pr(repo_state, db, pr_db, &pr_gh.clone().into()).await?;
         true
     } else {
         false
@@ -1095,7 +1108,7 @@ fn is_bors_observed_branch(branch: &str) -> bool {
 mod tests {
     use crate::tests::{BorsTester, Comment, User, run_test};
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn ignore_bot_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(Comment::from("@bors ping").with_author(User::bors_bot()))
@@ -1106,7 +1119,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn do_not_load_pr_on_unrelated_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_repo((), |repo| repo.pull_request_error = true);
@@ -1116,11 +1129,11 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unknown_command(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(Comment::from("@bors foo")).await?;
-            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"Unknown command "foo". Run `@bors help` to see available commands."#);
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"Unknown command "foo". Run `@bors help` or go to <https://bors-test.com/help> to see available commands."#);
             Ok(())
         })
             .await;

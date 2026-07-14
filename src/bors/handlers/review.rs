@@ -1,6 +1,6 @@
 use crate::bors::RepositoryState;
-use crate::bors::command::RollupMode;
-use crate::bors::command::{Approver, CommandPrefix};
+use crate::bors::command::{Approver, CommandPrefix, Delegatee};
+use crate::bors::command::{DelegateCommand, RollupMode};
 use crate::bors::comment::{
     approve_blocking_labels_present, approve_merge_conflict_comment, approve_non_open_pr_comment,
     approve_wip_title, approved_comment, delegate_comment, delegate_try_builds_comment,
@@ -19,6 +19,7 @@ use crate::github::{GithubUser, PullRequestNumber};
 use crate::permissions::PermissionType;
 use crate::{BorsContext, PgDbClient};
 use std::sync::Arc;
+use tracing::log;
 
 /// Approve a pull request.
 /// A pull request can only be approved by a user of sufficient authority.
@@ -32,6 +33,7 @@ pub(super) async fn command_approve(
     approver: &Approver,
     priority: Option<u32>,
     rollup_mode: Option<RollupMode>,
+    note: Option<String>,
     merge_queue_tx: &MergeQueueSender,
 ) -> anyhow::Result<()> {
     tracing::info!("Approving PR {}", pr.number());
@@ -80,7 +82,7 @@ pub(super) async fn command_approve(
         sha: pr.github.head.sha.to_string(),
     };
 
-    db.approve(pr.db, approval_info, priority, rollup_mode)
+    db.approve(pr.db, approval_info, priority, rollup_mode, note)
         .await?;
 
     let was_failed = pr
@@ -133,7 +135,12 @@ pub(super) async fn command_approve(
         )
         .await?;
 
-    handle_label_trigger(&repo_state, pr.github, LabelTrigger::Approved).await
+    handle_label_trigger(
+        &repo_state,
+        &pr.github.clone().into(),
+        LabelTrigger::Approved,
+    )
+    .await
 }
 
 /// Normalize approvers (given after @bors r=) by removing leading @, possibly from multiple
@@ -271,6 +278,7 @@ pub(super) async fn command_set_priority(
     pr: PullRequestData<'_>,
     author: &GithubUser,
     priority: u32,
+    note: Option<String>,
 ) -> anyhow::Result<()> {
     if !has_permission(&repo_state, author, pr, PermissionType::Review).await? {
         deny_request(
@@ -283,7 +291,7 @@ pub(super) async fn command_set_priority(
         .await?;
         return Ok(());
     };
-    db.set_priority(pr.db, priority).await
+    db.set_priority(pr.db, priority, note).await
 }
 
 /// Delegate permissions of a pull request to its author.
@@ -292,13 +300,17 @@ pub(super) async fn command_delegate(
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
-    delegated_permission: DelegatedPermission,
+    delegate_cmd: DelegateCommand,
     bot_prefix: &CommandPrefix,
 ) -> anyhow::Result<()> {
     tracing::info!(
-        "Delegating PR {} {} permissions",
+        "Delegating PR {} to {} ({} permission)",
         pr.number(),
-        delegated_permission
+        match &delegate_cmd.delegatee {
+            Delegatee::PullRequestAuthor | Delegatee::PullRequestAuthorLegacy => "PR author",
+            Delegatee::User(user) => user,
+        },
+        delegate_cmd.permission
     );
     if !sufficient_delegate_permission(repo_state.clone(), author) {
         deny_request(
@@ -312,14 +324,42 @@ pub(super) async fn command_delegate(
         return Ok(());
     }
 
-    db.delegate(pr.db, delegated_permission).await?;
+    let delegatee = match &delegate_cmd.delegatee {
+        Delegatee::PullRequestAuthor | Delegatee::PullRequestAuthorLegacy => {
+            pr.github.author.clone()
+        }
+        Delegatee::User(username) => {
+            let user = repo_state.client.get_user(username).await;
+            match user {
+                Ok(user) => user,
+                Err(error) => {
+                    log::error!("Cannot fetch delegatee username `{username}`: {error:?}");
+                    repo_state
+                        .client
+                        .post_comment(
+                            pr.number(),
+                            Comment::new(format!(
+                                "Cannot fetch information about user `{username}`."
+                            )),
+                            &db,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    db.delegate(pr.db, delegatee.id, delegate_cmd.permission)
+        .await?;
     notify_of_delegation(
         &repo_state,
         &db,
         pr.db,
         pr.github,
         &author.username,
-        delegated_permission,
+        &delegatee,
+        delegate_cmd,
         bot_prefix,
     )
     .await
@@ -355,6 +395,7 @@ pub(super) async fn command_set_rollup(
     pr: PullRequestData<'_>,
     author: &GithubUser,
     rollup_mode: RollupMode,
+    note: Option<String>,
 ) -> anyhow::Result<()> {
     // Require only try for rollup commands, because rust-timer uses them, and we don't want to
     // grant it approve permissions.
@@ -370,7 +411,13 @@ pub(super) async fn command_set_rollup(
         return Ok(());
     }
 
-    db.set_rollup_mode(pr.db, rollup_mode).await
+    db.set_rollup_mode(pr.db, rollup_mode, note).await
+}
+
+pub struct TreeCloseArguments<'a> {
+    pub priority: u32,
+    pub reason: Option<String>,
+    pub comment_url: &'a str,
 }
 
 pub(super) async fn command_close_tree(
@@ -378,10 +425,15 @@ pub(super) async fn command_close_tree(
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
-    priority: u32,
-    comment_url: &str,
+    args: TreeCloseArguments<'_>,
     merge_queue_tx: &MergeQueueSender,
 ) -> anyhow::Result<()> {
+    let TreeCloseArguments {
+        priority,
+        reason,
+        comment_url,
+    } = args;
+
     if !sufficient_approve_permission(repo_state.clone(), author) {
         deny_request(
             &repo_state,
@@ -397,6 +449,7 @@ pub(super) async fn command_close_tree(
         repo_state.repository(),
         TreeState::Closed {
             priority,
+            reason,
             source: comment_url.to_string(),
         },
     )
@@ -477,24 +530,31 @@ async fn notify_of_tree_open(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn notify_of_delegation(
     repo: &RepositoryState,
     db: &PgDbClient,
     pr_db: &PullRequestModel,
     pr_gh: &PullRequest,
     delegator: &str,
-    delegated_permission: DelegatedPermission,
+    delegatee: &GithubUser,
+    delegate_cmd: DelegateCommand,
     bot_prefix: &CommandPrefix,
 ) -> anyhow::Result<()> {
-    let delegatee = pr_gh.author.username.as_str();
-    let comment = match delegated_permission {
-        DelegatedPermission::Try => delegate_try_builds_comment(delegatee, bot_prefix),
+    let legacy = match delegate_cmd.delegatee {
+        Delegatee::PullRequestAuthorLegacy => true,
+        Delegatee::PullRequestAuthor | Delegatee::User(_) => false,
+    };
+
+    let comment = match delegate_cmd.permission {
+        DelegatedPermission::Try => delegate_try_builds_comment(delegatee, legacy, bot_prefix),
         DelegatedPermission::Review => delegate_comment(
             pr_db,
             &pr_gh.base.sha,
             &pr_gh.head.sha,
             delegatee,
             delegator,
+            legacy,
             bot_prefix,
         ),
     };
@@ -513,7 +573,9 @@ mod tests {
 
     use crate::bors::TRY_BRANCH_NAME;
     use crate::bors::merge_queue::AUTO_BUILD_CHECK_RUN_NAME;
-    use crate::database::{DelegatedPermission, OctocrabMergeableState, TreeState};
+    use crate::database::{
+        DelegatedPermission, DelegationStatus, OctocrabMergeableState, TreeState,
+    };
     use crate::permissions::PermissionType;
     use crate::tests::default_repo_name;
     use crate::tests::{BorsTester, Commit};
@@ -522,7 +584,7 @@ mod tests {
         tests::{BorsBuilder, Comment, GitHub, Permissions, User, run_test},
     };
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn default_approve(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r+").await?;
@@ -544,7 +606,7 @@ mod tests {
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_add_label(pool: sqlx::PgPool) {
         let gh = GitHub::default().append_to_default_config(
             r#"
@@ -560,7 +622,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_on_behalf(pool: sqlx::PgPool) {
         let approve_user_id = 200;
         let approve_user = "user1";
@@ -589,7 +651,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_normalize_approver(pool: sqlx::PgPool) {
         let mut gh = GitHub::default();
         gh.add_user(User::new(201, "foo"));
@@ -616,7 +678,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_normalize_approver_multiple(pool: sqlx::PgPool) {
         let mut gh = GitHub::default();
         for (id, name) in [(202, "foo"), (203, "bar"), (204, "baz")] {
@@ -645,7 +707,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_unknown_reviewer(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             // Approve with a user that doesn't exist
@@ -667,7 +729,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_unknown_team(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r=nonexistent-team").await?;
@@ -688,7 +750,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_known_team(pool: sqlx::PgPool) {
         let mut gh = GitHub::default();
         gh.add_team("team1");
@@ -710,7 +772,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_known_reviewer_different_case(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r=DEFAULT-USER").await?;
@@ -727,7 +789,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn insufficient_permission_approve(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(Comment::from("@bors try").with_author(User::unprivileged()))
@@ -741,7 +803,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn insufficient_permission_set_priority(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(Comment::from("@bors p=2").with_author(User::unprivileged()))
@@ -756,7 +818,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_while_tree_is_closed(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors treeclosed=100").await?;
@@ -777,7 +839,7 @@ approved = ["+approved"]
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_while_tree_is_closed_high_priority(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors treeclosed=100").await?;
@@ -796,7 +858,7 @@ approved = ["+approved"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_do_not_unnecessarily_modify_labels(pool: sqlx::PgPool) {
         let gh = GitHub::default().append_to_default_config(
             r#"
@@ -825,7 +887,7 @@ approved = ["+foo", "+baz", "-bar", "-foo2"]
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn label_respect_unless(pool: sqlx::PgPool) {
         let gh = GitHub::default().append_to_default_config(
             r#"
@@ -852,7 +914,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r+").await?;
@@ -879,7 +941,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_lacking_permissions(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -898,7 +960,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_closed_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -919,7 +981,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_unapproved_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r-").await?;
@@ -932,7 +994,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_author(pool: sqlx::PgPool) {
         run_test(
             (pool, GitHub::unauthorized_pr_author()),
@@ -958,7 +1020,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_priority(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r+ p=10").await?;
@@ -973,7 +1035,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_on_behalf_with_priority(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r=user1 p=10").await?;
@@ -988,7 +1050,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn set_priority(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors p=5").await?;
@@ -998,7 +1060,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn priority_preserved_after_approve(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors p=5").await?;
@@ -1013,7 +1075,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn priority_overridden_on_approve_with_priority(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors p=5").await?;
@@ -1029,7 +1091,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn tree_closed_with_priority(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors treeclosed=5").await?;
@@ -1043,6 +1105,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 repo.unwrap().tree_state,
                 TreeState::Closed {
                     priority: 5,
+                    reason: None,
                     source: format!(
                         "https://github.com/{}/pull/1#issuecomment-1",
                         default_repo_name()
@@ -1055,7 +1118,49 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn tree_closed_with_reason(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors treeclosed=5 CI is flaky").await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @"Tree closed for PRs with priority less than 5."
+            );
+
+            let repo = ctx.db().repo_db(&default_repo_name()).await?;
+            assert_eq!(
+                repo.unwrap().tree_state,
+                TreeState::Closed {
+                    priority: 5,
+                    reason: Some("CI is flaky".to_string()),
+                    source: format!(
+                        "https://github.com/{}/pull/1#issuecomment-1",
+                        default_repo_name()
+                    ),
+                }
+            );
+
+            let pr = ctx.open_pr((), |_| {}).await?;
+            ctx.post_comment(Comment::new(pr.id(), "@bors r+")).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(pr.id()).await?,
+                @"
+            :pushpin: Commit pr-2-sha has been approved by `default-user`
+
+            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+
+            :evergreen_tree: The tree is currently [closed](https://github.com/rust-lang/borstest/pull/1#issuecomment-1) for pull requests below priority 5. This pull request will be tested once the tree is reopened.
+
+            Reason for tree closure: `CI is flaky`
+            "
+            );
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn insufficient_permission_tree_closed(pool: sqlx::PgPool) {
         let gh = GitHub::default();
         gh.default_repo().lock().permissions = Permissions::empty();
@@ -1077,7 +1182,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         Comment::from(text).with_author(User::reviewer())
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cannot_approve_without_delegation(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1092,7 +1197,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegate_author(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1114,13 +1219,13 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 ctx
                     .pr(())
                     .await
-                    .expect_delegated(DelegatedPermission::Review);
+                    .expect_delegated(User::default_pr_author().github_id, DelegatedPermission::Review);
                 Ok(())
             })
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegatee_can_approve(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1138,20 +1243,44 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
-    async fn delegate_error_message(pool: sqlx::PgPool) {
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delegatee_custom_user_can_approve(pool: sqlx::PgPool) {
+        let user = User::new(1000, "user1");
         BorsBuilder::new(pool)
-            .github(GitHub::unauthorized_pr_author())
+            .github(GitHub::unauthorized_pr_author().with_user(user.clone()))
             .run_test(async |ctx: &mut BorsTester| {
-                ctx.post_comment(review_comment("@bors delegate try"))
+                ctx.post_comment(review_comment("@bors delegate=user1"))
                     .await?;
-                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"Unknown argument "try". Did you mean to use `@bors delegate=<try|review>`? Run `@bors help` to see available commands."#);
+                ctx.expect_comments((), 1).await;
+
+                ctx.post_comment(Comment::new((), "@bors r+").with_author(user.clone()))
+                    .await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+                :pushpin: Commit pr-1-sha has been approved by `user1`
+
+                It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+                ");
+
+                ctx.pr(()).await.expect_approved_by(&user.name);
                 Ok(())
             })
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delegate_error_message(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(GitHub::unauthorized_pr_author())
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment(review_comment("@bors delegate foo"))
+                    .await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"Unknown argument "foo". Did you mean to use `@bors `try` or `review``? Run `@bors help` or go to <https://bors-test.com/help> to see available commands."#);
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegatee_can_try(pool: sqlx::PgPool) {
         let gh = BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1174,7 +1303,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         insta::assert_snapshot!(gh.get_sha_history((), TRY_BRANCH_NAME), @"merge-0-pr-1-d7d45f1f-reauthored-to-bors");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegatee_can_set_priority(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1190,7 +1319,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegate_insufficient_permission(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1205,27 +1334,30 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn undelegate_by_reviewer(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
             .run_test(async |ctx: &mut BorsTester| {
                 ctx.post_comment(review_comment("@bors delegate+")).await?;
                 ctx.expect_comments((), 1).await;
-                ctx.pr(())
-                    .await
-                    .expect_delegated(DelegatedPermission::Review);
+                ctx.pr(()).await.expect_delegated(
+                    User::default_pr_author().github_id,
+                    DelegatedPermission::Review,
+                );
 
                 ctx.post_comment(review_comment("@bors delegate-")).await?;
-                ctx.wait_for_pr((), |pr| pr.delegated_permission.is_none())
-                    .await?;
+                ctx.wait_for_pr((), |pr| {
+                    matches!(pr.delegation, DelegationStatus::NotDelegated)
+                })
+                .await?;
 
                 Ok(())
             })
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn undelegate_by_delegatee(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1234,15 +1366,17 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 ctx.expect_comments((), 1).await;
 
                 ctx.post_comment("@bors delegate-").await?;
-                ctx.wait_for_pr((), |pr| pr.delegated_permission.is_none())
-                    .await?;
+                ctx.wait_for_pr((), |pr| {
+                    matches!(pr.delegation, DelegationStatus::NotDelegated)
+                })
+                .await?;
 
                 Ok(())
             })
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn reviewer_unapprove_delegated_approval(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1268,7 +1402,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn non_author_cannot_use_delegation(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
@@ -1287,7 +1421,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegate_insufficient_permission_try_user(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .run_test(async |ctx: &mut BorsTester| {
@@ -1302,7 +1436,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_rollup_value(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r+ rollup=never").await?;
@@ -1317,7 +1451,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_rollup_bare(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r+ rollup").await?;
@@ -1332,7 +1466,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_rollup_bare_maybe(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r+ rollup-").await?;
@@ -1346,7 +1480,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_with_priority_rollup(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r+ p=10 rollup=never").await?;
@@ -1362,7 +1496,24 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn approve_with_note(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment(r#"@bors r+ rollup=never p=5 note="foo bar""#)
+                .await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.pr(())
+                .await
+                .expect_rollup(Some(RollupMode::Never))
+                .expect_approved_by(&User::default_pr_author().name)
+                .expect_note(Some("foo bar"));
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_on_behalf_with_rollup_bare(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r=user1 rollup").await?;
@@ -1376,7 +1527,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_on_behalf_with_rollup_value(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r=user1 rollup=always").await?;
@@ -1390,7 +1541,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_on_behalf_with_priority_rollup_value(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors r=user1 rollup=always priority=10")
@@ -1406,7 +1557,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn set_rollup_default(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors rollup").await?;
@@ -1417,7 +1568,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn set_rollup_with_value(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors rollup=maybe").await?;
@@ -1428,7 +1579,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn set_rollup_try_permissions(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(Comment::new((), "@bors rollup=never").with_author(User::try_user()))
@@ -1440,7 +1591,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn rollup_preserved_after_approve(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors rollup").await?;
@@ -1459,7 +1610,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn rollup_overridden_on_approve_with_rollup(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors rollup=never").await?;
@@ -1479,7 +1630,52 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn set_rollup_with_note(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors rollup=never foo bar").await?;
+            ctx.pr(())
+                .await
+                .expect_rollup(Some(RollupMode::Never))
+                .expect_note(Some("foo bar"));
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn set_priority_with_note(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors p=5 foo").await?;
+            ctx.pr(())
+                .await
+                .expect_priority(Some(5))
+                .expect_note(Some("foo"));
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn override_note(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors r+ note=foo").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.post_comment("@bors rollup=never bar").await?;
+            ctx.pr(())
+                .await
+                .expect_approved_by(&User::default_pr_author().name)
+                .expect_rollup(Some(RollupMode::Never))
+                .expect_note(Some("bar"));
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_store_sha(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.pr(()).await.get_gh_pr();
@@ -1492,7 +1688,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn reapproved_pr_uses_latest_sha(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.pr(()).await.get_gh_pr();
@@ -1515,12 +1711,12 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegate_try(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
             .run_test(async |ctx: &mut BorsTester| {
-                ctx.post_comment(review_comment("@bors delegate=try"))
+                ctx.post_comment(review_comment("@bors delegate try"))
                     .await?;
                 insta::assert_snapshot!(
                     ctx.get_next_comment_text(()).await?,
@@ -1530,18 +1726,45 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 You can now post `@bors try` to start a try build.
                 "
                 );
-                ctx.pr(()).await.expect_delegated(DelegatedPermission::Try);
+                ctx.pr(()).await.expect_delegated(
+                    User::default_pr_author().github_id,
+                    DelegatedPermission::Try,
+                );
                 Ok(())
             })
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delegate_try_legacy(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(GitHub::unauthorized_pr_author())
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment(review_comment("@bors delegate try"))
+                    .await?;
+                insta::assert_snapshot!(
+                    ctx.get_next_comment_text(()).await?,
+                    @"
+                :v: @default-user, you can now perform try builds on this pull request!
+
+                You can now post `@bors try` to start a try build.
+                "
+                );
+                ctx.pr(()).await.expect_delegated(
+                    User::default_pr_author().github_id,
+                    DelegatedPermission::Try,
+                );
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegated_try_can_build(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
             .run_test(async |ctx: &mut BorsTester| {
-                ctx.post_comment(review_comment("@bors delegate=try"))
+                ctx.post_comment(review_comment("@bors delegate try"))
                     .await?;
                 ctx.expect_comments((), 1).await;
 
@@ -1557,15 +1780,18 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn delegated_try_can_not_approve(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::unauthorized_pr_author())
             .run_test(async |ctx: &mut BorsTester| {
-                ctx.post_comment(review_comment("@bors delegate=try"))
+                ctx.post_comment(review_comment("@bors delegate try"))
                     .await?;
                 ctx.expect_comments((), 1).await;
-                ctx.pr(()).await.expect_delegated(DelegatedPermission::Try);
+                ctx.pr(()).await.expect_delegated(
+                    User::default_pr_author().github_id,
+                    DelegatedPermission::Try,
+                );
 
                 ctx.post_comment("@bors r+").await?;
                 insta::assert_snapshot!(
@@ -1579,7 +1805,50 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delegate_custom_user(pool: sqlx::PgPool) {
+        let user = User::new(1000, "user1");
+        BorsBuilder::new(pool)
+            .github(GitHub::unauthorized_pr_author().with_user(user.clone()))
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment(review_comment("@bors delegate=user1"))
+                    .await?;
+                insta::assert_snapshot!(
+                    ctx.get_next_comment_text(()).await?,
+                    @r#"
+                :v: @user1, you can now approve this pull request!
+
+                If @reviewer told you to "`r=me`" after making some further change, then please make that change and post `@bors r=reviewer`.
+
+                [View changes since this delegation](https://triagebot.infra.rust-lang.org/gh-changes-since/rust-lang/borstest/1/main-sha1..pr-1-sha).
+                "#
+                );
+                ctx.pr(())
+                    .await
+                    .expect_delegated(user.github_id, DelegatedPermission::Review);
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delegate_invalid_user(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(GitHub::unauthorized_pr_author())
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment(review_comment("@bors delegate=foo"))
+                    .await?;
+                insta::assert_snapshot!(
+                    ctx.get_next_comment_text(()).await?,
+                    @"Cannot fetch information about user `foo`."
+                );
+                ctx.pr(()).await.expect_not_delegated();
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn multiple_commands_in_one_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(
@@ -1600,7 +1869,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_draft_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx
@@ -1614,7 +1883,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_closed_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx
@@ -1628,7 +1897,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_merged_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx
@@ -1642,7 +1911,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_wip_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.edit_pr((), |pr| {
@@ -1661,7 +1930,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_pr_with_blocked_label(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::default().append_to_default_config(
@@ -1686,7 +1955,7 @@ labels_blocking_approval = ["proposed-final-comment-period"]
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_pr_with_blocked_labels(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::default().append_to_default_config(
@@ -1713,7 +1982,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_running_auto_build_pr_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1735,7 +2004,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_running_auto_build_pr_failed_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_repo((), |pr| pr.workflow_cancel_error = true);
@@ -1757,7 +2026,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_running_auto_build_updates_check_run(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1779,7 +2048,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_pr_with_merge_conflict_dirty(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_pr_in_gh((), |pr| {
@@ -1793,7 +2062,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn approve_pr_with_merge_conflict_blocked(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_pr_in_gh((), |pr| {
@@ -1810,7 +2079,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
         .await;
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn reapprove_works_as_retry(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;

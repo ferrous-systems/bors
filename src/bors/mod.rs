@@ -67,19 +67,26 @@ pub fn format_help() -> &'static str {
             approver: _,
             rollup: _,
             priority: _,
+            note: _,
         } => {}
         BorsCommand::Unapprove => {}
         BorsCommand::Help => {}
         BorsCommand::Ping => {}
         BorsCommand::Try { parent: _, jobs: _ } => {}
         BorsCommand::TryCancel => {}
-        BorsCommand::SetPriority(_) => {}
+        BorsCommand::SetPriority {
+            priority: _,
+            note: _,
+        } => {}
         BorsCommand::Info => {}
-        BorsCommand::SetDelegate(_) => {}
+        BorsCommand::Delegate(_) => {}
         BorsCommand::Undelegate => {}
-        BorsCommand::SetRollupMode(_) => {}
+        BorsCommand::SetRollupMode {
+            rollup_mode: _,
+            note: _,
+        } => {}
         BorsCommand::OpenTree => {}
-        BorsCommand::TreeClosed(_) => {}
+        BorsCommand::TreeClosed { .. } => {}
         BorsCommand::Retry => {}
         BorsCommand::Cancel => {}
         BorsCommand::Squash { .. } => {}
@@ -89,21 +96,27 @@ pub fn format_help() -> &'static str {
 You can use the following commands:
 
 ## PR management
-- `r+ [p=<priority>] [rollup=<never|iffy|maybe|always>]`: Approve this PR on your behalf
+- `r+ [p=<priority>] [rollup=<never|iffy|maybe|always>] [note=<note>]`: Approve this PR on your behalf
     - Optionally, you can specify the `<priority>` of the PR and if it is eligible for rollups (`<rollup>)`.
-- `r=<user> [p=<priority>] [rollup=<never|iffy|maybe|always>]`: Approve this PR on behalf of `<user>`
+    - Optionally, you can attach a `<note>` to the PR that will be displayed on the queue page.
+- `r=<user> [p=<priority>] [rollup=<never|iffy|maybe|always>] [note=<note>]`: Approve this PR on behalf of `<user>`
     - Optionally, you can specify the `<priority>` of the PR and if it is eligible for rollups (`<rollup>)`.
     - You can pass a comma-separated list of GitHub usernames.
+    - Optionally, you can attach a `<note>` to the PR that will be displayed on the queue page.
 - `r-`: Unapprove this PR
-- `p=<priority>` or `priority=<priority>`: Set the priority of this PR
-- `rollup=<never|iffy|maybe|always>`: Set the rollup status of the PR
+- `p=<priority> [note]` | `priority=<priority> [<note>]`: Set the priority of this PR
+    - Optionally, you can attach a `<note>` to the PR that will be displayed on the queue page.
+- `rollup=<never|iffy|maybe|always> [<note>]`: Set the rollup status of the PR
+    - Optionally, you can attach a `<note>` to the PR that will be displayed on the queue page.
 - `rollup`: Short for `rollup=always`
 - `rollup-`: Short for `rollup=maybe`
-- `delegate=<try|review>`: Delegate permissions for running try builds or approving to the PR author
-    - `try` allows the PR author to start try builds.
-    - `review` allows the PR author to both start try builds and approve the PR.
+- `delegate[=<user>] [try|review]`: Delegate permissions for running try builds or approving to the PR author or the specified `<user>`.
+    - If no `<user>` is specified, the PR author is delegated the permission.
+    - The default permission is `review`.
+    - `try` allows the delegatee to start try builds.
+    - `review` allows the delegatee to both start try builds and approve the PR.
 - `delegate` | `delegate+`: Delegate approval permissions to the PR author
-    - Shortcut for `delegate=review`
+    - Shortcut for `delegate review`
 - `delegate-`: Remove any previously granted permission delegation
 - `try [parent=<parent>] [job|jobs=<jobs>]`: Start a try build.
     - Optionally, you can specify a `<parent>` SHA with which will the PR be merged. You can specify `parent=last` to use the same parent SHA as the previous try build.
@@ -114,12 +127,13 @@ You can use the following commands:
 - `try cancel`: Cancel a running try build on the current PR.
 - `retry`: Clear a failed auto build status from an approved PR. This will cause the merge queue to eventually attempt to merge the PR again.
 - `cancel` | `yield`: Cancel a running auto build on the current PR.
-- `squash [msg|message=<commit-message>]`: Squash the commits of a PR into a single commit.
+- `squash [msg|message=<commit-message>|description]`: Squash the commits of a PR into a single commit.
     - Optionally, you can specify a `<commit-message>` for the created commit. If not specified, the commit messages of all squashed commits will be combined.
+    - If you specify `msg=description`, then the PR body will be used as the squashed commit message.
 - `info`: Get information about the current PR
 
 ## Repository management
-- `treeclosed=<priority>`: Close the tree for PRs with priority less than `<priority>`
+- `treeclosed=<priority> [reason]`: Close the tree for PRs with priority less than `<priority>`. Optionally, you can specify a `<reason>`.
 - `treeclosed-` or `treeopen`: Open the repository tree for merging
 
 ## Meta commands

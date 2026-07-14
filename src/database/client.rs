@@ -29,6 +29,7 @@ use crate::github::PullRequestNumber;
 use crate::github::{CommitSha, GithubRepoName};
 use anyhow::Context;
 use itertools::Either;
+use octocrab::models::UserId;
 use sqlx::PgPool;
 use sqlx::postgres::PgAdvisoryLock;
 use tracing::log;
@@ -88,8 +89,9 @@ impl PgDbClient {
         approval_info: ApprovalInfo,
         priority: Option<u32>,
         rollup: Option<RollupMode>,
+        note: Option<String>,
     ) -> anyhow::Result<()> {
-        approve_pull_request(&self.pool, pr.id, approval_info, priority, rollup).await
+        approve_pull_request(&self.pool, pr.id, approval_info, priority, rollup, note).await
     }
 
     /// Unapprove a pull request and remove its auto build status, if there is any attached.
@@ -101,16 +103,28 @@ impl PgDbClient {
         clear_auto_build(&self.pool, pr.id).await
     }
 
-    pub async fn set_priority(&self, pr: &PullRequestModel, priority: u32) -> anyhow::Result<()> {
-        set_pr_priority(&self.pool, pr.id, priority).await
+    pub async fn set_priority(
+        &self,
+        pr: &PullRequestModel,
+        priority: u32,
+        note: Option<String>,
+    ) -> anyhow::Result<()> {
+        set_pr_priority(&self.pool, pr.id, priority, note).await
     }
 
     pub async fn delegate(
         &self,
         pr: &PullRequestModel,
+        delegatee_id: UserId,
         delegated_permission: DelegatedPermission,
     ) -> anyhow::Result<()> {
-        delegate_pull_request(&self.pool, pr.id, delegated_permission).await
+        delegate_pull_request(
+            &self.pool,
+            pr.id,
+            delegatee_id.0 as i64,
+            delegated_permission,
+        )
+        .await
     }
 
     pub async fn undelegate(&self, pr: &PullRequestModel) -> anyhow::Result<()> {
@@ -151,8 +165,9 @@ impl PgDbClient {
         &self,
         pr: &PullRequestModel,
         rollup_mode: RollupMode,
+        note: Option<String>,
     ) -> anyhow::Result<()> {
-        set_pr_rollup_mode(&self.pool, pr.id, rollup_mode).await
+        set_pr_rollup_mode(&self.pool, pr.id, rollup_mode, note).await
     }
 
     pub async fn get_pull_request(

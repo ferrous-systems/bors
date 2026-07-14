@@ -21,6 +21,7 @@ use crate::bors::RollupMode;
 use crate::bors::comment::CommentTag;
 use crate::database::BuildKind;
 use crate::database::BuildStatus;
+use crate::database::DelegationStatus;
 use crate::database::PgDuration;
 use crate::database::RepoModel;
 use crate::database::WorkflowModel;
@@ -53,7 +54,11 @@ pub(crate) async fn get_pull_request(
         pr.status as "status: PullRequestStatus",
         pr.priority,
         pr.rollup as "rollup: RollupMode",
-        pr.delegated_permission as "delegated_permission: DelegatedPermission",
+        pr.note,
+        (
+            pr.delegatee_id,
+            pr.delegated_permission
+        ) AS "delegation!: DelegationStatus",
         pr.head_branch,
         pr.base_branch,
         pr.mergeable_state as "mergeable_state: MergeableState",
@@ -177,7 +182,11 @@ pub(crate) async fn upsert_pull_request(
                 pr.status as "status: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
-                pr.delegated_permission as "delegated_permission: DelegatedPermission",
+                pr.note,
+                (
+                    pr.delegatee_id,
+                    pr.delegated_permission
+                ) AS "delegation!: DelegationStatus",
                 pr.head_branch,
                 pr.base_branch,
                 pr.mergeable_state as "mergeable_state: MergeableState",
@@ -229,7 +238,11 @@ pub(crate) async fn get_nonclosed_pull_requests(
                 pr.status as "status: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
-                pr.delegated_permission as "delegated_permission: DelegatedPermission",
+                pr.note,
+                (
+                    pr.delegatee_id,
+                    pr.delegated_permission
+                ) AS "delegation!: DelegationStatus",
                 pr.head_branch,
                 pr.base_branch,
                 pr.mergeable_state as "mergeable_state: MergeableState",
@@ -310,7 +323,11 @@ pub(crate) async fn get_prs_with_stale_mergeability_or_approved(
                 pr.status as "status: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
-                pr.delegated_permission as "delegated_permission: DelegatedPermission",
+                pr.note,
+                (
+                    pr.delegatee_id,
+                    pr.delegated_permission
+                ) AS "delegation!: DelegationStatus",
                 pr.head_branch,
                 pr.base_branch,
                 pr.mergeable_state as "mergeable_state: MergeableState",
@@ -366,7 +383,11 @@ pub(crate) async fn set_stale_mergeability_status_by_base_branch(
                 pr.status as "status: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
-                pr.delegated_permission as "delegated_permission: DelegatedPermission",
+                pr.note,
+                (
+                    pr.delegatee_id,
+                    pr.delegated_permission
+                ) AS "delegation!: DelegationStatus",
                 pr.head_branch,
                 pr.base_branch,
                 pr.mergeable_state as "mergeable_state: MergeableState",
@@ -395,6 +416,7 @@ pub(crate) async fn approve_pull_request(
     approval_info: ApprovalInfo,
     priority: Option<u32>,
     rollup: Option<RollupMode>,
+    note: Option<String>,
 ) -> anyhow::Result<()> {
     let priority_i32 = priority.map(|p| p as i32);
 
@@ -405,13 +427,15 @@ UPDATE pull_request
 SET approved_by = $1,
     approved_sha = $2,
     priority = COALESCE($3, priority),
-    rollup = COALESCE($4, rollup)
-WHERE id = $5
+    rollup = COALESCE($4, rollup),
+    note = COALESCE($5, note)
+WHERE id = $6
 "#,
             approval_info.approver,
             approval_info.sha,
             priority_i32,
             rollup as Option<RollupMode>,
+            note,
             pr_id,
         )
         .execute(executor)
@@ -445,11 +469,18 @@ pub(crate) async fn unapprove_pull_request(
 pub(crate) async fn delegate_pull_request(
     executor: impl PgExecutor<'_>,
     pr_id: i32,
+    delegatee_id: i64,
     delegated_permission: DelegatedPermission,
 ) -> anyhow::Result<()> {
     measure_db_query("delegate_pull_request", || async {
         sqlx::query!(
-            "UPDATE pull_request SET delegated_permission = $1 WHERE id = $2",
+            r#"
+UPDATE pull_request
+SET
+    delegatee_id = $1,
+    delegated_permission = $2
+WHERE id = $3"#,
+            delegatee_id,
             delegated_permission as _,
             pr_id
         )
@@ -466,7 +497,12 @@ pub(crate) async fn undelegate_pull_request(
 ) -> anyhow::Result<()> {
     measure_db_query("undelegate_pull_request", || async {
         sqlx::query!(
-            "UPDATE pull_request SET delegated_permission = NULL WHERE id = $1",
+            r#"
+UPDATE pull_request
+SET
+    delegatee_id = NULL,
+    delegated_permission = NULL
+WHERE id = $1"#,
             pr_id
         )
         .execute(executor)
@@ -496,8 +532,12 @@ SELECT
         pr.approved_sha
     ) AS "approval_status!: ApprovalStatus",
     pr.status as "status: PullRequestStatus",
-    pr.delegated_permission as "delegated_permission: DelegatedPermission",
+    (
+        pr.delegatee_id,
+        pr.delegated_permission
+    ) AS "delegation!: DelegationStatus",
     pr.priority,
+    pr.note,
     pr.head_branch,
     pr.base_branch,
     pr.mergeable_state as "mergeable_state: MergeableState",
@@ -740,11 +780,17 @@ pub(crate) async fn set_pr_priority(
     executor: impl PgExecutor<'_>,
     pr_id: i32,
     priority: u32,
+    note: Option<String>,
 ) -> anyhow::Result<()> {
     measure_db_query("set_pr_priority", || async {
         sqlx::query!(
-            "UPDATE pull_request SET priority = $1 WHERE id = $2",
+            r#"
+UPDATE pull_request
+SET priority = $1,
+    note = COALESCE($2, note)
+WHERE id = $3"#,
             priority as i32,
+            note,
             pr_id,
         )
         .execute(executor)
@@ -758,11 +804,17 @@ pub(crate) async fn set_pr_rollup_mode(
     executor: impl PgExecutor<'_>,
     pr_id: i32,
     rollup: RollupMode,
+    note: Option<String>,
 ) -> anyhow::Result<()> {
     measure_db_query("set_pr_rollup", || async {
         sqlx::query!(
-            "UPDATE pull_request SET rollup = $1 WHERE id = $2",
+            r#"
+UPDATE pull_request
+SET rollup = $1,
+    note = COALESCE($2, note)
+WHERE id = $3"#,
             rollup as RollupMode,
+            note,
             pr_id,
         )
         .execute(executor)
@@ -907,7 +959,8 @@ pub(crate) async fn get_repository(
             name as "name: GithubRepoName",
             (
                 tree_state,
-                treeclosed_src
+                treeclosed_src,
+                treeclosed_reason
             ) AS "tree_state!: TreeState",
             created_at
         FROM repository
@@ -928,20 +981,25 @@ pub(crate) async fn insert_repo_if_not_exists(
     repo: &GithubRepoName,
     tree_state: TreeState,
 ) -> anyhow::Result<()> {
-    let (priority, src) = match tree_state {
-        TreeState::Open => (None, None),
-        TreeState::Closed { priority, source } => (Some(priority as i32), Some(source)),
+    let (priority, src, reason) = match tree_state {
+        TreeState::Open => (None, None, None),
+        TreeState::Closed {
+            priority,
+            source,
+            reason,
+        } => (Some(priority as i32), Some(source), reason),
     };
     measure_db_query("insert_repository_if_not_exists", || async {
         sqlx::query!(
             r#"
-        INSERT INTO repository (name, tree_state, treeclosed_src)
-        VALUES ($1, $2, $3)
+        INSERT INTO repository (name, tree_state, treeclosed_src, treeclosed_reason)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (name) DO NOTHING
         "#,
             repo as &GithubRepoName,
             priority,
-            src
+            src,
+            reason
         )
         .execute(executor)
         .await?;
@@ -966,7 +1024,8 @@ pub(crate) async fn get_repository_by_name(
             name as "name: GithubRepoName",
             (
                 tree_state,
-                treeclosed_src
+                treeclosed_src,
+                treeclosed_reason
             ) AS "tree_state!: TreeState",
             created_at
         FROM repository
@@ -989,21 +1048,29 @@ pub(crate) async fn upsert_repository(
     repo: &GithubRepoName,
     tree_state: TreeState,
 ) -> anyhow::Result<()> {
-    let (priority, src) = match tree_state {
-        TreeState::Open => (None, None),
-        TreeState::Closed { priority, source } => (Some(priority as i32), Some(source)),
+    let (priority, src, reason) = match tree_state {
+        TreeState::Open => (None, None, None),
+        TreeState::Closed {
+            priority,
+            source,
+            reason,
+        } => (Some(priority as i32), Some(source), reason),
     };
     measure_db_query("upsert_repository", || async {
         sqlx::query!(
             r#"
-        INSERT INTO repository (name, tree_state, treeclosed_src)
-        VALUES ($1, $2, $3)
+        INSERT INTO repository (name, tree_state, treeclosed_src, treeclosed_reason)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (name)
-        DO UPDATE SET tree_state = EXCLUDED.tree_state, treeclosed_src = EXCLUDED.treeclosed_src
+        DO UPDATE SET
+          tree_state = EXCLUDED.tree_state,
+          treeclosed_src = EXCLUDED.treeclosed_src,
+          treeclosed_reason = EXCLUDED.treeclosed_reason
         "#,
             repo as &GithubRepoName,
             priority,
-            src
+            src,
+            reason
         )
         .execute(executor)
         .await?;
@@ -1226,7 +1293,11 @@ pub(crate) async fn find_rollups_for_member_pr(
         pr.status as "status: PullRequestStatus",
         pr.priority,
         pr.rollup as "rollup: RollupMode",
-        pr.delegated_permission as "delegated_permission: DelegatedPermission",
+        pr.note,
+        (
+            pr.delegatee_id,
+            pr.delegated_permission
+        ) AS "delegation!: DelegationStatus",
         pr.head_branch,
         pr.base_branch,
         pr.mergeable_state as "mergeable_state: MergeableState",
@@ -1299,7 +1370,7 @@ mod tests {
     use crate::github::{GithubRepoName, PullRequestNumber};
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn upsert_pr_do_not_clear_mergeable_stale_flag(pool: PgPool) {
         let make_pr = |mergeable_state| UpsertPullRequestParams {
             pr_number: PullRequestNumber(1),

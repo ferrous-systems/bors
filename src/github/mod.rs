@@ -94,8 +94,16 @@ impl FromStr for GithubRepoName {
 pub struct GithubUser {
     pub id: UserId,
     pub username: String,
-    pub email: Option<String>,
+    email: Option<String>,
     pub html_url: Url,
+}
+
+impl GithubUser {
+    /// Get the e-mail of the GitHub user.
+    /// Note that it will be likely not filled in.
+    pub fn email_probably_missing(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
 }
 
 impl From<octocrab::models::Author> for GithubUser {
@@ -151,6 +159,32 @@ impl Display for TreeSha {
 pub struct Branch {
     pub name: String,
     pub sha: CommitSha,
+}
+
+#[derive(Debug)]
+/// Basic information about a PR needed to handle mergeability checks and label changes.
+pub struct PullRequestInfo {
+    pub number: PullRequestNumber,
+    pub status: PullRequestStatus,
+    pub mergeable_state: MergeableState,
+    pub labels: Vec<String>,
+}
+
+impl From<PullRequest> for PullRequestInfo {
+    fn from(pr: PullRequest) -> Self {
+        Self {
+            number: pr.number,
+            status: pr.status,
+            mergeable_state: pr.mergeable_state,
+            labels: pr.labels,
+        }
+    }
+}
+
+impl From<octocrab::models::pulls::PullRequest> for PullRequestInfo {
+    fn from(pr: octocrab::models::pulls::PullRequest) -> Self {
+        PullRequest::from(pr).into()
+    }
 }
 
 #[derive(Clone, Debug)]
