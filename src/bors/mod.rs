@@ -317,8 +317,8 @@ pub enum MergeType {
 /// Commit author used to emulate old bors (homu).
 fn bors_commit_author() -> CommitAuthor {
     CommitAuthor {
-        name: "bors".to_string(),
-        email: "bors@rust-lang.org".to_string(),
+        name: "handlebors".to_string(),
+        email: "handlebors@ferrous-systems.com".to_string(),
     }
 }
 
