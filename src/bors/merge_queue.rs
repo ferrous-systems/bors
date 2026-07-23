@@ -867,7 +867,7 @@ merge_queue_enabled = false
             ctx.run_merge_queue_now().await;
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":hourglass: Testing commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors..."
+                @":hourglass: Testing commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors..."
             );
             Ok(())
         })
@@ -888,8 +888,8 @@ merge_queue_enabled = false
             :sunny: Test successful - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)
             Approved by: `default-user`
             Duration: `1h`
-            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-bors to `main`...
-            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-bors"} -->
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
             "#
             );
             Ok(())
@@ -914,8 +914,8 @@ merge_queue_enabled = false
             :sunny: Test successful - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)
             Approved by: `default-user`
             Duration: `1h 20m`
-            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-bors to `main`...
-            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-bors"} -->
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
             "#
               );
             Ok(())
@@ -940,8 +940,8 @@ merge_queue_enabled = false
             :sunny: Test successful - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)
             Approved by: `default-user`
             Duration: `3h 25m 45s`
-            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-bors to `main`...
-            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-bors"} -->
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
             "#
               );
             Ok(())
@@ -966,8 +966,8 @@ merge_queue_enabled = false
             :sunny: Test successful - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)
             Approved by: `default-user`
             Duration: `45s`
-            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-bors to `main`...
-            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-bors"} -->
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
             "#
               );
             Ok(())
@@ -984,7 +984,7 @@ merge_queue_enabled = false
 
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-bors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)"
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)"
             );
             Ok(())
         })
@@ -1038,7 +1038,7 @@ merge_queue_enabled = false
             "main",
         ), @"
         main-sha1
-        merge-0-pr-1-d7d45f1f-reauthored-to-bors
+        merge-0-pr-1-d7d45f1f-reauthored-to-handlebors
         ");
         insta::assert_snapshot!(gh.get_sha_history(
             (),
@@ -1050,7 +1050,7 @@ merge_queue_enabled = false
         insta::assert_snapshot!(gh.get_sha_history(
             (),
             AUTO_BRANCH_NAME,
-        ), @"merge-0-pr-1-d7d45f1f-reauthored-to-bors");
+        ), @"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors");
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -1069,8 +1069,8 @@ merge_queue_enabled = false
             .clone();
         insta::assert_debug_snapshot!(branch.get_commit().author(), @r#"
         GitUser {
-            name: "bors",
-            email: "bors@rust-lang.org",
+            name: "handlebors",
+            email: "handlebors@ferrous-systems.com",
         }
         "#);
     }
@@ -1127,10 +1127,10 @@ merge_queue_enabled = false
 
         ), @"
         main-sha1
-        merge-0-pr-1-d7d45f1f-reauthored-to-bors
-        merge-1-pr-2-d7d45f1f-reauthored-to-bors
-        merge-2-pr-3-d7d45f1f-reauthored-to-bors
-        merge-3-pr-4-d7d45f1f-reauthored-to-bors
+        merge-0-pr-1-d7d45f1f-reauthored-to-handlebors
+        merge-1-pr-2-d7d45f1f-reauthored-to-handlebors
+        merge-2-pr-3-d7d45f1f-reauthored-to-handlebors
+        merge-3-pr-4-d7d45f1f-reauthored-to-handlebors
         ");
     }
 
@@ -1161,9 +1161,9 @@ merge_queue_enabled = false
 
         ), @"
         main-sha1
-        merge-0-pr-4-d7d45f1f-reauthored-to-bors
-        merge-1-pr-2-d7d45f1f-reauthored-to-bors
-        merge-2-pr-3-d7d45f1f-reauthored-to-bors
+        merge-0-pr-4-d7d45f1f-reauthored-to-handlebors
+        merge-1-pr-2-d7d45f1f-reauthored-to-handlebors
+        merge-2-pr-3-d7d45f1f-reauthored-to-handlebors
         ");
     }
 
@@ -1618,7 +1618,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
                 .get_comment_by_node_id(&comment.node_id().unwrap())
                 .unwrap();
             insta::assert_snapshot!(updated_comment.content(), @"
-            :hourglass: Testing commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors...
+            :hourglass: Testing commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors...
 
             **Workflow**: https://github.com/rust-lang/borstest/actions/runs/1
             ");
@@ -1665,7 +1665,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
             // Run the merge queue. It should recover and start merging PR3
             ctx.run_merge_queue_now().await;
             let comment = ctx.get_next_comment_text(pr3.id()).await?;
-            insta::assert_snapshot!(comment, @":hourglass: Testing commit pr-3-sha with merge merge-0-pr-3-d7d45f1f-reauthored-to-bors...");
+            insta::assert_snapshot!(comment, @":hourglass: Testing commit pr-3-sha with merge merge-0-pr-3-d7d45f1f-reauthored-to-handlebors...");
 
             // The merge queue should also unapprove PR2
             ctx.expect_comments(pr2.id(), 1).await;
@@ -1696,7 +1696,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
             // Run the merge queue. It should recover and start merging PR3
             ctx.run_merge_queue_now().await;
             let comment = ctx.get_next_comment_text(pr3.id()).await?;
-            insta::assert_snapshot!(comment, @":hourglass: Testing commit pr-3-sha with merge merge-0-pr-3-d7d45f1f-reauthored-to-bors...");
+            insta::assert_snapshot!(comment, @":hourglass: Testing commit pr-3-sha with merge merge-0-pr-3-d7d45f1f-reauthored-to-handlebors...");
 
             ctx.pr(pr2.id()).await.expect_no_auto_build();
 

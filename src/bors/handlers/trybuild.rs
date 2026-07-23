@@ -287,10 +287,10 @@ mod tests {
                 ctx.get_next_comment_text(()).await?,
                 @r#"
             :sunny: Try build successful ([Workflow1](https://github.com/rust-lang/borstest/actions/runs/1))
-            Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-bors (`merge-0-pr-1-d7d45f1f-reauthored-to-bors`)
+            Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
             Base parent: main-sha1 (`main-sha1`)
 
-            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-bors"} -->
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
             "#
             );
             Ok(())
@@ -306,7 +306,7 @@ mod tests {
             ctx.workflow_full_failure(ctx.try_workflow()).await?;
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-bors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)"
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)"
             );
             Ok(())
         })
@@ -330,7 +330,7 @@ mod tests {
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @"
-            :broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-bors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1). Failed jobs:
+            :broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1). Failed jobs:
 
             - `Job 1000` ([web logs](https://github.com/job-logs/1000), [enhanced plaintext logs](https://triage.rust-lang.org/gha-logs/rust-lang/borstest/1000))
             - `Job 1001` ([web logs](https://github.com/job-logs/1001), [enhanced plaintext logs](https://triage.rust-lang.org/gha-logs/rust-lang/borstest/1001))
@@ -363,7 +363,7 @@ mod tests {
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @"
-            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             "
@@ -380,7 +380,7 @@ mod tests {
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @"
-            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             "
@@ -494,7 +494,7 @@ try-job: Bar
         insta::assert_snapshot!(gh.get_sha_history(
             (),
             TRY_BRANCH_NAME,
-        ), @"merge-0-pr-1-d7d45f1f-reauthored-to-bors");
+        ), @"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors");
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -515,8 +515,8 @@ try-job: Bar
             .clone();
         insta::assert_debug_snapshot!(author, @r#"
         GitUser {
-            name: "bors",
-            email: "bors@rust-lang.org",
+            name: "handlebors",
+            email: "handlebors@ferrous-systems.com",
         }
         "#);
     }
@@ -561,7 +561,7 @@ try-job: Bar
             ctx.expect_comments((), 1).await;
             ctx.post_comment("@bors try parent=last").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
@@ -659,7 +659,7 @@ try-job: Bar
             ctx.expect_comments((), 1).await;
             ctx.post_comment("@bors try").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
@@ -681,7 +681,7 @@ try-job: Bar
                 )
                 .await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
@@ -702,7 +702,7 @@ try-job: Bar
 
             ctx.post_comment("@bors try").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             (The previously running try build was automatically cancelled.)
 
@@ -726,7 +726,7 @@ try-job: Bar
 
             ctx.post_comment("@bors try").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
@@ -735,10 +735,10 @@ try-job: Bar
                 .await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
             :sunny: Try build successful ([Workflow1](https://github.com/rust-lang/borstest/actions/runs/2))
-            Build commit: merge-1-pr-1-d7d45f1f-reauthored-to-bors (`merge-1-pr-1-d7d45f1f-reauthored-to-bors`)
+            Build commit: merge-1-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-1-pr-1-d7d45f1f-reauthored-to-handlebors`)
             Base parent: main-sha1 (`main-sha1`)
 
-            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-1-pr-1-d7d45f1f-reauthored-to-bors"} -->
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-1-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
             "#);
             Ok(())
         })
@@ -864,7 +864,7 @@ try_failed = ["+foo", "+bar", "-baz"]
                 .await?;
             ctx.post_comment("@bors try").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
@@ -1052,7 +1052,7 @@ try_failed = ["+foo", "+bar", "-baz"]
                 .get_comment_by_node_id(&comment.node_id().unwrap())
                 .unwrap();
             insta::assert_snapshot!(updated_comment.content(), @"
-            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
 
