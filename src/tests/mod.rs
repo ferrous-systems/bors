@@ -1,6 +1,6 @@
 use crate::bors::{
-    CommandPrefix, PullRequestStatus, RollupMode, WAIT_FOR_BUILD_QUEUE, WAIT_FOR_MERGE_QUEUE,
-    WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT, WAIT_FOR_MERGEABILITY_STATUS_REFRESH,
+    CommandPrefix, PullRequestStatus, RollupMode, WAIT_FOR_BUILD_QUEUE, WAIT_FOR_CONFIG_REFRESH,
+    WAIT_FOR_MERGE_QUEUE, WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT, WAIT_FOR_MERGEABILITY_STATUS_REFRESH,
     WAIT_FOR_PR_STATUS_REFRESH, WAIT_FOR_WEBHOOK_COMPLETED,
 };
 use crate::database::{
@@ -547,6 +547,22 @@ impl BorsTester {
                 Ok(())
             },
             &WAIT_FOR_PR_STATUS_REFRESH,
+        )
+        .await
+        .unwrap();
+    }
+
+    pub async fn refresh_configs(&self) {
+        // Wait until the refresh is fully handled
+        wait_for_marker(
+            async || {
+                self.global_tx
+                    .send(BorsGlobalEvent::RefreshConfig)
+                    .await
+                    .unwrap();
+                Ok(())
+            },
+            &WAIT_FOR_CONFIG_REFRESH,
         )
         .await
         .unwrap();

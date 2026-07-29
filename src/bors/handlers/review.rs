@@ -312,6 +312,22 @@ pub(super) async fn command_delegate(
         },
         delegate_cmd.permission
     );
+    if !repo_state.config.load().allow_delegate {
+        tracing::warn!(
+            "Delegate command not enabled in {}",
+            repo_state.repository()
+        );
+        repo_state
+            .client
+            .post_comment(
+                pr.number(),
+                Comment::new("Delegation is not allowed in this repository.".to_string()),
+                &db,
+            )
+            .await?;
+        return Ok(());
+    }
+
     if !sufficient_delegate_permission(repo_state.clone(), author) {
         deny_request(
             &repo_state,
@@ -2139,6 +2155,24 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
 
             Ok(())
         })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn disabled_delegation_delegate_error(pool: sqlx::PgPool) {
+        run_test(
+            (pool, GitHub::default().with_default_config("")),
+            async |ctx| {
+                ctx.post_comment(review_comment("@bors delegate=foo"))
+                    .await?;
+                insta::assert_snapshot!(
+                    ctx.get_next_comment_text(()).await?,
+                    @"Delegation is not allowed in this repository."
+                );
+                ctx.pr(()).await.expect_not_delegated();
+                Ok(())
+            },
+        )
         .await;
     }
 }

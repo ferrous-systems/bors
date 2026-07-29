@@ -454,16 +454,17 @@ fn get_query_param(req: &Request, key: &str) -> String {
 async fn mock_config(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
     // Extracted into a block to avoid holding the lock over an await point
     let mock = {
-        let repo = repo.lock();
         Mock::given(method("GET"))
             .and(path(format!(
                 "/repos/{}/contents/rust-bors.toml",
-                repo.full_name()
+                repo.lock().full_name()
             )))
-            .respond_with(
+            .respond_with(move |_: &Request| {
+                let repo = repo.lock();
+                tracing::info!(config = repo.config, "returning repo config");
                 ResponseTemplate::new(200)
-                    .set_body_json(GitHubContent::new("rust-bors.toml", &repo.config)),
-            )
+                    .set_body_json(GitHubContent::new("rust-bors.toml", &repo.config))
+            })
             .mount(mock_server)
     };
     mock.await;

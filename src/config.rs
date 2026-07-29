@@ -42,6 +42,8 @@ pub struct RepositoryConfig {
     /// Defaults to false.
     #[serde(default)]
     pub report_merge_conflicts: bool,
+    #[serde(default)]
+    pub allow_delegate: bool,
 }
 
 /// Load a repository config from TOML.

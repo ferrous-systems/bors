@@ -7,8 +7,8 @@ use super::operations::{
     get_workflow_urls_for_build, get_workflows_for_build, insert_repo_if_not_exists, is_rollup,
     record_tagged_bot_comment, set_pr_assignees, set_pr_mergeability_state, set_pr_priority,
     set_pr_rollup_mode, set_pr_status, set_stale_mergeability_status_by_base_branch,
-    unapprove_pull_request, undelegate_pull_request, update_build, update_pr_try_build_id,
-    update_workflow_status, upsert_pull_request, upsert_repository,
+    unapprove_pull_request, undelegate_all, undelegate_pull_request, update_build,
+    update_pr_try_build_id, update_workflow_status, upsert_pull_request, upsert_repository,
 };
 use super::{
     ApprovalInfo, DelegatedPermission, MergeableState, PrimaryKey, RegisterRollupMemberParams,
@@ -129,6 +129,10 @@ impl PgDbClient {
 
     pub async fn undelegate(&self, pr: &PullRequestModel) -> anyhow::Result<()> {
         undelegate_pull_request(&self.pool, pr.id).await
+    }
+
+    pub async fn undelegate_all(&self) -> anyhow::Result<Vec<PullRequestNumber>> {
+        undelegate_all(&self.pool).await
     }
 
     /// Set the mergeability status of a PR, and return the *previous* mergeability status.

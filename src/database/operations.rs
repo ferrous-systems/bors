@@ -491,6 +491,30 @@ WHERE id = $3"#,
     .await
 }
 
+pub(crate) async fn undelegate_all(
+    executor: impl PgExecutor<'_>,
+) -> anyhow::Result<Vec<PullRequestNumber>> {
+    measure_db_query("undelegate_all", || async {
+        let mut affected_prs = sqlx::query!(
+            r#"
+UPDATE pull_request as pr
+SET
+    delegatee_id = NULL,
+    delegated_permission = NULL
+RETURNING
+    pr.number as "number!: i64"
+            "#
+        )
+        .fetch(executor);
+        let mut prs = Vec::new();
+        while let Some(affected) = affected_prs.try_next().await? {
+            prs.push(affected.number.into());
+        }
+        Ok(prs)
+    })
+    .await
+}
+
 pub(crate) async fn undelegate_pull_request(
     executor: impl PgExecutor<'_>,
     pr_id: i32,

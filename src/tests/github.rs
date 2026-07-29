@@ -278,6 +278,7 @@ impl Default for GitHub {
 timeout = 3600
 merge_queue_enabled = true
 report_merge_conflicts = true
+allow_delegate = true
 "#
         .to_string();
 
