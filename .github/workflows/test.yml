@@ -75,3 +75,10 @@ jobs:
           load: true
       - name: Run Docker image
         run: docker run bors --help
+
+  haha-fails:
+    name: THIS SHOULD FAIL
+    runs-on: ubuntu-latest
+    steps:
+      - name: FAILURE
+        run: exit 100
