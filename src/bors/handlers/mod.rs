@@ -251,10 +251,13 @@ pub async fn handle_bors_global_event(
             let span = tracing::info_span!("Refresh config");
             for_each_repo(&ctx, |repo| {
                 let span = tracing::info_span!("Repo", "{}", repo.repository());
-                reload_repository_config(repo).instrument(span)
+                reload_repository_config(repo, &ctx.db).instrument(span)
             })
             .instrument(span)
             .await?;
+
+            #[cfg(test)]
+            crate::bors::WAIT_FOR_CONFIG_REFRESH.mark();
         }
         BorsGlobalEvent::RefreshPermissions => {
             let span = tracing::info_span!("Refresh permissions");

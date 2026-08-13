@@ -182,6 +182,10 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
             if let Err(error) = db.insert_repo_if_not_exists(&name, TreeState::Open).await {
                 tracing::warn!("Failed to insert repository {name}: {error:?}");
             }
+
+            if let Err(error) = repo.ensure_consistency(&db).await {
+                tracing::warn!("Failed to ensure repository {name} config consistency: {error:?}");
+            }
         });
 
         repos.insert(repo);

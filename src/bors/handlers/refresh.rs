@@ -49,9 +49,15 @@ pub async fn reload_mergeability_status(
 }
 
 /// Reloads the bors configuration for the given repository from GitHub.
-pub async fn reload_repository_config(repo: Arc<RepositoryState>) -> anyhow::Result<()> {
+pub async fn reload_repository_config(
+    repo: Arc<RepositoryState>,
+    db: &PgDbClient,
+) -> anyhow::Result<()> {
     let config = repo.client.load_config().await?;
     repo.config.store(Arc::new(config));
+
+    repo.ensure_consistency(db).await?;
+
     Ok(())
 }
 
@@ -138,7 +144,7 @@ mod tests {
     use crate::bors::handlers::trybuild::TRY_BUILD_CHECK_RUN_NAME;
     use crate::bors::{PullRequestStatus, with_mocked_time};
     use crate::database::{MergeableState, OctocrabMergeableState, WorkflowStatus};
-    use crate::tests::{BorsTester, GitHub, run_test};
+    use crate::tests::{BorsTester, Comment, GitHub, run_test};
     use crate::tests::{User, default_repo_name};
     use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
     use std::time::Duration;
@@ -518,5 +524,35 @@ auto_build_failed = ["+failed"]
             Ok(())
         })
             .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn disabled_delegation_automatically_undelegates(pool: sqlx::PgPool) {
+        let user = User::new(1000, "user1");
+        run_test(
+            (pool, GitHub::unauthorized_pr_author().with_user(user)),
+            async |ctx| {
+                ctx.post_comment(
+                    Comment::from("@bors delegate=user1").with_author(User::reviewer()),
+                )
+                .await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
+                :v: @user1, you can now approve this pull request!
+
+                If @reviewer told you to "`r=me`" after making some further change, then please make that change and post `@bors r=reviewer`.
+
+                [View changes since this delegation](https://triagebot.infra.rust-lang.org/gh-changes-since/rust-lang/borstest/1/main-sha1..pr-1-sha).
+                "#);
+
+                ctx.modify_repo((), |repo| {
+                    repo.config = "".to_string();
+                });
+                ctx.refresh_configs().await;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"Delegation has been disabled for this repo; this PR has been undelegated");
+
+                Ok(())
+            },
+        )
+        .await;
     }
 }

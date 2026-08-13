@@ -166,6 +166,9 @@ pub static WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT: TestSyncMarker = TestSyncMarker::
 #[cfg(test)]
 pub static WAIT_FOR_WORKFLOW_COMPLETED_HANDLED: TestSyncMarker = TestSyncMarker::new();
 
+#[cfg(test)]
+pub static WAIT_FOR_CONFIG_REFRESH: TestSyncMarker = TestSyncMarker::new();
+
 #[cfg(not(test))]
 fn now() -> DateTime<Utc> {
     Utc::now()
@@ -235,6 +238,36 @@ pub struct RepositoryState {
 impl RepositoryState {
     pub fn repository(&self) -> &GithubRepoName {
         self.client.repository()
+    }
+
+    pub async fn ensure_consistency(&self, db: &PgDbClient) -> anyhow::Result<()> {
+        let config = self.config.load();
+        let mut is_error = false;
+        if !config.allow_delegate {
+            tracing::debug!("delegation not allowed; undelegating all");
+            match db.undelegate_all().await {
+                Ok(undelegated_prs) if undelegated_prs.is_empty() => {}
+                Ok(undelegated_prs) => {
+                    tracing::warn!("Repo {} has disabled delegation", self.client.repository());
+                    for pr in undelegated_prs {
+                        tracing::info!("PR #{pr} has been undelegated");
+                        self.client.post_comment(pr, Comment::new("Delegation has been disabled for this repo; this PR has been undelegated".to_string()), db).await?;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("Unable to undelegate PRs due to disabled delegation: {err:?}");
+                    is_error = true;
+                }
+            }
+        }
+
+        if is_error {
+            return Err(anyhow::anyhow!(
+                "Error ensuring repo consistency with configuration"
+            ));
+        }
+
+        Ok(())
     }
 }
 
