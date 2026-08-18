@@ -1217,6 +1217,13 @@ impl BorsTester {
         Ok(())
     }
 
+    pub async fn ping(&mut self) -> anyhow::Result<()> {
+        self.post_comment(Comment::new((), "@bors ping")).await?;
+        let pong = self.get_next_comment_text(()).await?;
+        anyhow::ensure!(pong.contains("Pong :ping_pong:!"), "expected pong response");
+        Ok(())
+    }
+
     async fn finish(self, bors: JoinHandle<()>) -> anyhow::Result<GitHub> {
         // Tell the mergeability queue that it should shutdown once it has nothing else to do
         self.senders.mergeability_queue().shutdown();

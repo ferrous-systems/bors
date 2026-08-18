@@ -41,14 +41,19 @@ impl GitHub {
     }
 
     pub fn with_default_config(self, config: &str) -> Self {
-        self.default_repo().lock().config = config.to_string();
+        self.default_repo()
+            .lock()
+            .files
+            .insert("handlebors.toml".to_string(), config.to_string());
         self
     }
 
     pub fn append_to_default_config(self, config: &str) -> Self {
         self.default_repo()
             .lock()
-            .config
+            .files
+            .get_mut("handlebors.toml")
+            .unwrap()
             .push_str(&format!("\n{config}"));
         self
     }
@@ -305,7 +310,7 @@ allow_delegate = true
 
         let mut repo = Repo::new(org_user.clone(), repo_name.name());
         repo.add_pr(User::default_pr_author());
-        repo.config = config;
+        repo.files.insert("handlebors.toml".to_string(), config);
         repo.permissions = Permissions { users };
         gh.add_repo(repo);
         gh
@@ -370,10 +375,10 @@ impl MergeBehavior {
 }
 
 pub struct Repo {
-    name: String,
+    pub name: String,
     owner: User,
     pub permissions: Permissions,
-    pub config: String,
+    pub files: HashMap<String, String>,
     branches: Vec<Branch>,
     commits: HashMap<CommitSha, Commit>,
     workflows_cancelled_by_bors: Vec<RunId>,
@@ -395,7 +400,7 @@ impl Repo {
         let mut repo = Self {
             name: name.to_string(),
             permissions: Permissions::empty(),
-            config: String::new(),
+            files: HashMap::from([("handlebors.toml".to_string(), "".to_string())]),
             owner,
             pull_requests: Default::default(),
             branches: vec![],

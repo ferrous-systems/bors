@@ -10,6 +10,7 @@ use crate::tests::mock::{GitHubUser, dynamic_mock_req};
 use crate::tests::{Branch, GitHub, Repo, WorkflowJob};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use http::StatusCode;
 use octocrab::models::repos::Object;
 use octocrab::models::workflows::{Conclusion, Status, Step};
 use octocrab::models::{JobId, RunId};
@@ -17,6 +18,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use url::Url;
+use wiremock::matchers::path_regex;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
     matchers::{method, path},
@@ -69,7 +71,7 @@ pub async fn mock_repo(
     mock_check_runs(repo.clone(), mock_server).await;
     mock_workflow_runs(repo.clone(), mock_server).await;
     mock_workflow_jobs(repo.clone(), mock_server).await;
-    mock_config(repo.clone(), mock_server).await;
+    mock_files(repo.clone(), mock_server).await;
 }
 
 async fn mock_branches_and_commits(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
@@ -451,23 +453,38 @@ fn get_query_param(req: &Request, key: &str) -> String {
         .unwrap_or_else(|| panic!("Query parameter {key} not found in {}", req.url))
 }
 
-async fn mock_config(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
+async fn mock_files(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
+    let repo_owner = repo.lock().owner().name.clone();
+    let repo_name = repo.lock().name.clone();
     // Extracted into a block to avoid holding the lock over an await point
-    let mock = {
+    let mock_files = {
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/repos/{}/contents/rust-bors.toml",
-                repo.lock().full_name()
+            .and(path_regex(format!(
+                r#"^\/repos\/{repo_owner}\/{repo_name}\/contents\/.+"#
             )))
-            .respond_with(move |_: &Request| {
+            .respond_with(move |req: &Request| {
                 let repo = repo.lock();
-                tracing::info!(config = repo.config, "returning repo config");
-                ResponseTemplate::new(200)
-                    .set_body_json(GitHubContent::new("rust-bors.toml", &repo.config))
+                tracing::info!(files = ?repo.files, "contents request");
+                let Some(path) = req
+                    .url
+                    .path()
+                    .strip_prefix(&format!("/repos/{repo_owner}/{repo_name}/contents/"))
+                else {
+                    tracing::error!(uri = req.url.path(), "invalid requested path");
+                    // doesn't need to be accurate, just needs to be non-successful
+                    return ResponseTemplate::new(StatusCode::INTERNAL_SERVER_ERROR);
+                };
+                let Some(contents) = repo.files.get(path) else {
+                    tracing::info!(path = path, "returning 404 for path");
+                    return ResponseTemplate::new(StatusCode::NOT_FOUND);
+                };
+                tracing::info!(path = path, contents, "returning contents for path");
+                ResponseTemplate::new(200).set_body_json(GitHubContent::new(path, contents))
             })
             .mount(mock_server)
     };
-    mock.await;
+
+    mock_files.await;
 }
 
 #[derive(serde::Deserialize)]
