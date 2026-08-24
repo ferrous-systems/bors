@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT\n                    check_run.id,\n                    check_run.github_id,\n                    check_run.name,\n                    check_run.status as \"status: WorkflowStatus\",\n                    check_run.url,\n                    check_run.started_at as \"started_at: DateTime<Utc>\",\n                    (\n                        build.id,\n                        build.repository,\n                        build.branch,\n                        build.commit_sha,\n                        build.status,\n                        build.parent,\n                        build.created_at,\n                        build.check_run_id,\n                        build.kind,\n                        build.duration\n                    ) as \"build!: BuildModel\"\n                FROM check_run\n                    LEFT JOIN build on check_run.build_id = build.id\n                WHERE build.id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "github_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "status: WorkflowStatus",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "started_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "build!: BuildModel",
+        "type_info": "Record"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "2ac9a2e23e7d8564a8105b4be3d9e0da2815c262e544bc93bc387aa65d0f6555"
+}

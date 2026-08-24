@@ -13,15 +13,16 @@ use octocrab::models::events::payload::{
 };
 use octocrab::models::pulls::{PullRequest, Review};
 use octocrab::models::webhook_events::payload::PullRequestWebhookEventAction;
-use octocrab::models::{Author, CheckSuiteId, Repository, workflows};
+use octocrab::models::{Author, CheckRunId, CheckSuiteId, Repository, workflows};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
 
 use crate::bors::event::{
-    BorsEvent, BorsGlobalEvent, BorsRepositoryEvent, PullRequestAssigned, PullRequestClosed,
-    PullRequestComment, PullRequestConvertedToDraft, PullRequestEdited, PullRequestMerged,
-    PullRequestOpened, PullRequestPushed, PullRequestReadyForReview, PullRequestReopened,
-    PullRequestUnassigned, PushToBranch, WorkflowRunCompleted, WorkflowRunStarted,
+    BorsEvent, BorsGlobalEvent, BorsRepositoryEvent, CheckRunCompleted, CheckRunCreated,
+    PullRequestAssigned, PullRequestClosed, PullRequestComment, PullRequestConvertedToDraft,
+    PullRequestEdited, PullRequestMerged, PullRequestOpened, PullRequestPushed,
+    PullRequestReadyForReview, PullRequestReopened, PullRequestUnassigned, PushToBranch,
+    WorkflowRunCompleted, WorkflowRunStarted,
 };
 use crate::database::{WorkflowStatus, WorkflowType};
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
@@ -68,6 +69,24 @@ struct WorkflowRunInner {
     check_suite_id: CheckSuiteId,
     #[serde(flatten)]
     run: workflows::Run,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct WebhookCheckRun<'a> {
+    action: &'a str,
+    check_run: CheckRunInner,
+    repository: Repository,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct CheckRunInner {
+    id: CheckRunId,
+    name: String,
+    conclusion: Option<String>,
+    head_sha: String,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    html_url: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -163,7 +182,8 @@ fn parse_webhook_event(request: Parts, body: &[u8]) -> anyhow::Result<Option<Bor
         b"installation_repositories" | b"installation" => Ok(Some(BorsEvent::Global(
             BorsGlobalEvent::InstallationsChanged,
         ))),
-        b"workflow_run" => parse_workflow_run_events(body),
+        // b"workflow_run" => parse_workflow_run_events(body),
+        b"check_run" => parse_check_run_events(body),
         _ => {
             tracing::debug!(
                 "Ignoring unknown webhook event type {:?}",
@@ -315,6 +335,7 @@ fn parse_pull_request_review_comment_events(body: &[u8]) -> anyhow::Result<Optio
     }
 }
 
+#[allow(unused)]
 fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
     let payload: WebhookWorkflowRun = serde_json::from_slice(body)?;
     let repository_name = parse_repository_name(&payload.repository)?;
@@ -360,6 +381,41 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                 }),
             ))
         }
+        _ => None,
+    };
+    Ok(result)
+}
+
+fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
+    let payload: WebhookCheckRun = serde_json::from_slice(body)?;
+    let repository = parse_repository_name(&payload.repository)?;
+    let result = match payload.action {
+        "created" => Some(BorsEvent::Repository(BorsRepositoryEvent::CheckRunCreated(
+            CheckRunCreated {
+                id: payload.check_run.id,
+                name: payload.check_run.name,
+                repository,
+                commit_sha: payload.check_run.head_sha.into(),
+                html_url: payload.check_run.html_url,
+                started_at: payload.check_run.started_at,
+            },
+        ))),
+        "completed" => Some(BorsEvent::Repository(
+            BorsRepositoryEvent::CheckRunCompleted(CheckRunCompleted {
+                id: payload.check_run.id,
+                name: payload.check_run.name,
+                repository,
+                commit_sha: payload.check_run.head_sha.into(),
+                status: match payload.check_run.conclusion.as_deref().unwrap_or_default() {
+                    "success" | "skipped" => WorkflowStatus::Success,
+                    _ => WorkflowStatus::Failure,
+                },
+                running_time: payload
+                    .check_run
+                    .completed_at
+                    .map(|completed| completed - payload.check_run.started_at),
+            }),
+        )),
         _ => None,
     };
     Ok(result)

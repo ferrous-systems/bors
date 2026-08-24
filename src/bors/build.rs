@@ -1,5 +1,5 @@
 use crate::PgDbClient;
-use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
+use crate::bors::{BuildKind, CheckRun, RepositoryState, WorkflowRun};
 use crate::database::{
     BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams, WorkflowModel,
 };
@@ -171,6 +171,70 @@ pub async fn load_workflow_runs(
     Ok(workflow_runs)
 }
 
+pub async fn load_check_runs(
+    repo: &RepositoryState,
+    db: &PgDbClient,
+    build: &BuildModel,
+) -> anyhow::Result<Vec<CheckRun>> {
+    // Load the check runs that we know about from the DB. We know about check runs for
+    // which we have received a started or a completed event.
+    let db_check_runs = db.get_check_runs_for_build(build).await?;
+    tracing::debug!(runs = ?db_check_runs, "Check runs from DB");
+
+    // Ask GitHub about all check runs attached to the build commit.
+    // This tells us for how many check runs we should wait.
+    let mut check_runs = repo
+        .client
+        .get_check_runs_for_commit_sha(build.commit_sha.clone().into())
+        .await?
+        .into_iter()
+        .filter(|run| {
+            build
+                .check_run_id
+                .map(|bors_run_id| run.id != CheckRunId(bors_run_id as _))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    tracing::debug!(runs = ?check_runs, "Check runs from GitHub");
+
+    // It is possible that the GitHub state is not fully up-to-date, or that we have overridden
+    // it somehow in our DB (for example with the min_ci time mechanism).
+    // It is also possible that we learn here about new GitHub check run state that hasn't been
+    // propagated to the DB yet.
+    // Here we reconcile the two world views.
+    for db_run in db_check_runs {
+        if let Some(gh_run) = check_runs
+            .iter_mut()
+            .find(|gh_run| gh_run.id == db_run.github_id.into())
+        {
+            if !db_run.status.is_pending() {
+                // If our DB has a conclusion for the check that does not match GH state, we
+                // override GH state with DB state, because we could have stored something special
+                // in the DB, e.g. because of min_ci time check failing.
+                gh_run.status = db_run.status;
+            }
+        } else {
+            // For some reason, we have a check in the DB that is not on GitHub. This shouldn't
+            // really happen, but in any case we backfill it.
+            tracing::warn!(
+                id = %db_run.github_id,
+                status = ?db_run.status,
+                "Found DB check run that was not on GitHub",
+            );
+            check_runs.push(CheckRun {
+                id: db_run.github_id.into(),
+                name: db_run.name,
+                status: db_run.status,
+                url: db_run.url,
+                started_at: db_run.started_at,
+                duration: None,
+            });
+        }
+    }
+
+    Ok(check_runs)
+}
+
 pub struct StartBuildContext {
     /// Temporary branch used for merge preparation.
     pub merge_branch: String,
@@ -314,7 +378,7 @@ pub async fn start_build(
         .await;
     match check_run_result {
         Ok(check_run) => {
-            let check_run_id = check_run.id.into_inner() as i64;
+            let check_run_id = check_run.into_inner() as i64;
             if let Err(error) = db
                 .update_build(
                     build_id,

@@ -12,6 +12,7 @@ pub use comment::Comment;
 pub use context::BorsContext;
 pub use handlers::{handle_bors_global_event, handle_bors_repository_event};
 use itertools::Itertools;
+use octocrab::models::CheckRunId;
 use octocrab::models::RunId;
 use octocrab::models::workflows::Job;
 use regex::{Regex, RegexBuilder};
@@ -169,6 +170,10 @@ pub static WAIT_FOR_WORKFLOW_COMPLETED_HANDLED: TestSyncMarker = TestSyncMarker:
 #[cfg(test)]
 pub static WAIT_FOR_CONFIG_REFRESH: TestSyncMarker = TestSyncMarker::new();
 
+/// The build queue has handled a check suite completed event.
+#[cfg(test)]
+pub static WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED: TestSyncMarker = TestSyncMarker::new();
+
 #[cfg(not(test))]
 fn now() -> DateTime<Utc> {
     Utc::now()
@@ -223,6 +228,16 @@ pub struct WorkflowRun {
 pub struct FailedWorkflowRun {
     pub workflow_run: WorkflowRun,
     pub failed_jobs: Vec<Job>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckRun {
+    pub id: CheckRunId,
+    pub name: String,
+    pub status: WorkflowStatus,
+    pub started_at: DateTime<Utc>,
+    pub duration: Option<Duration>,
+    pub url: String,
 }
 
 /// An access point to a single repository.

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::bors::command::{BorsCommand, CommandParseError};
 use crate::bors::event::{BorsGlobalEvent, BorsRepositoryEvent, PullRequestComment};
 use crate::bors::handlers::autobuild::{command_cancel, command_retry};
+use crate::bors::handlers::check_run::{handle_check_run_completed, handle_check_run_created};
 use crate::bors::handlers::help::command_help;
 use crate::bors::handlers::info::command_info;
 use crate::bors::handlers::ping::command_ping;
@@ -46,6 +47,7 @@ use review::{command_delegate, command_set_priority, command_set_rollup, command
 use tracing::{Instrument, debug_span};
 
 mod autobuild;
+mod check_run;
 mod help;
 mod info;
 mod ping;
@@ -119,6 +121,18 @@ pub async fn handle_bors_repository_event(
                 .instrument(span.clone())
                 .await?;
         }
+        BorsRepositoryEvent::CheckRunCreated(payload) => {
+            let span = tracing::info_span!(
+                "Check run created",
+                repo = payload.repository.to_string(),
+                id = payload.id.into_inner(),
+                name = payload.name,
+                commit = %payload.commit_sha,
+            );
+            handle_check_run_created(repo, db, payload)
+                .instrument(span.clone())
+                .await?;
+        }
         BorsRepositoryEvent::WorkflowCompleted(payload) => {
             let span = tracing::info_span!(
                 "Workflow completed",
@@ -126,6 +140,18 @@ pub async fn handle_bors_repository_event(
                 id = payload.run_id.into_inner()
             );
             handle_workflow_completed(repo, db, payload, senders.build_queue())
+                .instrument(span.clone())
+                .await?;
+        }
+        BorsRepositoryEvent::CheckRunCompleted(payload) => {
+            let span = tracing::info_span!(
+                "Check run completed",
+                repo = payload.repository.to_string(),
+                id = payload.id.into_inner(),
+                name = payload.name,
+                commit = %payload.commit_sha,
+            );
+            handle_check_run_completed(repo, db, payload, senders.build_queue())
                 .instrument(span.clone())
                 .await?;
         }

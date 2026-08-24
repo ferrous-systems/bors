@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS check_run (
+    id SERIAL PRIMARY KEY,
+    github_id BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    build_id BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    url TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_build_id FOREIGN KEY (build_id) REFERENCES build (id) ON DELETE CASCADE
+);

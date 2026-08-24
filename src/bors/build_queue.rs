@@ -10,12 +10,14 @@
 //! other background sync processes. We want to finish builds as fast as possible.
 
 use crate::bors::build::{
-    CancelBuildConclusion, CancelBuildError, cancel_build, get_failed_jobs, load_workflow_runs,
+    CancelBuildConclusion, CancelBuildError, cancel_build, get_failed_jobs, load_check_runs,
+    load_workflow_runs,
 };
 use crate::bors::comment::{
-    CommentTag, build_failed_comment, build_timed_out_comment, try_build_succeeded_comment,
+    CommentTag, build_failed_comment, build_failed_comment_v2, build_timed_out_comment,
+    try_build_succeeded_comment, try_build_succeeded_comment_v2,
 };
-use crate::bors::event::WorkflowRunCompleted;
+use crate::bors::event::{CheckRunCompleted, WorkflowRunCompleted};
 use crate::bors::labels::handle_label_trigger;
 use crate::bors::merge_queue::MergeQueueSender;
 use crate::bors::{
@@ -76,6 +78,33 @@ impl BuildQueueSender {
 
         Ok(())
     }
+
+    pub async fn on_check_run_completed(
+        &self,
+        event: CheckRunCompleted,
+        branch: String,
+        error_context: Option<String>,
+    ) -> Result<(), mpsc::error::SendError<BuildQueueEvent>> {
+        #[cfg(test)]
+        crate::bors::WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED
+            .drain()
+            .await;
+
+        self.inner
+            .send(BuildQueueEvent::OnCheckRunCompleted {
+                event,
+                branch,
+                error_context,
+            })
+            .await?;
+
+        #[cfg(test)]
+        crate::bors::WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED
+            .sync()
+            .await;
+
+        Ok(())
+    }
 }
 
 pub fn create_build_queue() -> (BuildQueueSender, BuildQueueReceiver) {
@@ -88,6 +117,11 @@ pub enum BuildQueueEvent {
     RefreshPendingBuilds(GithubRepoName),
     OnWorkflowCompleted {
         event: WorkflowRunCompleted,
+        error_context: Option<String>,
+    },
+    OnCheckRunCompleted {
+        event: CheckRunCompleted,
+        branch: String,
         error_context: Option<String>,
     },
 }
@@ -111,7 +145,7 @@ pub async fn handle_build_queue_event(
                         // First try to complete builds, and only then timeout then
                         // Because if the bot was offline for some time, we want to first attempt to
                         // actually finish the build, otherwise it might get instantly timeouted.
-                        if !maybe_complete_build(&repo, db, &build, &pr, &merge_queue_tx, None)
+                        if !maybe_complete_build_v2(&repo, db, &build, &pr, &merge_queue_tx, None)
                             .await?
                         {
                             maybe_timeout_build(&repo, db, &build, &pr, timeout).await?;
@@ -177,6 +211,45 @@ pub async fn handle_build_queue_event(
 
             #[cfg(test)]
             crate::bors::WAIT_FOR_WORKFLOW_COMPLETED_HANDLED.mark();
+
+            return res;
+        }
+        BuildQueueEvent::OnCheckRunCompleted {
+            event,
+            branch,
+            error_context,
+        } => {
+            let handle = async {
+                let Some(build) = db
+                    .find_build(&event.repository, &branch, event.commit_sha)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                if build.status != BuildStatus::Pending {
+                    tracing::warn!("Received check run completed for an already completed build");
+                    return Ok(());
+                }
+                let Some(pr) = db.find_pr_by_build(&build).await? else {
+                    return Ok(());
+                };
+                let repo = ctx.get_repo(&event.repository)?;
+                maybe_complete_build_v2(
+                    &repo,
+                    db,
+                    &build,
+                    &pr,
+                    &merge_queue_tx,
+                    Some(CompletionTrigger { error_context }),
+                )
+                .await?;
+                Ok(())
+            };
+
+            let res = handle.await;
+
+            #[cfg(test)]
+            crate::bors::WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED.mark();
 
             return res;
         }
@@ -423,6 +496,185 @@ async fn maybe_complete_build(
     hide_tagged_comments(repo, db, pr, tag).await?;
 
     if let Some(comment) = comment_opt {
+        repo.client.post_comment(pr_num, comment, db).await?;
+    }
+
+    Ok(true)
+}
+
+/// Attempt to complete a pending build.
+///
+/// `maybe_complete_build` is upstream's logic, which relies on `workflow_run` webhook events.
+/// However, we rely on `check_run` events to capture both GitHub Actions workflows and external
+/// workflows (eg CircleCI).
+///
+/// In order to minimize merge conflicts from upstream pulls, this function is maintained separately.
+/// It parallels the logic from `maybe_complete_build`, but instead of checking GitHub Workflows, it
+/// checks all GitHub Check runs.
+async fn maybe_complete_build_v2(
+    repo: &RepositoryState,
+    db: &PgDbClient,
+    build: &BuildModel,
+    pr: &PullRequestModel,
+    merge_queue_tx: &MergeQueueSender,
+    completion_trigger: Option<CompletionTrigger>,
+) -> anyhow::Result<bool> {
+    assert_eq!(
+        build.status,
+        BuildStatus::Pending,
+        "Attempting to complete a non-pending build"
+    );
+
+    let check_runs = load_check_runs(repo, db, build)
+        .await
+        .context("Cannot load check runs")?;
+
+    // at this point, there should be at least 1 check run.
+    // i don't know why this code path is different depending on whether there's an error context or not...
+    // regardless of whether the check run timed out or not (currently the only reason an error context would be present),
+    // there should always be one, and it should be an error to not have the run present.
+    // however, that's what `maybe_complete_build` does, so let's keep it
+    if check_runs.is_empty() {
+        if completion_trigger.is_some() {
+            return Err(anyhow::anyhow!(
+                "No check runs attached to SHA {} found, even though we received check run completed event. Github returned inconsistent data?",
+                build.commit_sha,
+            ));
+        }
+        tracing::warn!(
+            "No check runs attached to SHA {} found. Exiting build completion check.",
+            build.commit_sha
+        );
+        return Ok(false);
+    }
+
+    // At this point, we assume that the number of GH check runs is final, and after a single
+    // check run has been completed, no other check runs attached to the same commit can
+    // appear out of nowhere.
+    assert!(!check_runs.is_empty());
+
+    let has_failure = check_runs
+        .iter()
+        .any(|run| matches!(run.status, WorkflowStatus::Failure));
+    // If we have a failure, then we want to immediately finish the build with a failure.
+    // If we don't have any failures, then we should check if we are still waiting for some
+    // workflows to finish.
+    if !has_failure
+        && check_runs
+            .iter()
+            .any(|run| matches!(run.status, WorkflowStatus::Pending))
+    {
+        // We are still waiting for some workflows to be finished.
+        return Ok(false);
+    }
+
+    // Below this point, we assume that the build has completed.
+    // Either all workflow runs attached to the corresponding commit SHA are completed or there
+    // was at least one failure.
+    let build_succeeded = !has_failure;
+    let pr_num = pr.number;
+
+    let status = if build_succeeded {
+        BuildStatus::Success
+    } else {
+        BuildStatus::Failure
+    };
+    let trigger = match build.kind {
+        BuildKind::Try => {
+            if !build_succeeded {
+                Some(LabelTrigger::TryBuildFailed)
+            } else {
+                None
+            }
+        }
+        BuildKind::Auto => Some(if build_succeeded {
+            LabelTrigger::AutoBuildSucceeded
+        } else {
+            LabelTrigger::AutoBuildFailed
+        }),
+    };
+
+    let compute_duration = || {
+        // Compute the time when the earliest check started, and when the latest check ended
+        let start = check_runs.iter().map(|run| run.started_at).min()?;
+        let end = check_runs
+            .iter()
+            .filter_map(|run| run.duration.map(|d| run.started_at + d))
+            .max()?;
+
+        // The build duration is the difference between those two
+        (end - start).to_std().ok()
+    };
+    db.update_build(
+        build.id,
+        UpdateBuildParams::default()
+            .status(status)
+            .duration(compute_duration()),
+    )
+    .await?;
+    if let Some(trigger) = trigger {
+        let pr = repo.client.get_pull_request(pr_num).await?;
+        handle_label_trigger(repo, &pr.into(), trigger).await?;
+    }
+
+    if let Some(check_run_id) = build.check_run_id {
+        let (status, conclusion) = if build_succeeded {
+            (CheckRunStatus::Completed, Some(CheckRunConclusion::Success))
+        } else {
+            (CheckRunStatus::Completed, Some(CheckRunConclusion::Failure))
+        };
+
+        if let Err(error) = repo
+            .client
+            .update_check_run(CheckRunId(check_run_id as u64), status, conclusion)
+            .await
+        {
+            tracing::error!("Could not update check run {check_run_id}: {error:?}");
+        }
+    }
+
+    // Trigger merge queue when an auto build completes
+    if build.kind == BuildKind::Auto {
+        merge_queue_tx.notify().await?;
+    }
+
+    let mut comment = None;
+    if build_succeeded {
+        tracing::info!("Build succeeded for PR {pr_num}");
+
+        // Merge queue will post the build succeeded comment for auto builds
+        if build.kind == BuildKind::Try {
+            comment = Some(try_build_succeeded_comment_v2(
+                check_runs,
+                CommitSha(build.commit_sha.clone()),
+                CommitSha(build.parent.clone()),
+            ));
+        }
+    } else {
+        tracing::info!("Build failed for PR {pr_num}");
+
+        let failed_check_runs = check_runs
+            .iter()
+            .filter(|run| run.status == WorkflowStatus::Failure)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let error_context = completion_trigger.and_then(|t| t.error_context);
+        comment = Some(build_failed_comment_v2(
+            repo.repository(),
+            CommitSha(build.commit_sha.clone()),
+            failed_check_runs,
+            error_context,
+        ));
+    }
+
+    let tag = match build.kind {
+        BuildKind::Try => CommentTag::TryBuildStarted,
+        BuildKind::Auto => CommentTag::AutoBuildStarted,
+    };
+    hide_tagged_comments(repo, db, pr, tag).await?;
+
+    if let Some(comment) = comment {
         repo.client.post_comment(pr_num, comment, db).await?;
     }
 

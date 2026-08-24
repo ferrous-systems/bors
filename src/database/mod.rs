@@ -22,7 +22,7 @@ pub(crate) mod operations;
 
 type PrimaryKey = i32;
 
-/// A unique identifier for a workflow run.
+/// A unique identifier for a workflow or check run.
 #[derive(Clone, Copy, Debug)]
 pub struct RunId(pub u64);
 
@@ -54,6 +54,18 @@ impl From<RunId> for octocrab::models::RunId {
 impl From<octocrab::models::RunId> for RunId {
     fn from(val: octocrab::models::RunId) -> Self {
         RunId(val.0)
+    }
+}
+
+impl From<RunId> for octocrab::models::CheckRunId {
+    fn from(value: RunId) -> Self {
+        octocrab::models::CheckRunId(value.0)
+    }
+}
+
+impl From<octocrab::models::CheckRunId> for RunId {
+    fn from(value: octocrab::models::CheckRunId) -> Self {
+        RunId(value.0)
     }
 }
 
@@ -642,6 +654,22 @@ pub struct WorkflowModel {
     /// Current status of the workflow (pending, success, failure).
     pub status: WorkflowStatus,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub struct CheckRunModel {
+    pub id: PrimaryKey,
+    /// The name of the check run
+    pub name: String,
+    /// The build this check run is associated with
+    pub build: BuildModel,
+    /// GitHub's identifier for this check run
+    pub github_id: RunId,
+    /// Current status of the check run
+    pub status: WorkflowStatus,
+    /// URL to view this check run on GitHub
+    pub url: String,
+    pub started_at: DateTime<Utc>,
 }
 
 /// Represents the state of a repository's tree.

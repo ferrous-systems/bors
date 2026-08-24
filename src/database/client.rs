@@ -19,16 +19,18 @@ use std::collections::{HashMap, HashSet};
 use crate::bors::comment::CommentTag;
 use crate::bors::{BuildKind, PullRequestStatus, RollupMode};
 use crate::database::operations::{
-    get_nonclosed_rollups, register_rollup_pr_member, update_pr_auto_build_id,
+    create_check_run, find_builds_by_sha, get_check_runs_for_build, get_nonclosed_rollups,
+    register_rollup_pr_member, update_check_run_status, update_pr_auto_build_id,
 };
 use crate::database::{
-    BuildModel, CommentModel, PullRequestModel, RepoModel, TreeState, WorkflowModel,
+    BuildModel, CheckRunModel, CommentModel, PullRequestModel, RepoModel, TreeState, WorkflowModel,
     WorkflowStatus, WorkflowType,
 };
 use crate::github::PullRequestNumber;
 use crate::github::{CommitSha, GithubRepoName};
 use anyhow::Context;
 use itertools::Either;
+use octocrab::models::CheckRunId;
 use octocrab::models::UserId;
 use sqlx::PgPool;
 use sqlx::postgres::PgAdvisoryLock;
@@ -276,6 +278,14 @@ impl PgDbClient {
         find_build(&self.pool, repo, branch, &commit_sha).await
     }
 
+    pub async fn find_builds_by_sha(
+        &self,
+        repo: &GithubRepoName,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<BuildModel>> {
+        find_builds_by_sha(&self.pool, repo, commit_sha).await
+    }
+
     pub async fn get_pending_builds(
         &self,
         repo: &GithubRepoName,
@@ -312,12 +322,38 @@ impl PgDbClient {
         .await
     }
 
+    pub async fn create_check_run(
+        &self,
+        id: CheckRunId,
+        name: &str,
+        build: &BuildModel,
+        url: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        create_check_run(&self.pool, id, name, build, url, started_at).await
+    }
+
     pub async fn update_workflow_status(
         &self,
         run_id: u64,
         status: WorkflowStatus,
     ) -> anyhow::Result<()> {
         update_workflow_status(&self.pool, run_id, status).await
+    }
+
+    pub async fn update_check_run_status(
+        &self,
+        check_run_id: CheckRunId,
+        status: WorkflowStatus,
+    ) -> anyhow::Result<()> {
+        update_check_run_status(&self.pool, check_run_id, status).await
+    }
+
+    pub async fn get_check_runs_for_build(
+        &self,
+        build: &BuildModel,
+    ) -> anyhow::Result<Vec<CheckRunModel>> {
+        get_check_runs_for_build(&self.pool, build.id).await
     }
 
     pub async fn get_workflows_for_build(

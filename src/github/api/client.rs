@@ -1,7 +1,6 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
-use octocrab::models::checks::CheckRun;
 use octocrab::models::pulls::MergeableState;
 use octocrab::models::{CheckRunId, Repository, RunId, UserId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
@@ -12,7 +11,7 @@ use tracing::log;
 
 use crate::PgDbClient;
 use crate::bors::event::PullRequestComment;
-use crate::bors::{Comment, PullRequestStatus, WorkflowRun};
+use crate::bors::{CheckRun, Comment, PullRequestStatus, WorkflowRun};
 use crate::config::{CONFIG_FILE_PATH, RepositoryConfig, deserialize_config};
 use crate::database::WorkflowStatus;
 use crate::github::api::CommitAuthor;
@@ -409,7 +408,7 @@ impl GithubRepositoryClient {
         status: CheckRunStatus,
         output: CheckRunOutput,
         external_id: &str,
-    ) -> anyhow::Result<CheckRun> {
+    ) -> anyhow::Result<CheckRunId> {
         let check_run = perform_retryable("create_check_run", RetryMethod::no_retry(), || {
             let output = output.clone();
             async {
@@ -419,7 +418,7 @@ impl GithubRepositoryClient {
             }
         })
         .await?;
-        Ok(check_run)
+        Ok(check_run.id)
     }
 
     /// Update a check run with the given check run ID.
@@ -428,14 +427,66 @@ impl GithubRepositoryClient {
         check_run_id: CheckRunId,
         status: CheckRunStatus,
         conclusion: Option<CheckRunConclusion>,
-    ) -> anyhow::Result<CheckRun> {
-        let check_run = perform_retryable("update_check_run", RetryMethod::no_retry(), || async {
+    ) -> anyhow::Result<()> {
+        perform_retryable("update_check_run", RetryMethod::no_retry(), || async {
             update_check_run(self, check_run_id, status, conclusion)
                 .await
                 .context("Cannot update check run")
         })
         .await?;
-        Ok(check_run)
+        Ok(())
+    }
+
+    pub async fn get_check_runs_for_commit_sha(
+        &self,
+        commit_sha: CommitSha,
+    ) -> anyhow::Result<Vec<CheckRun>> {
+        let runs = perform_retryable(
+            "get_check_runs_for_commit_sha",
+            RetryMethod::default(),
+            async || -> anyhow::Result<_> {
+                let mut runs = Vec::new();
+                let mut page: u32 = 0;
+                loop {
+                    let response = self
+                        .client
+                        .checks(self.repo_name.owner(), self.repo_name.name())
+                        .list_check_runs_for_git_ref(commit_sha.0.clone().into())
+                        .per_page(100)
+                        .page(page)
+                        .send()
+                        .await?;
+                    runs.extend(response.check_runs.into_iter().map(|run| {
+                        let created_at = run.started_at.unwrap_or_default();
+                        CheckRun {
+                            id: run.id,
+                            name: run.name,
+                            url: run.html_url.unwrap_or_default(), // GitHub guarantees the string is always non-empty; octocrab doesn't believe github
+                            started_at: created_at,
+                            duration: run
+                                .completed_at
+                                .map(|completed| completed - created_at)
+                                .map(|d| d.to_std())
+                                .transpose()
+                                .unwrap_or_default(),
+                            status: match run.conclusion.as_deref() {
+                                None => WorkflowStatus::Pending,
+                                Some("success" | "skipped") => WorkflowStatus::Success,
+                                _ => WorkflowStatus::Failure,
+                            },
+                        }
+                    }));
+                    if runs.len() >= response.total_count as usize {
+                        break;
+                    }
+                    page += 1;
+                }
+
+                Ok(runs)
+            },
+        )
+        .await?;
+        Ok(runs)
     }
 
     /// Find all workflows attached to a specific commit SHA.
