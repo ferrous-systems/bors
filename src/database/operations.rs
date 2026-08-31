@@ -497,12 +497,14 @@ pub(crate) async fn undelegate_all(
     measure_db_query("undelegate_all", || async {
         let mut affected_prs = sqlx::query!(
             r#"
-UPDATE pull_request as pr
+UPDATE pull_request
 SET
     delegatee_id = NULL,
     delegated_permission = NULL
+WHERE
+    delegatee_id IS NOT NULL
 RETURNING
-    pr.number as "number!: i64"
+    number as "number!: i64"
             "#
         )
         .fetch(executor);

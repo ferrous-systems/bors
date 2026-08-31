@@ -244,7 +244,10 @@ impl RepositoryState {
         let config = self.config.load();
         let mut is_error = false;
         if !config.allow_delegate {
-            tracing::debug!("delegation not allowed; undelegating all");
+            tracing::debug!(
+                repo = %self.client.repository(),
+                "delegation not allowed; undelegating all",
+            );
             match db.undelegate_all().await {
                 Ok(undelegated_prs) if undelegated_prs.is_empty() => {}
                 Ok(undelegated_prs) => {

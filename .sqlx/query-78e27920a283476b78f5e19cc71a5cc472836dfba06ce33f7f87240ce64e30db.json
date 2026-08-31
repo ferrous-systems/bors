@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nUPDATE pull_request\nSET\n    delegatee_id = NULL,\n    delegated_permission = NULL\nWHERE\n    delegatee_id IS NOT NULL\nRETURNING\n    number as \"number!: i64\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "number!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "78e27920a283476b78f5e19cc71a5cc472836dfba06ce33f7f87240ce64e30db"
+}
