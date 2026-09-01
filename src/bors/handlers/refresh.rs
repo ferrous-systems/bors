@@ -545,7 +545,7 @@ auto_build_failed = ["+failed"]
                 "#);
 
                 ctx.modify_repo((), |repo| {
-                    repo.config = "".to_string();
+                    repo.files.insert("handlebors.toml".to_string(), "".to_string());
                 });
                 ctx.refresh_configs().await;
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"Delegation has been disabled for this repo; this PR has been undelegated");

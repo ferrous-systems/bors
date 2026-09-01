@@ -6,7 +6,8 @@ use serde::{Deserialize, Deserializer};
 
 use crate::github::{LabelModification, LabelTrigger, PullRequestInfo};
 
-pub const CONFIG_FILE_PATH: &str = "rust-bors.toml";
+pub const CONFIG_FILE_PATH_FALLBACK: &str = "rust-bors.toml";
+pub const CONFIG_FILE_PATH: &str = "handlebors.toml";
 
 /// Configuration of a repository loaded from a `rust-bors.toml`
 /// file located in the root of the repository file tree.

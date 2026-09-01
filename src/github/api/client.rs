@@ -1,5 +1,6 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use http::StatusCode;
 use octocrab::Octocrab;
 use octocrab::models::checks::CheckRun;
 use octocrab::models::pulls::MergeableState;
@@ -13,7 +14,9 @@ use tracing::log;
 use crate::PgDbClient;
 use crate::bors::event::PullRequestComment;
 use crate::bors::{Comment, PullRequestStatus, WorkflowRun};
-use crate::config::{CONFIG_FILE_PATH, RepositoryConfig, deserialize_config};
+use crate::config::{
+    CONFIG_FILE_PATH, CONFIG_FILE_PATH_FALLBACK, RepositoryConfig, deserialize_config,
+};
 use crate::database::WorkflowStatus;
 use crate::github::api::CommitAuthor;
 use crate::github::api::operations::{
@@ -158,19 +161,27 @@ impl GithubRepositoryClient {
             "load_config",
             RetryMethod::default(),
             || async {
-                let mut response = self
+                let repo = self
                     .client
-                    .repos(&self.repo_name.owner, &self.repo_name.name)
-                    .get_content()
-                    .path(CONFIG_FILE_PATH)
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "Could not fetch {CONFIG_FILE_PATH} from {}: {error:?}",
-                            self.repo_name
-                        )
-                    })?;
+                    .repos(&self.repo_name.owner, &self.repo_name.name);
+
+                let mut response = repo.get_content().path(CONFIG_FILE_PATH).send().await;
+                if let Err(octocrab::Error::GitHub { source, .. }) = response.as_ref()
+                    && source.status_code == StatusCode::NOT_FOUND
+                {
+                    response = repo
+                        .get_content()
+                        .path(CONFIG_FILE_PATH_FALLBACK)
+                        .send()
+                        .await;
+                }
+
+                let mut response = response.map_err(|error| {
+                    anyhow::anyhow!(
+                        "Could not fetch {CONFIG_FILE_PATH} from {}: {error:?}",
+                        self.repo_name
+                    )
+                })?;
 
                 response
                     .take_items()
@@ -1001,11 +1012,13 @@ mod tests {
     use crate::github::GithubRepoName;
     use crate::github::api::load_repositories;
     use crate::permissions::PermissionType;
+    use crate::tests::BorsBuilder;
     use crate::tests::ExternalHttpMock;
     use crate::tests::Repo;
     use crate::tests::{GitHub, User};
     use octocrab::models::UserId;
     use parking_lot::Mutex;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1039,5 +1052,41 @@ mod tests {
                 .load()
                 .has_permission(UserId(1), PermissionType::Review)
         );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn prefers_handlebors_toml(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github({
+                let gh = GitHub::default();
+                gh.default_repo().lock().files = HashMap::from([
+                    ("handlebors.toml".to_string(), "".to_string()),
+                    ("rust-bors.toml".to_string(), "bad-key = true".to_string()),
+                ]);
+                gh
+            })
+            .run_test(async |ctx| {
+                ctx.refresh_configs().await;
+                ctx.ping().await?;
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn falls_back_to_rust_bors_toml(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github({
+                let gh = GitHub::default();
+                gh.default_repo().lock().files =
+                    HashMap::from([("handlebors.toml".to_string(), "".to_string())]);
+                gh
+            })
+            .run_test(async |ctx| {
+                ctx.refresh_configs().await;
+                ctx.ping().await?;
+                Ok(())
+            })
+            .await;
     }
 }
