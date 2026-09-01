@@ -1,5 +1,6 @@
 use chrono::DateTime;
 use chrono::Utc;
+use octocrab::models::CheckRunId;
 use sqlx::postgres::PgExecutor;
 use std::collections::{HashMap, HashSet};
 
@@ -21,6 +22,7 @@ use crate::bors::RollupMode;
 use crate::bors::comment::CommentTag;
 use crate::database::BuildKind;
 use crate::database::BuildStatus;
+use crate::database::CheckRunModel;
 use crate::database::DelegationStatus;
 use crate::database::PgDuration;
 use crate::database::RepoModel;
@@ -689,6 +691,40 @@ WHERE repository = $1
     .await
 }
 
+pub(crate) async fn find_builds_by_sha(
+    executor: impl PgExecutor<'_>,
+    repo: &GithubRepoName,
+    commit_sha: &CommitSha,
+) -> anyhow::Result<Vec<BuildModel>> {
+    measure_db_query("find_builds_by_sha", async || {
+        let builds = sqlx::query_as!(
+            BuildModel,
+            r#"
+                SELECT
+                    id,
+                    repository as "repository: GithubRepoName",
+                    branch,
+                    kind as "kind: BuildKind",
+                    commit_sha,
+                    status as "status: BuildStatus",
+                    parent,
+                    created_at as "created_at: DateTime<Utc>",
+                    check_run_id,
+                    duration as "duration: PgDuration"
+                FROM build
+                WHERE repository = $1
+                    AND commit_sha = $2
+            "#,
+            repo as &GithubRepoName,
+            commit_sha.0,
+        )
+        .fetch_all(executor)
+        .await?;
+        Ok(builds)
+    })
+    .await
+}
+
 pub(crate) async fn get_pending_builds(
     executor: impl PgExecutor<'_>,
     repo: &GithubRepoName,
@@ -784,6 +820,41 @@ VALUES ($1, $2, $3, $4, $5, $6)
     .await
 }
 
+pub(crate) async fn create_check_run(
+    executor: impl PgExecutor<'_>,
+    id: CheckRunId,
+    name: &str,
+    build: &BuildModel,
+    url: &str,
+    started_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    measure_db_query("create_check_run", async || {
+        sqlx::query!(
+            r#"
+                INSERT INTO check_run (
+                    github_id,
+                    name,
+                    build_id,
+                    status,
+                    url,
+                    started_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+            id.into_inner() as i64,
+            name,
+            build.id as _,
+            WorkflowStatus::Pending as _,
+            url,
+            started_at
+        )
+        .execute(executor)
+        .await?;
+        Ok(())
+    })
+    .await
+}
+
 pub(crate) async fn update_workflow_status(
     executor: impl PgExecutor<'_>,
     run_id: u64,
@@ -794,6 +865,28 @@ pub(crate) async fn update_workflow_status(
             "UPDATE workflow SET status = $1 WHERE run_id = $2",
             status as _,
             run_id as i64
+        )
+        .execute(executor)
+        .await?;
+        Ok(())
+    })
+    .await
+}
+
+pub(crate) async fn update_check_run_status(
+    executor: impl PgExecutor<'_>,
+    run_id: CheckRunId,
+    status: WorkflowStatus,
+) -> anyhow::Result<()> {
+    measure_db_query("update_check_run_status", async || {
+        sqlx::query!(
+            r#"
+                UPDATE check_run
+                SET status = $1
+                WHERE github_id = $2
+            "#,
+            status as _,
+            run_id.into_inner() as i64,
         )
         .execute(executor)
         .await?;
@@ -866,6 +959,46 @@ pub(crate) async fn set_pr_assignees(
         .execute(executor)
         .await?;
         Ok(())
+    })
+    .await
+}
+
+pub(crate) async fn get_check_runs_for_build(
+    executor: impl PgExecutor<'_>,
+    build_id: i32,
+) -> anyhow::Result<Vec<CheckRunModel>> {
+    measure_db_query("get_check_runs_for_build", async || {
+        let check_runs = sqlx::query_as!(
+            CheckRunModel,
+            r#"
+                SELECT
+                    check_run.id,
+                    check_run.github_id,
+                    check_run.name,
+                    check_run.status as "status: WorkflowStatus",
+                    check_run.url,
+                    check_run.started_at as "started_at: DateTime<Utc>",
+                    (
+                        build.id,
+                        build.repository,
+                        build.branch,
+                        build.commit_sha,
+                        build.status,
+                        build.parent,
+                        build.created_at,
+                        build.check_run_id,
+                        build.kind,
+                        build.duration
+                    ) as "build!: BuildModel"
+                FROM check_run
+                    LEFT JOIN build on check_run.build_id = build.id
+                WHERE build.id = $1
+            "#,
+            build_id,
+        )
+        .fetch_all(executor)
+        .await?;
+        Ok(check_runs)
     })
     .await
 }

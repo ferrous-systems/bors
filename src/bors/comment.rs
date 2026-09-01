@@ -1,6 +1,6 @@
 use crate::bors::command::CommandPrefix;
-use crate::bors::{FailedWorkflowRun, WorkflowRun};
-use crate::database::PullRequestModel;
+use crate::bors::{CheckRun, FailedWorkflowRun, WorkflowRun};
+use crate::database::{CheckRunModel, PullRequestModel};
 use crate::github::{GithubRepoName, GithubUser, PullRequestNumber};
 use crate::utils::text::pluralize;
 use crate::{TreeState, database::WorkflowStatus, github::CommitSha};
@@ -82,6 +82,39 @@ pub fn try_build_succeeded_comment(
         let workflows_status = list_workflows_status(&workflows);
         writeln!(text, "\n{workflows_status}").unwrap();
     }
+    writeln!(
+        text,
+        r#"Build commit: {commit_sha} (`{commit_sha}`)
+Base parent: {parent_sha} (`{parent_sha}`)"#,
+    )
+    .unwrap();
+
+    Comment {
+        text,
+        metadata: Some(CommentMetadata::TryBuildCompleted {
+            merge_sha: commit_sha.to_string(),
+        }),
+        tag: None,
+    }
+}
+
+/// This is the same as `try_build_succeeded_comment`, but doesn't link to each check run output
+pub fn try_build_succeeded_comment_v2(
+    mut checks: Vec<CheckRun>,
+    commit_sha: CommitSha,
+    parent_sha: CommitSha,
+) -> Comment {
+    let mut text = String::from(":sunny: Try build successful");
+
+    checks.sort_by(|a, b| a.name.cmp(&b.name));
+    // If there is only a single check, compress the output so that it doesn't take so much space
+    if checks.len() == 1 {
+        writeln!(text, " ([{}]({}))", checks[0].name, checks[0].url).unwrap();
+    } else {
+        let checks_status = list_checks_status(&checks);
+        writeln!(text, "\n{checks_status}").unwrap();
+    }
+
     writeln!(
         text,
         r#"Build commit: {commit_sha} (`{commit_sha}`)
@@ -204,6 +237,45 @@ pub fn build_failed_comment(
     Comment::new(msg)
 }
 
+pub fn build_failed_comment_v2(
+    _repo: &GithubRepoName, // TODO: triagebot
+    commit_sha: CommitSha,
+    failed_check_runs: Vec<CheckRun>,
+    error_context: Option<String>,
+) -> Comment {
+    let mut msg = format!(
+        ":broken_heart: {} {} for {commit_sha} failed:\n",
+        failed_check_runs.len(),
+        pluralize("check", failed_check_runs.len()),
+    );
+
+    let max_runs_to_show = 5;
+    for check_run in failed_check_runs.iter().take(max_runs_to_show) {
+        writeln!(
+            msg,
+            "- [{}]({})", // TODO: triagebot
+            check_run.name, check_run.url,
+        )
+        .unwrap();
+    }
+
+    if failed_check_runs.len() > max_runs_to_show {
+        let remaining = failed_check_runs.len() - max_runs_to_show;
+        writeln!(
+            msg,
+            "- (and {remaining} other {})",
+            pluralize("check", remaining),
+        )
+        .unwrap();
+    }
+
+    if let Some(error_context) = error_context {
+        writeln!(msg, "\n{error_context}").unwrap();
+    }
+
+    Comment::new(msg)
+}
+
 pub fn try_build_started_comment(
     head_sha: &CommitSha,
     merge_sha: &CommitSha,
@@ -240,6 +312,29 @@ pub fn append_workflow_links_to_comment(comment_content: &mut String, workflow_u
         comment_content.push_str("\n**Workflows**:\n\n");
         for url in workflow_urls {
             comment_content.push_str(&format!("- {url}\n"));
+        }
+    }
+}
+
+pub fn append_check_run_links_to_comment(
+    comment_content: &mut String,
+    check_runs: Vec<CheckRunModel>,
+) {
+    if !comment_content.ends_with('\n') {
+        comment_content.push('\n');
+    }
+
+    comment_content.push('\n');
+    if check_runs.len() == 1 {
+        let check_run = &check_runs[0];
+        comment_content.push_str(&format!(
+            "**Check**: [{}]({})",
+            check_run.name, check_run.url
+        ));
+    } else {
+        comment_content.push_str("**Checks**:\n\n");
+        for check_run in check_runs {
+            comment_content.push_str(&format!("- [{}]({})\n", check_run.name, check_run.url));
         }
     }
 }
@@ -450,6 +545,25 @@ fn list_workflows_status(workflows: &[WorkflowRun]) -> String {
                 w.name,
                 w.url,
                 match w.status {
+                    WorkflowStatus::Success => ":white_check_mark:",
+                    WorkflowStatus::Failure => ":x:",
+                    WorkflowStatus::Pending => ":question:",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn list_checks_status(checks: &[CheckRun]) -> String {
+    checks
+        .iter()
+        .map(|c| {
+            format!(
+                "- [{}]({}) {}",
+                c.name,
+                c.url,
+                match c.status {
                     WorkflowStatus::Success => ":white_check_mark:",
                     WorkflowStatus::Failure => ":x:",
                     WorkflowStatus::Pending => ":question:",

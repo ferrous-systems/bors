@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE check_run\n                SET status = $1\n                WHERE github_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "45f50908c61cad561ae251c4bdc92b852f3ef147e2bf6f52d4415de8b44b79c3"
+}

@@ -1,7 +1,7 @@
 use crate::database::{WorkflowStatus, WorkflowType};
 use crate::github::{CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestNumber};
 use chrono::Duration;
-use octocrab::models::{CheckSuiteId, RunId};
+use octocrab::models::{CheckRunId, CheckSuiteId, RunId};
 
 #[derive(Debug)]
 pub enum BorsRepositoryEvent {
@@ -34,6 +34,10 @@ pub enum BorsRepositoryEvent {
     WorkflowStarted(WorkflowRunStarted),
     /// A workflow run on Github Actions or a check run from external CI system has been completed.
     WorkflowCompleted(WorkflowRunCompleted),
+    /// A check run was requested for a commit/branch.
+    CheckRunCreated(CheckRunCreated),
+    /// A check run was completed for a commit/branch
+    CheckRunCompleted(CheckRunCompleted),
 }
 
 impl BorsRepositoryEvent {
@@ -53,6 +57,8 @@ impl BorsRepositoryEvent {
             BorsRepositoryEvent::PushToBranch(payload) => &payload.repository,
             BorsRepositoryEvent::WorkflowStarted(workflow) => &workflow.repository,
             BorsRepositoryEvent::WorkflowCompleted(workflow) => &workflow.repository,
+            BorsRepositoryEvent::CheckRunCreated(check_run) => &check_run.repository,
+            BorsRepositoryEvent::CheckRunCompleted(check_run) => &check_run.repository,
         }
     }
 }
@@ -183,4 +189,24 @@ pub struct WorkflowRunCompleted {
     pub running_time: Option<Duration>,
     /// Check suite to which this workflow is attached.
     pub check_suite_id: CheckSuiteId,
+}
+
+#[derive(Debug)]
+pub struct CheckRunCreated {
+    pub id: CheckRunId,
+    pub name: String,
+    pub repository: GithubRepoName,
+    pub commit_sha: CommitSha,
+    pub html_url: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug)]
+pub struct CheckRunCompleted {
+    pub id: CheckRunId,
+    pub name: String,
+    pub repository: GithubRepoName,
+    pub commit_sha: CommitSha,
+    pub status: WorkflowStatus,
+    pub running_time: Option<Duration>,
 }
