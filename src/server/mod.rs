@@ -621,9 +621,27 @@ pub async fn queue_handler(
 }
 
 pub async fn ec2_handler(
+    session: SessionNullSession,
     Path((repo_owner, repo_name)): Path<(String, String)>,
     State(ServerStateRef(state)): State<ServerStateRef>,
+    State(oauth): State<Option<OAuthClient>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let gh_repo_name = GithubRepoName::new(&repo_owner, &repo_name);
+    let repo = state.get_repo(&gh_repo_name);
+
+    let gh_session = GitHubSession::restore(&session);
+    let mut is_visible = false;
+    if let Some(gh_session) = gh_session.as_ref() {
+        let oauth_client = oauth.as_ref().unwrap();
+        let authenticated_client =
+            oauth_client.get_authenticated_client(&gh_session.access_token)?;
+        is_visible = gh_repo_name
+            .is_visible_to_client(&authenticated_client)
+            .await?;
+    } else if let Some(repo) = repo.as_ref() {
+        is_visible = !repo.private;
+    }
+
     let Some(ec2_context) = state.ctx.get_ec2_ctx() else {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -632,10 +650,9 @@ pub async fn ec2_handler(
             .into_response());
     };
 
-    let gh_repo_name = GithubRepoName::new(&repo_owner, &repo_name);
-    let repo = match state.get_repo(&gh_repo_name) {
-        Some(repo) => repo,
-        None => {
+    let repo = match repo {
+        Some(repo) if is_visible => repo,
+        _ => {
             return Ok((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("Repository {gh_repo_name} not found"),
@@ -687,6 +704,10 @@ pub async fn ec2_handler(
         repo_url: format!("https://github.com/{gh_repo_name}"),
         instances,
         loaded_at: cached.loaded_at,
+        login_url: oauth
+            .as_ref()
+            .map(|client| client.authorization_url(Some(format!("/ec2/{gh_repo_name}")))),
+        github_user: gh_session.as_ref().map(Into::into),
     })
     .into_response())
 }

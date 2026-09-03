@@ -270,6 +270,9 @@ pub struct EC2Template {
     pub repo_url: String,
     pub instances: Vec<Ec2Instance>,
     pub loaded_at: chrono::DateTime<Utc>,
+    pub login_url: Option<String>,
+    /// Can only be Some if login_url is as well
+    pub github_user: Option<GitHubUser>,
 }
 
 impl EC2Template {
