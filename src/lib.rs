@@ -1,14 +1,18 @@
 #![allow(async_fn_in_trait)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::result_large_err)]
 
 //! This is the library of the bors bot.
 mod bors;
 mod config;
 mod database;
+mod ec2;
 mod github;
 mod permissions;
 pub mod server;
 mod templates;
 mod utils;
+mod zulip;
 
 pub use self::bors::process::{BorsProcess, create_bors_process};
 pub use bors::{
@@ -16,6 +20,7 @@ pub use bors::{
     event::BorsRepositoryEvent,
 };
 pub use database::{PgDbClient, TreeState};
+pub use ec2::Ec2Context;
 pub use github::{
     AppError, OAuthClient, OAuthConfig, WebhookSecret, api::create_github_client,
     api::load_repositories,
@@ -37,4 +42,3 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 #[cfg(test)]
 mod tests;
-mod zulip;

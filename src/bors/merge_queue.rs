@@ -19,7 +19,9 @@ use crate::bors::handlers::{
     InvalidationComment, InvalidationInfo, InvalidationReason, invalidate_pr, unapprove_pr,
 };
 use crate::bors::mergeability_queue::{MergeabilityQueueSender, update_pr_with_known_mergeability};
+use crate::bors::unroll_queue::UnrollQueueSender;
 use crate::bors::{AUTO_BRANCH_NAME, BuildKind, PullRequestStatus, RepositoryState};
+use crate::config::{CONFIG_FILE_PATH, deserialize_config};
 use crate::database::{
     ApprovalInfo, BuildModel, BuildStatus, ExclusiveLockProof, ExclusiveOperationOutcome,
     MergeableState, PullRequestModel, QueueStatus, UpdateBuildParams,
@@ -91,6 +93,7 @@ pub(super) const AUTO_BUILD_CHECK_RUN_NAME: &str = "Bors auto build";
 pub async fn merge_queue_tick(
     ctx: Arc<BorsContext>,
     mergeability_sender: &MergeabilityQueueSender,
+    unroll_queue_sender: &UnrollQueueSender,
 ) -> anyhow::Result<()> {
     let repos: Vec<Arc<RepositoryState>> = ctx.repositories.repositories();
 
@@ -102,16 +105,14 @@ pub async fn merge_queue_tick(
         // from the DB).
         let res = ctx
             .db
-            .ensure_not_concurrent(
-                &format!("{}-auto-build", repo.repository()),
-                async |proof| {
-                    if let Err(error) =
-                        process_repository(&repo, &ctx, mergeability_sender, proof).await
-                    {
-                        tracing::error!("Error running merge queue for {repo_name}: {error:?}");
-                    }
-                },
-            )
+            .ensure_not_concurrent(BuildKind::Auto, repo.repository(), async |proof| {
+                if let Err(error) =
+                    process_repository(&repo, &ctx, mergeability_sender, unroll_queue_sender, proof)
+                        .await
+                {
+                    tracing::error!("Error running merge queue for {repo_name}: {error:?}");
+                }
+            })
             .await
             .context("Merge lock failure")?;
         match res {
@@ -134,6 +135,7 @@ async fn process_repository(
     repo: &RepositoryState,
     ctx: &BorsContext,
     mergeability_sender: &MergeabilityQueueSender,
+    unroll_queue_sender: &UnrollQueueSender,
     proof: ExclusiveLockProof,
 ) -> anyhow::Result<()> {
     if !repo.config.load().merge_queue_enabled {
@@ -171,7 +173,16 @@ async fn process_repository(
                 #[cfg(test)]
                 crate::bors::WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT.mark();
 
-                handle_successful_build(repo, ctx, pr, auto_build, approval_info, pr_num).await?;
+                handle_successful_build(
+                    repo,
+                    ctx,
+                    pr,
+                    auto_build,
+                    approval_info,
+                    pr_num,
+                    unroll_queue_sender,
+                )
+                .await?;
                 break;
             }
             QueueStatus::Approved(approval_info) => {
@@ -257,6 +268,7 @@ async fn handle_successful_build(
     auto_build: &BuildModel,
     approval_info: &ApprovalInfo,
     pr_num: PullRequestNumber,
+    unroll_queue_sender: &UnrollQueueSender,
 ) -> anyhow::Result<()> {
     let commit_sha = CommitSha(auto_build.commit_sha.clone());
     let workflow_runs = load_workflow_runs(repo, &ctx.db, auto_build)
@@ -303,9 +315,21 @@ async fn handle_successful_build(
         }
     } else {
         tracing::info!("Auto build succeeded and merged for PR {pr_num}");
-        ctx.db
-            .set_pr_status(&pr.repository, pr.number, PullRequestStatus::Merged)
-            .await?;
+
+        if ctx.db.is_rollup(pr).await? {
+            tracing::info!("Recording waiting rollup member unroll state");
+            // Rollup, also mark its members as waiting for an unroll
+            ctx.db.finish_rollup_merge(pr).await?;
+            // Trigger the unroll queue
+            unroll_queue_sender
+                .process_unrolled_members(repo.repository())
+                .await?;
+        } else {
+            // Not a rollup, just mark it as merged
+            ctx.db
+                .set_pr_status(&pr.repository, pr.number, PullRequestStatus::Merged)
+                .await?;
+        }
         repo.client
             .post_comment(pr.number, comment, &ctx.db)
             .await?;
@@ -501,6 +525,41 @@ This rollup has been unapproved."#,
             );
             Ok(AutoBuildStartOutcome::PauseQueue)
         }
+        StartAutoBuildError::SanityCheckFailed {
+            error: SanityCheckError::ConfigMissing,
+            pr: gh_pr,
+        } => {
+            tracing::info!("Sanity check failed for PR {pr_num}: bors config is missing");
+
+            unapprove_pr(repo, &ctx.db, pr, &gh_pr.into()).await?;
+            let comment = format!(
+                "The bors config is missing in this PR. Ensure that the config exists at `{CONFIG_FILE_PATH}`."
+            );
+            repo.client
+                .post_comment(pr_num, Comment::new(comment), &ctx.db)
+                .await?;
+            Ok(AutoBuildStartOutcome::ContinueToNextPr)
+        }
+        StartAutoBuildError::SanityCheckFailed {
+            error: SanityCheckError::ConfigInvalid { error },
+            pr: gh_pr,
+        } => {
+            tracing::info!("Sanity check failed for PR {pr_num}: bors config is invalid");
+
+            unapprove_pr(repo, &ctx.db, pr, &gh_pr.into()).await?;
+            let comment = format!(
+                r#"The bors config at `{CONFIG_FILE_PATH}` is invalid in this PR. Parse error:
+
+```
+{error}
+```
+"#
+            );
+            repo.client
+                .post_comment(pr_num, Comment::new(comment), &ctx.db)
+                .await?;
+            Ok(AutoBuildStartOutcome::ContinueToNextPr)
+        }
     }
 }
 
@@ -534,6 +593,10 @@ enum SanityCheckError {
         status: PullRequestStatus,
     },
     RollupMemberMismatch(Vec<RollupMemberMismatch>),
+    ConfigMissing,
+    ConfigInvalid {
+        error: String,
+    },
 }
 
 async fn sanity_check_pr(
@@ -617,10 +680,10 @@ async fn sanity_check_rollup(
                 continue;
             }
         };
-        if member_gh.head.sha != member.rolled_up_sha {
+        if member_gh.head.sha != member.rolled_up_head_sha {
             mismatches.push(RollupMemberMismatch {
                 member: member.member,
-                expected: member.rolled_up_sha,
+                expected: member.rolled_up_head_sha,
                 actual: member_gh.head.sha,
             });
         }
@@ -657,6 +720,25 @@ async fn start_auto_build(
         .map_err(StartAutoBuildError::GitHubError)?;
     let head_sha = gh_pr.head.sha.clone();
 
+    let result = sanity_check_config(repo, &head_sha)
+        .await
+        .map_err(StartAutoBuildError::GitHubError)?;
+    match result {
+        ConfigCheckResult::Ok => {}
+        ConfigCheckResult::Missing => {
+            return Err(StartAutoBuildError::SanityCheckFailed {
+                error: SanityCheckError::ConfigMissing,
+                pr: gh_pr,
+            });
+        }
+        ConfigCheckResult::Invalid { error } => {
+            return Err(StartAutoBuildError::SanityCheckFailed {
+                error: SanityCheckError::ConfigInvalid { error },
+                pr: gh_pr,
+            });
+        }
+    }
+
     let pr_data = super::handlers::PullRequestData {
         db: pr,
         github: &gh_pr,
@@ -679,10 +761,10 @@ async fn start_auto_build(
             message: auto_merge_commit_message,
             author: bors_commit_author(),
         },
-        StartBuildCheckRun {
+        Some(StartBuildCheckRun {
             name: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
             title: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
-        },
+        }),
         pr,
     )
     .await
@@ -713,6 +795,34 @@ async fn start_auto_build(
     Ok(())
 }
 
+#[must_use]
+enum ConfigCheckResult {
+    Ok,
+    Missing,
+    Invalid { error: String },
+}
+
+/// Ensures that the commit that we are about to merge has a valid bors config.
+async fn sanity_check_config(
+    repo: &RepositoryState,
+    commit_sha: &CommitSha,
+) -> anyhow::Result<ConfigCheckResult> {
+    let config = repo
+        .client
+        .load_file_at(CONFIG_FILE_PATH, Some(commit_sha.clone()))
+        .await?;
+    let Some(config) = config else {
+        return Ok(ConfigCheckResult::Missing);
+    };
+    if let Err(error) = deserialize_config(&config) {
+        Ok(ConfigCheckResult::Invalid {
+            error: error.to_string(),
+        })
+    } else {
+        Ok(ConfigCheckResult::Ok)
+    }
+}
+
 /// Starts the background merge queue loop.
 ///
 /// It receives events on the sender that it returns, and acts based on them.
@@ -732,6 +842,7 @@ pub fn start_merge_queue(
     ctx: Arc<BorsContext>,
     max_interval: chrono::Duration,
     mergeability_sender: MergeabilityQueueSender,
+    unroll_queue_sender: UnrollQueueSender,
 ) -> (MergeQueueSender, impl Future<Output = ()>) {
     let (tx, mut rx) = mpsc::channel::<MergeQueueEvent>(1024);
     let sender = MergeQueueSender { inner: tx };
@@ -745,15 +856,17 @@ pub fn start_merge_queue(
             notified: &mut bool,
             last_executed_at: &mut DateTime<Utc>,
             mergeability_sender: &MergeabilityQueueSender,
+            unroll_queue_sender: &UnrollQueueSender,
         ) {
             *notified = false;
             *last_executed_at = Utc::now();
 
             let span = tracing::info_span!("MergeQueue");
             tracing::debug!("Processing merge queue");
-            if let Err(error) = merge_queue_tick(ctx.clone(), mergeability_sender)
-                .instrument(span.clone())
-                .await
+            if let Err(error) =
+                merge_queue_tick(ctx.clone(), mergeability_sender, unroll_queue_sender)
+                    .instrument(span.clone())
+                    .await
             {
                 // In tests, we want to panic on all errors.
                 #[cfg(test)]
@@ -777,6 +890,7 @@ pub fn start_merge_queue(
                         &mut notified,
                         &mut last_executed_at,
                         &mergeability_sender,
+                        &unroll_queue_sender,
                     )
                     .await;
                 }
@@ -788,6 +902,7 @@ pub fn start_merge_queue(
                             &mut notified,
                             &mut last_executed_at,
                             &mergeability_sender,
+                            &unroll_queue_sender,
                         )
                         .await;
                     }
@@ -808,6 +923,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::bors::with_mocked_time;
+    use crate::github::CommitSha;
     use crate::github::api::client::HideCommentReason;
     use crate::tests::{BorsBuilder, Commit, GitHub, run_test};
     use crate::tests::{default_branch_name, default_repo_name};
@@ -1502,6 +1618,54 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_build_missing_config(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            let pr = ctx.open_pr((), |_| {}).await?;
+            ctx.repo().lock().contents.insert(CommitSha(pr.head_sha()), None);
+            ctx.approve(pr.id()).await?;
+            ctx.run_merge_queue_now().await;
+            insta::assert_snapshot!(ctx.get_next_comment_text(pr.id()).await?, @"The bors config is missing in this PR. Ensure that the config exists at `rust-bors.toml`.");
+            ctx.pr(pr.id())
+                .await
+                .expect_no_auto_build()
+                .expect_unapproved();
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_build_invalid_config(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            let pr = ctx.open_pr((), |_| {}).await?;
+            ctx.repo().lock().contents.insert(
+                CommitSha(pr.head_sha()),
+                Some("[foo bar I am invalid toml!".to_string()),
+            );
+            ctx.approve(pr.id()).await?;
+            ctx.run_merge_queue_now().await;
+            insta::assert_snapshot!(ctx.get_next_comment_text(pr.id()).await?, @"
+            The bors config at `rust-bors.toml` is invalid in this PR. Parse error:
+
+            ```
+            TOML parse error at line 1, column 5
+              |
+            1 | [foo bar I am invalid toml!
+              |     ^
+            unclosed table, expected `]`
+
+            ```
+            ");
+            ctx.pr(pr.id())
+                .await
+                .expect_no_auto_build()
+                .expect_unapproved();
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn finish_auto_build_while_tree_is_closed_1(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             // Start an auto build with the default priority (0)
@@ -1511,6 +1675,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
             // Now close the tree for priority below 100
             ctx.post_comment("@bors treeclosed=100").await?;
             ctx.expect_comments((), 1).await;
+            ctx.expect_zulip_messages(1).await;
 
             // Then finish the auto build AFTER the tree has been closed and then
             // run the merge queue
@@ -1539,6 +1704,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
 
             ctx.post_comment("@bors treeclosed=100").await?;
             ctx.expect_comments((), 1).await;
+            ctx.expect_zulip_messages(1).await;
             ctx.run_merge_queue_until_merge_attempt().await;
             ctx.expect_comments((), 1).await;
 
@@ -1557,6 +1723,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors treeclosed=100").await?;
             ctx.expect_comments((), 1).await;
+            ctx.expect_zulip_messages(1).await;
 
             let pr2 = ctx.open_pr((), |_| {}).await?;
             let pr3 = ctx.open_pr((), |_| {}).await?;
@@ -1579,6 +1746,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
 
             ctx.post_comment("@bors treeopen").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"Tree is now open for merging.");
+            ctx.expect_zulip_messages(1).await;
 
             ctx.start_and_finish_auto_build(()).await?;
             ctx.start_and_finish_auto_build(pr3.id()).await?;
