@@ -476,8 +476,8 @@ mod tests {
 
             | PR# | Message | Perf Build Sha |
             |----|----|:-----:|
-            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-bors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-bors))|
-            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-bors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-bors))|
+            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-handlebors))|
+            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
 
             *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
 
@@ -546,7 +546,7 @@ mod tests {
 
             | PR# | Message | Perf Build Sha |
             |----|----|:-----:|
-            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-bors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-bors))|
+            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-handlebors))|
             |#3|Title of PR 3|:x: conflicts merging into previous parent commit :x:|
 
             *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
@@ -581,7 +581,7 @@ mod tests {
             | PR# | Message | Perf Build Sha |
             |----|----|:-----:|
             |#2|Title of PR 2|:x: build [failed](https://github.com/rust-lang/borstest/actions/runs/2) :x:|
-            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-bors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-bors))|
+            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
 
             *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
 
@@ -622,9 +622,9 @@ mod tests {
 
             | PR# | Message | Perf Build Sha |
             |----|----|:-----:|
-            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-bors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-bors))|
-            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-bors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-bors))|
-            |#4|Title of PR 4|`merge-2-pr-4-d7d45f1f-reauthored-to-bors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-2-pr-4-d7d45f1f-reauthored-to-bors))|
+            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
+            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-handlebors))|
+            |#4|Title of PR 4|`merge-2-pr-4-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-2-pr-4-d7d45f1f-reauthored-to-handlebors))|
 
             *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
 

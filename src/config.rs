@@ -476,6 +476,7 @@ allowed_instances = ["c8a.12xlarge"]
             min_ci_time: None,
             merge_queue_enabled: false,
             report_merge_conflicts: false,
+            allow_delegate: false,
             ec2_runners: Some(
                 Ec2RunnersConfig {
                     runner_group_id: 1,
@@ -509,6 +510,7 @@ allowed_instances = ["c8a.12xlarge"]
             min_ci_time: None,
             merge_queue_enabled: false,
             report_merge_conflicts: false,
+            allow_delegate: false,
             ec2_runners: None,
             unroll: Some(
                 UnrollConfig,

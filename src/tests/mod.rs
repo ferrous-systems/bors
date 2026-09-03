@@ -671,6 +671,7 @@ impl BorsTester {
                     .unwrap();
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_CONFIG_REFRESH,
         )
         .await

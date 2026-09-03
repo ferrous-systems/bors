@@ -521,7 +521,7 @@ try-job: Bar
             ctx.post_comment(format!("@bors try jobs={TOO_MANY_JOBS} nolimit").as_str())
                 .await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-bors…
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
