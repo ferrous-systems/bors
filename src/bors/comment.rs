@@ -102,6 +102,15 @@ pub fn cant_find_last_parent_comment() -> Comment {
     Comment::new(":exclamation: There was no previous build. Please set an explicit parent or remove the `parent=last` argument to use the default parent.".to_string())
 }
 
+pub fn too_many_try_jobs_comment(max_jobs: usize) -> Comment {
+    Comment::new(format!(
+        r#":exclamation: You cannot specify more than {max_jobs} try jobs.
+
+*Hint*: Use `@bors try jobs=... nolimit` to allow running an arbitrary number of try jobs."
+"#
+    ))
+}
+
 pub fn no_try_build_in_progress_comment() -> Comment {
     Comment::new(
         ":exclamation: There is currently no try build in progress on this PR.".to_string(),
@@ -131,12 +140,13 @@ pub fn try_build_cancelled_with_failed_workflow_cancel_comment() -> Comment {
 }
 
 pub fn try_build_cancelled_comment(workflow_urls: impl Iterator<Item = String>) -> Comment {
-    let mut try_build_cancelled_comment =
-        r#"Try build cancelled. Cancelled workflows:"#.to_string();
+    let mut comment = r#"Try build cancelled. Cancelled workflows:"#.to_string();
     for url in workflow_urls {
-        try_build_cancelled_comment += format!("\n- {url}").as_str();
+        comment += format!("\n- {url}").as_str();
     }
-    Comment::new(try_build_cancelled_comment)
+    writeln!(comment, "\n\n**Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.").unwrap();
+
+    Comment::new(comment)
 }
 
 pub fn build_failed_comment(

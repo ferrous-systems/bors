@@ -1,14 +1,16 @@
 use crate::bors::RollupMode::*;
+use crate::bors::{BuildKind, WorkflowJobData, WorkflowJobStatus};
 use crate::database::{
-    BuildModel, BuildStatus, MergeableState::*, PullRequestModel, QueueStatus, TreeState,
-    WorkflowModel,
+    BuildModel, MergeableState::*, PullRequestModel, QueueStatus, TreeState, WorkflowModel,
 };
+use crate::ec2::{Ec2Instance, Ec2InstanceStatus};
 use crate::github::{GitHubSession, PullRequestNumber};
 use askama::Template;
 use axum::response::{Html, IntoResponse, Response};
 use chrono::Utc;
 use http::StatusCode;
 use itertools::Itertools;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::time::Duration;
@@ -89,6 +91,16 @@ impl From<HashMap<PullRequestNumber, HashSet<PullRequestNumber>>> for RollupsInf
     }
 }
 
+pub struct PendingWorkflow {
+    pub workflow: WorkflowModel,
+    pub jobs: Vec<WorkflowJobData>,
+}
+
+pub struct PendingBuild {
+    pub build: BuildModel,
+    pub workflow: Option<PendingWorkflow>,
+}
+
 #[derive(Template)]
 #[template(path = "queue.html", whitespace = "minimize")]
 pub struct QueueTemplate {
@@ -104,58 +116,40 @@ pub struct QueueTemplate {
     pub github_user: Option<GitHubUser>,
     // PRs that should be pre-selected for being included in a rollup
     pub selected_rollup_prs: Vec<u32>,
-    // Active workflow for an active pending auto build
-    pub pending_workflow: Option<WorkflowModel>,
+    // Pending auto build(s)
+    pub pending_builds: HashMap<PullRequestNumber, PendingBuild>,
     // Guesstimated duration to merge all current approved/pending PRs in the queue
     pub expected_remaining_duration: Option<Duration>,
     // Average build duration over the past few successful auto builds
     pub average_build_duration: Duration,
+    pub ec2_configured: bool,
 }
 
 impl QueueTemplate {
     fn format_duration(&self, duration: Duration) -> String {
-        let total_seconds = duration.as_secs();
-        let days = total_seconds / 86400;
-        let hours = (total_seconds % 86400) / 3600;
-        let minutes = (total_seconds % 3600) / 60;
-
-        let mut output = String::new();
-        if days > 0 {
-            write!(output, "{days}d").unwrap();
-        }
-
-        if hours > 0 {
-            if !output.is_empty() {
-                output.push(' ');
-            }
-            write!(output, "{hours}h").unwrap();
-        }
-
-        if days == 0 && minutes > 0 {
-            if !output.is_empty() {
-                output.push(' ');
-            }
-            write!(output, "{minutes}m").unwrap();
-        }
-
-        if output.is_empty() {
-            output.push_str("<1m");
-        }
-
-        output
+        format_duration(duration)
     }
 
     fn pending_build_elapsed(&self, build: &BuildModel) -> Duration {
         (Utc::now() - build.created_at).to_std().unwrap_or_default()
     }
 
-    fn get_pending_auto_build<'a>(&self, pr: &'a PullRequestModel) -> Option<&'a BuildModel> {
-        if let Some(auto_build) = &pr.auto_build
-            && auto_build.status == BuildStatus::Pending
-        {
-            return Some(auto_build);
-        }
-        None
+    fn get_pending_auto_build<'a>(&'a self, pr: &'a PullRequestModel) -> Option<&'a PendingBuild> {
+        self.pending_builds.get(&pr.number)
+    }
+
+    fn get_pending_builds(&self) -> Vec<(&PullRequestNumber, &PendingBuild)> {
+        let mut pending: Vec<_> = self.pending_builds.iter().collect();
+        pending.sort_by(|(pr1, a), (pr2, b)| {
+            match (a.build.kind, b.build.kind) {
+                (BuildKind::Auto, BuildKind::Try) => return Ordering::Less,
+                (BuildKind::Try, BuildKind::Auto) => return Ordering::Greater,
+                _ => {}
+            }
+
+            pr1.cmp(pr2)
+        });
+        pending
     }
 
     /// Calculate the % progress of a build based on average build duration.
@@ -191,6 +185,146 @@ impl QueueTemplate {
         // and the result is significant
         pr.note() == Some("rustc-perf")
     }
+
+    fn count_completed_jobs(&self, jobs: &[WorkflowJobData]) -> u64 {
+        jobs.iter()
+            .filter(|j| matches!(j.status, WorkflowJobStatus::Completed))
+            .count() as u64
+    }
+
+    /// Format jobs that are not yet completed, to be rendered into a title attribute.
+    fn remaining_jobs_formatted_title(&self, jobs: &[WorkflowJobData]) -> String {
+        use std::fmt::Write;
+
+        const MAX_JOBS_TO_SHOW: usize = 20;
+
+        let remaining = get_remaining_jobs(jobs);
+        if remaining.is_empty() {
+            return String::new();
+        }
+        let mut data = format!("\n\nRemaining jobs ({}):\n", remaining.len());
+        for job in remaining.iter().take(MAX_JOBS_TO_SHOW) {
+            writeln!(data, "{}", normalize_job_name(&job.name)).unwrap();
+        }
+
+        if remaining.len() > MAX_JOBS_TO_SHOW {
+            let leftover = remaining.len() - MAX_JOBS_TO_SHOW;
+            writeln!(
+                data,
+                "(and {leftover} other{})",
+                if leftover == 1 { "" } else { "s" }
+            )
+            .unwrap();
+        }
+
+        data
+    }
+
+    /// Format jobs that are not yet completed, to be rendered into the jobs column.
+    fn remaining_jobs_formatted_column(&self, jobs: &[WorkflowJobData]) -> String {
+        let remaining = get_remaining_jobs(jobs);
+        if remaining.is_empty() {
+            return String::new();
+        }
+
+        const MAX_JOBS_TO_SHOW: usize = 5;
+
+        let mut data = String::new();
+        write!(
+            data,
+            " ({}",
+            remaining
+                .iter()
+                .take(MAX_JOBS_TO_SHOW)
+                .map(|j| normalize_job_name(&j.name))
+                .join(", ")
+        )
+        .unwrap();
+        if remaining.len() > MAX_JOBS_TO_SHOW {
+            write!(data, ", ...").unwrap();
+        }
+        data.push(')');
+        data
+    }
+}
+
+/// A hardcoded logic for rust-lang/rust, to strip auto/try prefixes.
+fn normalize_job_name(name: &str) -> String {
+    name.split_once(" - ")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| name)
+        .to_string()
+}
+
+fn get_remaining_jobs(jobs: &[WorkflowJobData]) -> Vec<&WorkflowJobData> {
+    let mut remaining: Vec<_> = jobs.iter().filter(|j| !j.status.is_completed()).collect();
+    remaining.sort_by(|a, b| a.name.cmp(&b.name));
+    remaining
+}
+
+#[derive(Template)]
+#[template(path = "ec2.html", whitespace = "minimize")]
+pub struct EC2Template {
+    pub repo_name: String,
+    pub repo_owner: String,
+    pub repo_url: String,
+    pub instances: Vec<Ec2Instance>,
+    pub loaded_at: chrono::DateTime<Utc>,
+}
+
+impl EC2Template {
+    fn format_status<'a>(&self, status: &'a Ec2InstanceStatus) -> &'a str {
+        match status {
+            Ec2InstanceStatus::Pending => "Starting",
+            Ec2InstanceStatus::Running => "Running",
+            Ec2InstanceStatus::ShuttingDown => "Shutting down",
+            Ec2InstanceStatus::Terminated => "Terminated",
+            Ec2InstanceStatus::Stopping => "Stopping",
+            Ec2InstanceStatus::Stopped => "Stopped",
+            Ec2InstanceStatus::Unknown(reason) => reason.as_str(),
+        }
+    }
+
+    fn get_lifetime(&self, instance: &Ec2Instance) -> String {
+        let end = instance.ended_at.unwrap_or_else(Utc::now);
+        let duration = end
+            .signed_duration_since(instance.started_at)
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        format_duration(duration)
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let days = total_seconds / 86400;
+    let hours = (total_seconds % 86400) / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+
+    let mut output = String::new();
+    if days > 0 {
+        write!(output, "{days}d").unwrap();
+    }
+
+    if hours > 0 {
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        write!(output, "{hours}h").unwrap();
+    }
+
+    if days == 0 && minutes > 0 {
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        write!(output, "{minutes}m").unwrap();
+    }
+
+    if output.is_empty() {
+        output.push_str("<1m");
+    }
+
+    output
 }
 
 #[derive(Template)]
@@ -198,4 +332,17 @@ impl QueueTemplate {
 pub struct NotFoundTemplate {
     pub login_url: Option<String>,
     pub github_user: Option<GitHubUser>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::templates::normalize_job_name;
+
+    #[test]
+    fn test_normalize_job() {
+        assert_eq!(
+            normalize_job_name("auto - aarch64-apple-macos-26"),
+            "aarch64-apple-macos-26"
+        );
+    }
 }

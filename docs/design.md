@@ -52,6 +52,9 @@ repository:
 - Reload the mergeability status of open PRs from GitHub.
 - Sync the status of PRs between the DB and GitHub.
 - Run the merge queue.
+- Terminate long-running EC2 instances.
+- Start EC2 instances for jobs that have been queued for a long time.
+- Process pending unrolled rollup member builds.
 
 ## Concurrency
 The bot is currently listening for GitHub webhooks concurrently, however it handles all commands serially, to avoid
@@ -195,6 +198,26 @@ preventing the problem where two PRs pass tests independently but fail when comb
 Note that `automation/bors/auto-merge` should not have any CI workflows configured! These should be configured for the
 `automation/bors/auto` branch instead.
 
+## Unrolled builds
+When a rollup PR is merged, and the `[unroll]` section is enabled in the config, bors creates a separate unrolled build for each of its rollup member.
+
+The state of the unrolled builds is tracked via the `unroll_state` column of the `rollup_member` table. The individual states are:
+
+- `NULL`: the rollup member hasn't been merged (yet) in this rollup
+- `Waiting`: the rollup is waiting for an unrolled build to be started by bors
+- `Pending`: the rollup is waiting for an unrolled build to finish
+- `Finished`: the unrolled build has finished, or it could not have been started
+- `Reported`: the comment with the unrolling results has been posted to the rollup PR
+
+Once a rollup is merged, all its members are set to the `Waiting` state. Then, when the unroll queue runs, it will attempt to start an unrolled build for each member:
+- It uses the `rolled_up_head_sha` captured when the rollup was created for the merge, and the `rolled_up_merge_sha` for the commit message.
+- It attempts to merge the HEAD SHA onto the parent of the rollup's merge commit, in the `automation/bors/try-perf-merge` branch.
+- If the merge succeeds, force-pushes the unrolled commit to `automation/bors/try-perf`.
+
+If any non-transient errors occur, the given rollup member is marked as `Finished`. 
+
+Once all members are in the `Finished` state, bors will post a comment with a result tableto the merged rollup.
+
 ## Recognizing that CI has succeeded/failed
 With [homu](https://github.com/rust-lang/homu) (the old bors implementation), GitHub actions CI running repositories had
 to use a "fake" job that marked the whole CI workflow as succeeded or failed, to signal to bors if it should consider
@@ -210,3 +233,17 @@ To make the implementation more robust, it now behaves as follow:
 Note that we explicitly do not read the "Check suite was completed" webhook, because it can actually be received *before* a webhook that tells us that the last workflow of that check suite was completed. If that happens, we could mark a build as completed without knowing the final conclusion of its workflows. That is not a big problem, but it would mean that we sometimes cannot post the real status of a workflow in the "build completed" bors comment on GitHub. So instead we just listen for the completed workflows.
 
 In any case, with new bors there is no need to introduce fake conclusion CI jobs.
+
+## Zulip messages
+
+Bors can post certain messages (e.g. tree of a repo being open/closed) to Zulip. You can configure this via three environment variables. See [README.md](../README.md) for more information.
+
+## EC2 instance spawning
+Bors can spawn and manage the lifecycle of EC2 instances with self-hosted GitHub runners for executing GitHub Actions jobs.
+To enable this functionality, set the `CI_EC2_RUNNER_ROLE` environment variable and configure the `ec2_runners` section in the config file.
+
+Then you can use a special value for the `os` field of GHA jobs, which will tell bors to spawn an EC2 instance to run the job.
+This value is documented in `rust-bors.example.toml`.
+
+Bors will start the EC2 instance when the job starts; the instance should end by itself once the job ends. Bors also periodically monitors all spawned instances, and it will terminate instances that have been running for a long time.
+It will also observe jobs that have been waiting for an EC2 instance for a long time (this can happen e.g. when the workflow job started webhook doesn't arrive) and backfill EC2 instances for them.

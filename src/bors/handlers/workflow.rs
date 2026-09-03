@@ -1,13 +1,18 @@
-use crate::PgDbClient;
 use crate::bors::RepositoryState;
 use crate::bors::build::{CancelBuildConclusion, CancelBuildError};
 use crate::bors::build_queue::BuildQueueSender;
 use crate::bors::comment::{CommentTag, append_workflow_links_to_comment};
-use crate::bors::event::{WorkflowRunCompleted, WorkflowRunStarted};
-use crate::bors::handlers::is_bors_observed_branch;
+use crate::bors::event::{
+    WorkflowJobCompleted, WorkflowJobStarted, WorkflowRunCompleted, WorkflowRunStarted,
+};
+use crate::bors::handlers::{get_build_kind_from_branch, is_bors_observed_branch};
 use crate::bors::{BuildKind, build};
 use crate::database::{BuildModel, BuildStatus, PullRequestModel, WorkflowStatus};
+use crate::ec2::{Ec2InstanceStartData, ParsedLabel, start_ec2_github_runner};
+use crate::github::CommitSha;
 use crate::github::api::client::GithubRepositoryClient;
+use crate::{BorsContext, PgDbClient};
+use octocrab::models::workflows::Status;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,6 +81,7 @@ async fn add_workflow_links_to_build_start_comment(
     let tag = match build.kind {
         BuildKind::Try => CommentTag::TryBuildStarted,
         BuildKind::Auto => CommentTag::AutoBuildStarted,
+        BuildKind::UnrolledMember => return Ok(()),
     };
     let comments = db
         .get_tagged_bot_comments(&payload.repository, pr.number, tag)
@@ -143,6 +149,185 @@ pub(super) async fn handle_workflow_completed(
     build_queue_tx
         .on_workflow_completed(payload, error_context)
         .await?;
+    Ok(())
+}
+
+pub(super) async fn handle_workflow_job_started(
+    ctx: &BorsContext,
+    db: Arc<PgDbClient>,
+    repo: Arc<RepositoryState>,
+    payload: WorkflowJobStarted,
+) -> anyhow::Result<()> {
+    if let Err(error) = try_start_ec2_instance(ctx, &db, &repo, &payload).await {
+        tracing::error!("Cannot start EC2 instance: {error:?}");
+    }
+
+    let Some(build_kind) = get_build_kind_from_branch(&payload.branch) else {
+        return Ok(());
+    };
+
+    if let BuildKind::Auto = build_kind {
+        ctx.get_job_cache().auto_job_started(
+            repo.repository(),
+            payload.run_id,
+            payload.job_id,
+            &payload.name,
+        );
+    }
+
+    Ok(())
+}
+
+/// Try to start an EC2 instance with a GitHub self-hosted runner for the started GitHub Actions
+/// workflow job.
+async fn try_start_ec2_instance(
+    ctx: &BorsContext,
+    db: &PgDbClient,
+    repo: &RepositoryState,
+    payload: &WorkflowJobStarted,
+) -> anyhow::Result<()> {
+    let Some(ec2_ctx) = ctx.get_ec2_ctx() else {
+        return Ok(());
+    };
+
+    let config = repo.config.load();
+    let Some(ec2_config) = &config.ec2_runners else {
+        return Ok(());
+    };
+    let Some(label) = payload
+        .labels
+        .iter()
+        .find_map(|label| ParsedLabel::parse(label, &ec2_config.label_prefix))
+    else {
+        return Ok(());
+    };
+
+    // Try to find a PR attached to the job. This is best-effort (though normally it should
+    // succeed).
+    let pr_number = async {
+        let Some(build) = db
+            .find_build(
+                repo.repository(),
+                &payload.branch,
+                payload.commit_sha.clone(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let Some(pr) = db.find_pr_by_build(&build).await? else {
+            return Ok(None);
+        };
+        anyhow::Ok(Some(pr.number))
+    }
+    .await;
+    let pr_number = match pr_number {
+        Ok(Some(pr_number)) => Some(pr_number),
+        res => {
+            tracing::warn!("Cannot find PR for workflow job {}: {res:?}", payload.name);
+            None
+        }
+    };
+
+    // If we don't know what kind of branch it is, we just assume that it is a try build
+    let build_kind = get_build_kind_from_branch(&payload.branch).unwrap_or(BuildKind::Try);
+
+    // We try to spawn EC2 instances for all kinds of jobs, even those outside of try/auto branches
+    let data = Ec2InstanceStartData {
+        job_id: payload.job_id,
+        job_name: payload.name.clone(),
+        run_id: payload.run_id.into(),
+        commit_sha: payload.commit_sha.clone(),
+        pr_number,
+        build_kind,
+    };
+    start_ec2_github_runner(ec2_ctx, ec2_config, repo, label, data).await
+}
+
+pub(super) async fn handle_workflow_job_completed(
+    ctx: &BorsContext,
+    repo: Arc<RepositoryState>,
+    payload: WorkflowJobCompleted,
+) -> anyhow::Result<()> {
+    let Some(build_kind) = get_build_kind_from_branch(&payload.branch) else {
+        return Ok(());
+    };
+
+    if let BuildKind::Auto = build_kind {
+        ctx.get_job_cache().auto_job_completed(
+            repo.repository(),
+            payload.run_id,
+            payload.job_id,
+            &payload.name,
+        );
+    }
+
+    Ok(())
+}
+
+/// Load pending auto workflows and their jobs from GitHub Actions, and store their state into the
+/// in-memory job cache.
+pub(super) async fn reload_workflow_job_cache(
+    ctx: &BorsContext,
+    db: Arc<PgDbClient>,
+    repo: Arc<RepositoryState>,
+) -> anyhow::Result<()> {
+    let job_cache = ctx.get_job_cache();
+
+    let builds = db.get_pending_builds(repo.repository()).await?;
+    for build in &builds {
+        // Right now, we only care about auto builds
+        if build.kind != BuildKind::Auto {
+            continue;
+        }
+
+        let Ok(workflows) = repo
+            .client
+            .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+            .await
+        else {
+            continue;
+        };
+        for workflow in workflows {
+            match workflow.status {
+                WorkflowStatus::Pending => {}
+                WorkflowStatus::Success | WorkflowStatus::Failure => {
+                    continue;
+                }
+            }
+            let Ok(workflow_jobs) = repo.client.get_jobs_for_workflow_run(workflow.id).await else {
+                continue;
+            };
+
+            tracing::info!(
+                "Reloading {} job(s) of workflow run {}",
+                workflow_jobs.len(),
+                workflow.id
+            );
+            for job in workflow_jobs {
+                match job.status {
+                    Status::Completed | Status::Failed => {
+                        job_cache.auto_job_completed(
+                            repo.repository(),
+                            workflow.id,
+                            job.id,
+                            &job.name,
+                        );
+                    }
+                    _ => {
+                        job_cache.auto_job_started(
+                            repo.repository(),
+                            workflow.id,
+                            job.id,
+                            &job.name,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -506,5 +691,28 @@ min_ci_time = 20
             Ok(())
         })
         .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn ignore_pull_request_event_workflow(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let workflow = ctx.try_workflow();
+            ctx.modify_workflow(workflow, |run| {
+                run.set_event("pull_request");
+            });
+
+            ctx.skip_waiting_for_marker(async |ctx| {
+                ctx.workflow_event(WorkflowEvent::started(workflow)).await?;
+                ctx.workflow_event(WorkflowEvent::success(workflow)).await
+            })
+            .await?;
+
+            Ok(())
+        })
+        .await;
+        assert!(get_all_workflows(&pool).await.unwrap().is_empty());
     }
 }

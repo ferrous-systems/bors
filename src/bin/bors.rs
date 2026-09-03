@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::Context;
 use bors::server::{ServerState, create_app};
 use bors::{
-    BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, Git, OAuthClient, OAuthConfig,
-    PgDbClient, RepositoryStore, TeamApiClient, TreeState, WebhookSecret, ZulipClient,
+    BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, Ec2Context, Git, OAuthClient,
+    OAuthConfig, PgDbClient, RepositoryStore, TeamApiClient, TreeState, WebhookSecret, ZulipClient,
     create_bors_process, create_github_client, load_repositories,
 };
 use clap::Parser;
@@ -40,6 +40,16 @@ const MERGE_QUEUE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Longest duration between two ticks of the merge queue.
 const MERGE_QUEUE_MAX_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often should the bot try to terminate running EC2 instances that are too old.
+const EC2_INSTANCE_TERMINATE_INTERVAL: Duration = Duration::from_secs(60 * 10);
+
+/// How often should the bot try to backfill EC2 instances for jobs that have been queued for a
+/// long time.
+const EC2_INSTANCE_BACKFILL_TERMINAL: Duration = Duration::from_secs(60 * 15);
+
+/// How often should the bot try to check unrolled builds?
+const PROCESS_UNROLLED_MEMBER_BUILDS: Duration = Duration::from_secs(60 * 5);
 
 #[derive(clap::Parser)]
 struct Opts {
@@ -98,6 +108,11 @@ struct Opts {
     /// Disable the use of `Secure` cookies for session management. Only recommended in local dev.
     #[arg(long, env = "INSECURE_COOKIES")]
     insecure_cookies: bool,
+
+    /// Set this to an AWS EC2 ARN role to be assumed when executing AWS commands.
+    /// Setting this variable is required to enable the EC2 instance spawning functionality.
+    #[arg(long, env = "CI_EC2_RUNNER_ROLE")]
+    ec2_role: Option<String>,
 }
 
 /// Starts a server that receives GitHub webhooks and generates events into a queue
@@ -135,25 +150,41 @@ async fn initialize_db(connection_string: &str) -> anyhow::Result<PgDbClient> {
 }
 
 fn try_main(opts: Opts) -> anyhow::Result<()> {
+    let Opts {
+        app_id,
+        private_key,
+        client_id,
+        client_secret,
+        zulip_username,
+        zulip_token,
+        zulip_server,
+        webhook_secret,
+        db,
+        cmd_prefix,
+        web_url,
+        permissions,
+        insecure_cookies,
+        ec2_role,
+    } = opts;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Cannot build tokio runtime")?;
 
     let db = runtime
-        .block_on(initialize_db(opts.db.expose_secret()))
+        .block_on(initialize_db(db.expose_secret()))
         .context("Cannot initialize database")?;
-    let team_api = TeamApiClient::new(opts.permissions);
+    let team_api = TeamApiClient::new(permissions);
     let (gh_client, loaded_repos) = runtime.block_on(async {
         let client = create_github_client(
-            opts.app_id.into(),
+            app_id.into(),
             "https://api.github.com".to_string(),
-            opts.private_key,
+            private_key,
         )?;
         let repos = load_repositories(&client, &team_api).await?;
         Ok::<_, anyhow::Error>((client, repos))
     })?;
-    let zulip_client = match (opts.zulip_server, opts.zulip_username, opts.zulip_token) {
+    let zulip_client = match (zulip_server, zulip_username, zulip_token) {
         (Some(url), Some(username), Some(token)) => {
             Some(ZulipClient::new(url, username, token).context("Cannot create Zulip client")?)
         }
@@ -201,14 +232,17 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         }
     };
 
+    let ec2_ctx = ec2_role.map(Ec2Context::new);
+
     let db = Arc::new(db);
     let ctx = Arc::new(BorsContext::new(
-        CommandParser::new(opts.cmd_prefix.clone().into()),
+        CommandParser::new(cmd_prefix.clone().into()),
         db.clone(),
         repos.clone(),
         git,
-        &opts.web_url,
+        &web_url,
         zulip_client,
+        ec2_ctx,
     ));
     let BorsProcess {
         repository_tx,
@@ -243,6 +277,9 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
             BorsGlobalEvent::RefreshPullRequestMergeability,
             BorsGlobalEvent::RefreshPendingBuilds,
             BorsGlobalEvent::ProcessMergeQueue,
+            BorsGlobalEvent::TerminateOldEC2Instances,
+            BorsGlobalEvent::ReloadWorkflowJobCache,
+            BorsGlobalEvent::ProcessUnrolledMemberBuilds,
         ];
         for event in startup_events {
             refresh_tx.send(event).await?;
@@ -254,6 +291,9 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         let mut mergeability_status_refresh = make_interval(MERGEABILITY_STATUS_INTERVAL);
         let mut prs_interval = make_interval(PR_STATE_PERIODIC_REFRESH);
         let mut merge_queue_interval = make_interval(MERGE_QUEUE_CHECK_INTERVAL);
+        let mut ec2_check_interval = make_interval(EC2_INSTANCE_TERMINATE_INTERVAL);
+        let mut ec2_backfill_interval = make_interval(EC2_INSTANCE_BACKFILL_TERMINAL);
+        let mut unrolled_build_interval = make_interval(PROCESS_UNROLLED_MEMBER_BUILDS);
         loop {
             tokio::select! {
                 _ = config_refresh.tick() => {
@@ -274,11 +314,20 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
                 _ = merge_queue_interval.tick() => {
                     refresh_tx.send(BorsGlobalEvent::ProcessMergeQueue).await?;
                 }
+                _ = ec2_check_interval.tick() => {
+                    refresh_tx.send(BorsGlobalEvent::TerminateOldEC2Instances).await?;
+                }
+                _ = ec2_backfill_interval.tick() => {
+                    refresh_tx.send(BorsGlobalEvent::BackfillEC2Instances).await?;
+                }
+                _ = unrolled_build_interval.tick() => {
+                    refresh_tx.send(BorsGlobalEvent::ProcessUnrolledMemberBuilds).await?;
+                }
             }
         }
     };
 
-    let oauth_client = match (opts.client_id.clone(), opts.client_secret.clone()) {
+    let oauth_client = match (client_id.clone(), client_secret.clone()) {
         (Some(client_id), Some(client_secret)) => {
             let config = OAuthConfig::new(client_id, client_secret);
             Some(OAuthClient::new(
@@ -303,11 +352,11 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
     let state = ServerState::new(
         repository_tx,
         global_tx,
-        WebhookSecret::new(opts.webhook_secret),
+        WebhookSecret::new(webhook_secret),
         oauth_client,
         ctx,
     );
-    let server_process = webhook_server(state, opts.insecure_cookies);
+    let server_process = webhook_server(state, insecure_cookies);
 
     let fut = async move {
         tokio::select! {

@@ -1,10 +1,12 @@
 use crate::bors::event::BorsEvent;
-use crate::bors::{CommandPrefix, RepositoryState, format_help};
+use crate::bors::{BuildKind, CommandPrefix, RepositoryState, format_help};
 use crate::database::{ApprovalStatus, QueueStatus};
+use crate::ec2::{Ec2Instance, Ec2InstanceStatus, get_aws_credentials, get_ec2_instances};
 use crate::github::{GitHubSession, GithubRepoName, OAuthExchangeCode, PullRequestNumber, rollup};
+use crate::server::cached::Cached;
 use crate::templates::{
-    HelpTemplate, HtmlTemplate, NotFoundTemplate, PullRequestStats, QueueTemplate, RepositoryView,
-    RollupsInfo,
+    EC2Template, HelpTemplate, HtmlTemplate, NotFoundTemplate, PendingBuild, PendingWorkflow,
+    PullRequestStats, QueueTemplate, RepositoryView, RollupsInfo,
 };
 use crate::utils::sort_queue::sort_queue_prs;
 use crate::{
@@ -38,7 +40,11 @@ use tower_http::trace::TraceLayer;
 use tracing::Span;
 use webhook::GitHubWebhook;
 
+mod cached;
 pub mod webhook;
+
+/// How often to reload EC2 instance list from AWS.
+const EC2_INSTANCE_RELOAD_DURATION: Duration = Duration::from_secs(60 * 2);
 
 /// Shared server state for all axum handlers.
 pub struct ServerState {
@@ -47,6 +53,7 @@ pub struct ServerState {
     webhook_secret: WebhookSecret,
     oauth: Option<OAuthClient>,
     ctx: Arc<BorsContext>,
+    cache: ServerCache,
 }
 
 impl ServerState {
@@ -63,6 +70,7 @@ impl ServerState {
             webhook_secret,
             oauth,
             ctx,
+            cache: ServerCache::default(),
         }
     }
 
@@ -97,6 +105,18 @@ impl FromRef<ServerStateRef> for Arc<PgDbClient> {
 
 #[derive(Clone)]
 pub struct ServerStateRef(pub Arc<ServerState>);
+
+struct ServerCache {
+    ec2_instances: Cached<Vec<Ec2Instance>>,
+}
+
+impl Default for ServerCache {
+    fn default() -> Self {
+        Self {
+            ec2_instances: Cached::new(EC2_INSTANCE_RELOAD_DURATION),
+        }
+    }
+}
 
 pub async fn create_app(state: ServerState, insecure_cookies: bool) -> anyhow::Result<Router> {
     let compression_layer = CompressionLayer::new()
@@ -147,7 +167,11 @@ pub async fn create_app(state: ServerState, insecure_cookies: bool) -> anyhow::R
         .route("/help", get(help_handler))
         .route(
             "/queue/{repo_owner}/{repo_name}",
-            get(queue_handler).layer(compression_layer),
+            get(queue_handler).layer(compression_layer.clone()),
+        )
+        .route(
+            "/ec2/{repo_owner}/{repo_name}",
+            get(ec2_handler).layer(compression_layer),
         )
         .route("/github", post(github_webhook_handler))
         .route("/health", get(health_handler))
@@ -408,8 +432,8 @@ pub async fn queue_handler(
     session: SessionNullSession,
     Path((repo_owner, repo_name)): Path<(String, String)>,
     State(db): State<Arc<PgDbClient>>,
-    State(oauth): State<Option<OAuthClient>>,
     State(ServerStateRef(state)): State<ServerStateRef>,
+    State(oauth): State<Option<OAuthClient>>,
     Query(params): Query<QueueParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let repo_name = GithubRepoName::new(&repo_owner, &repo_name);
@@ -450,15 +474,43 @@ pub async fn queue_handler(
 
     let prs = sort_queue_prs(prs);
 
-    // Note: this assumed that there is ever at most a single pending build
-    let pending_build = prs.iter().find_map(|pr| match pr.queue_status() {
-        QueueStatus::Pending(_, build) => Some(build),
-        _ => None,
-    });
-    let pending_workflow = match pending_build {
-        Some(build) => db.get_workflows_for_build(build).await?.into_iter().next(),
-        None => None,
+    let pending_builds = {
+        let builds = prs.iter().filter_map(|pr| match pr.queue_status() {
+            QueueStatus::Pending(_, build) => Some((pr.number, build)),
+            _ => None,
+        });
+        let mut pending = HashMap::new();
+        for (pr, build_model) in builds {
+            let workflow = db
+                .get_workflows_for_build(build_model)
+                .await?
+                .into_iter()
+                .next();
+            let workflow = workflow.map(|workflow| {
+                let jobs = state
+                    .ctx
+                    .get_job_cache()
+                    .get_jobs(&repo.name, workflow.run_id.into());
+                PendingWorkflow { workflow, jobs }
+            });
+
+            pending.insert(
+                pr,
+                PendingBuild {
+                    build: build_model.clone(),
+                    workflow,
+                },
+            );
+        }
+        pending
     };
+
+    // We assume that there is at most one of these, so the order doesn't matter
+    let pending_auto_workflow = pending_builds
+        .values()
+        .filter(|build| build.build.kind == BuildKind::Auto)
+        .filter_map(|b| b.workflow.as_ref())
+        .next();
 
     let average_build_duration = {
         let total_duration = last_ten_builds
@@ -497,8 +549,8 @@ pub async fn queue_handler(
         match &status {
             QueueStatus::Pending(_, _) => {
                 // Try to guess already elapsed time of the pending workflow
-                let elapsed = if let Some(workflow) = &pending_workflow {
-                    (Utc::now() - workflow.created_at)
+                let elapsed = if let Some(workflow) = &pending_auto_workflow {
+                    (Utc::now() - workflow.workflow.created_at)
                         .to_std()
                         .unwrap_or_default()
                 } else {
@@ -536,6 +588,13 @@ pub async fn queue_handler(
             Some(expected_remaining_duration.unwrap_or_default() + remaining_duration);
     }
 
+    let ec2_configured = state.ctx.get_ec2_ctx().is_some()
+        && state
+            .ctx
+            .get_repo(&repo.name)
+            .map(|r| r.config.load().ec2_runners.is_some())
+            .unwrap_or(false);
+
     Ok(HtmlTemplate(QueueTemplate {
         login_url: oauth
             .as_ref()
@@ -551,11 +610,83 @@ pub async fn queue_handler(
             failed_count,
         },
         prs,
-        pending_workflow,
+        pending_builds,
         selected_rollup_prs: params.pull_requests.map(|prs| prs.0).unwrap_or_default(),
         rollups_info: RollupsInfo::from(rollups),
         expected_remaining_duration,
         average_build_duration,
+        ec2_configured,
+    })
+    .into_response())
+}
+
+pub async fn ec2_handler(
+    Path((repo_owner, repo_name)): Path<(String, String)>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+) -> Result<impl IntoResponse, AppError> {
+    let Some(ec2_context) = state.ctx.get_ec2_ctx() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "EC2 context is not configured for this bors instance".to_string(),
+        )
+            .into_response());
+    };
+
+    let gh_repo_name = GithubRepoName::new(&repo_owner, &repo_name);
+    let repo = match state.get_repo(&gh_repo_name) {
+        Some(repo) => repo,
+        None => {
+            return Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Repository {gh_repo_name} not found"),
+            )
+                .into_response());
+        }
+    };
+    let Some(ec2_config) = &repo.config.load().ec2_runners else {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Repository {gh_repo_name} does not have EC2 configured"),
+        )
+            .into_response());
+    };
+
+    let load_instances = async || {
+        let creds = get_aws_credentials(ec2_context).await?;
+        let instances = get_ec2_instances(&gh_repo_name, &creds, ec2_config).await?;
+        anyhow::Ok(instances)
+    };
+    let cached = state.cache.ec2_instances.load(load_instances).await?;
+    let mut instances = cached.value;
+    instances.sort_by(|a, b| {
+        // Sort by status first, then build kind, then started date
+        let status = |instance: &Ec2Instance| match instance.status {
+            Ec2InstanceStatus::Pending => 0,
+            Ec2InstanceStatus::Running => 1,
+            Ec2InstanceStatus::Stopping => 2,
+            Ec2InstanceStatus::Stopped => 3,
+            Ec2InstanceStatus::ShuttingDown => 4,
+            Ec2InstanceStatus::Terminated => 5,
+            _ => 6,
+        };
+        let build_kind = |instance: &Ec2Instance| match instance.build_kind {
+            BuildKind::Auto => 0,
+            BuildKind::Try => 1,
+            BuildKind::UnrolledMember => 2,
+        };
+
+        status(a)
+            .cmp(&status(b))
+            .then_with(|| build_kind(a).cmp(&build_kind(b)))
+            .then_with(|| a.started_at.cmp(&b.started_at))
+    });
+
+    Ok(HtmlTemplate(EC2Template {
+        repo_name,
+        repo_owner,
+        repo_url: format!("https://github.com/{gh_repo_name}"),
+        instances,
+        loaded_at: cached.loaded_at,
     })
     .into_response())
 }
@@ -667,6 +798,6 @@ mod tests {
             insta::assert_snapshot!(response, @r#"[{"number":1,"title":"Title of PR 1","author":"default-user","status":"open","head_branch":"pr/1","base_branch":"main","priority":null,"approver":"default-user","try_build":null,"auto_build":null}]"#);
             Ok(())
         })
-        .await;
+            .await;
     }
 }

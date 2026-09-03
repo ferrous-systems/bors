@@ -12,19 +12,23 @@ The production instance of the bot is deployed at https://bors-prod.rust-lang.ne
 
 ## Configuration
 There are several parameters that can be configured when launching the bot. Parameters without a default value are
-required.
+required. Flags marked with `*` are required.
 
-| **CLI flag**       | **Environment var.**  | **Default**           | **Description**                                                                                                        |
-|--------------------|-----------------------|-----------------------|------------------------------------------------------------------------------------------------------------------------|
-| `--app-id`         | `APP_ID`              |                       | GitHub app ID of the bors bot.                                                                                         |
-| `--private-key`    | `PRIVATE_KEY`         |                       | Private key of the GitHub app.                                                                                         |
-| `--webhook-secret` | `WEBHOOK_SECRET`      |                       | Key used to authenticate GitHub webhooks.                                                                              |
-| `--client-id`      | `OAUTH_CLIENT_ID`     |                       | GitHub OAuth client ID for rollup UI (optional).                                                                       |
-| `--client-secret`  | `OAUTH_CLIENT_SECRET` |                       | GitHub OAuth client secret for rollup UI (optional).                                                                   |
-| `--db`             | `DATABASE_URL`        |                       | Database connection string. Only PostgreSQL is supported.                                                              |
-| `--cmd-prefix`     | `CMD_PREFIX`          | @bors                 | Prefix used to invoke bors commands in PR comments.                                                                    |
-| `--web_url`        | `WEB_URL`             | http://localhost:8080 | Web URL where the bot's website is deployed (optional).                                                                |
-| `--permissions`    | `PERMISSIONS`         | Rust Team API URL     | Either a URL to the team v1 API or a path to a directory containing JSON files with try/review permissions (optional). |
+| **CLI flag**           | **Environment var.**  | **Default**           | **Description**                                                                                             |
+|------------------------|-----------------------|-----------------------|-------------------------------------------------------------------------------------------------------------|
+| `--app-id` (*)         | `APP_ID`              |                       | GitHub app ID of the bors bot.                                                                              |
+| `--private-key` (*)    | `PRIVATE_KEY`         |                       | Private key of the GitHub app.                                                                              |
+| `--webhook-secret` (*) | `WEBHOOK_SECRET`      |                       | Key used to authenticate GitHub webhooks.                                                                   |
+| `--client-id`          | `OAUTH_CLIENT_ID`     |                       | GitHub OAuth client ID for rollup UI.                                                                       |
+| `--client-secret`      | `OAUTH_CLIENT_SECRET` |                       | GitHub OAuth client secret for rollup UI.                                                                   |
+| `--db`                 | `DATABASE_URL`        |                       | Database connection string. Only PostgreSQL is supported.                                                   |
+| `--cmd-prefix`         | `CMD_PREFIX`          | @bors                 | Prefix used to invoke bors commands in PR comments.                                                         |
+| `--web_url`            | `WEB_URL`             | http://localhost:8080 | Web URL where the bot's website is deployed.                                                                |
+| `--permissions`        | `PERMISSIONS`         | Rust Team API URL     | Either a URL to the team v1 API or a path to a directory containing JSON files with try/review permissions. |
+| `--zulip-username`     | `ZULIP_USERNAME`      |                       | Zulip account username for posting Zulip messages.                                                          |
+| `--zulip-token`        | `ZULIP_TOKEN`         |                       | Zulip account token for posting Zulip messages.                                                             |
+| `--zulip-server`       | `ZULIP_SERVER`        |                       | Zulip server URL for posting Zulip messages.                                                                |
+| `--ec2-role`           | `CI_EC2_RUNNER_ROLE`  |                       | AWS ARN role used to authenticate `aws` commands.                                                           |                                                                                               |
 
 ### Special branches
 The bot uses the following branch names for its operations.
@@ -42,6 +46,13 @@ The bot uses the following branch names for its operations.
   - Should not be configured for any CI workflows!
 - `automation/bors/auto`
   - This branch should be configured for CI workflows that need to run before merging to the base branch.
+
+#### Unrolled builds
+- `automation/bors/try-perf-merge`
+  - Used to prepare unrolled builds of rollup members, used for perf runs.
+  - Should not be configured for any CI workflows!
+- `automation/bors/try-perf`
+  - This branch should be configured for CI workflows used to produce perf artifacts.
 
 The merge and non-merge branches are needed because we cannot set branches to parent and merge them with a PR commit
 atomically using the GitHub API.
@@ -65,7 +76,9 @@ describes the file can be found in `src/config.rs`. [Here](rust-bors.example.tom
 4) Configure CI workflows on push to:
    - `automation/bors/try` branch (for try builds)
    - `automation/bors/auto` branch (for auto builds)
-5) Give the bot permissions to push to `automation/bors/try`, `automation/bors/try-merge`, `automation/bors/auto`, and `automation/bors/auto-merge`.
+   - `automation/bors/try-perf` branch (for unrolled rollup perf builds)
+     - This is only needed if the `[unroll]` section is configured in the config file.
+5) Give the bot permissions to push to `automation/bors/try`, `automation/bors/try-merge`, `automation/bors/auto`, `automation/bors/auto-merge`, `automation/bors/try-perf`, and `automation/bors/try-perf-merge`.
 
 ## Contributing
 

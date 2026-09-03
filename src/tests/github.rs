@@ -7,6 +7,7 @@ use crate::permissions::PermissionType;
 use crate::tests::COMMENT_RECEIVE_TIMEOUT;
 use chrono::{DateTime, Utc};
 use http::StatusCode;
+use itertools::Itertools;
 use octocrab::models::pulls::MergeableState;
 use octocrab::models::workflows::Conclusion;
 use octocrab::models::{CheckSuiteId, JobId, RunId};
@@ -386,8 +387,9 @@ pub struct Repo {
     pub pull_request_error: bool,
     /// Push error failure/success behaviour.
     pub push_behaviour: BranchPushBehaviour,
-    pub fork: bool,
+    pub fork_of: Option<Arc<Mutex<Repo>>>,
     pub merge_behavior: MergeBehavior,
+    pub contents: HashMap<CommitSha, Option<String>>,
 }
 
 impl Repo {
@@ -406,8 +408,9 @@ impl Repo {
             pull_request_error: false,
             check_runs: vec![],
             push_behaviour: BranchPushBehaviour::default(),
-            fork: false,
+            fork_of: None,
             merge_behavior: MergeBehavior::default(),
+            contents: Default::default(),
         };
         repo.add_branch(Branch::default());
         repo
@@ -419,6 +422,10 @@ impl Repo {
 
     pub fn owner(&self) -> &User {
         &self.owner
+    }
+
+    pub fn is_fork(&self) -> bool {
+        self.fork_of.is_some()
     }
 
     pub fn branches(&self) -> &[Branch] {
@@ -491,12 +498,20 @@ impl Repo {
         if let Some(old) = self.commits.insert(commit.commit_sha(), commit.clone()) {
             assert_eq!(old, commit);
         }
+        // Emulate commits being shared across forks on GitHub
+        if let Some(fork) = &self.fork_of {
+            fork.lock().create_commit(commit);
+        }
     }
 
     pub fn get_commit_by_sha(&self, sha: &str) -> Commit {
         self.commits
             .get(&CommitSha(sha.to_owned()))
-            .expect("Looking up non-existing commit SHA")
+            .unwrap_or_else(|| {
+                let commits: Vec<_> = self.commits.values().collect();
+                let commits = commits.iter().map(|c| format!("{c:?}")).join("\n");
+                panic!("Looking up non-existing commit SHA {sha}. Existing commits:\n{commits}")
+            })
             .clone()
     }
 
@@ -659,6 +674,8 @@ pub struct PullRequest {
     pub(super) comment_queue_rx: Arc<tokio::sync::Mutex<Receiver<CommentMsg>>>,
     pub(super) comment_history: Vec<Comment>,
     pub maintainers_can_modify: bool,
+    /// Should API requests for this PR return 404?
+    pub missing: bool,
 }
 
 impl PullRequest {
@@ -699,6 +716,7 @@ impl PullRequest {
             comment_queue_rx: Arc::new(tokio::sync::Mutex::new(comment_queue_rx)),
             comment_history: Vec::new(),
             maintainers_can_modify: true,
+            missing: false,
         }
     }
 
@@ -1118,6 +1136,7 @@ pub struct WorkflowRun {
     /// How long did the workflow run for?
     duration: Duration,
     status: WorkflowStatus,
+    event: String,
 }
 
 impl WorkflowRun {
@@ -1131,6 +1150,7 @@ impl WorkflowRun {
             jobs: vec![],
             head_sha: branch.sha(),
             duration: Duration::from_secs(3600),
+            event: "push".to_string(),
         }
     }
 
@@ -1161,6 +1181,9 @@ impl WorkflowRun {
     pub fn head_sha(&self) -> &str {
         &self.head_sha
     }
+    pub fn set_head_sha(&mut self, sha: &str) {
+        self.head_sha = sha.to_string();
+    }
 
     pub fn duration(&self) -> Duration {
         self.duration
@@ -1171,6 +1194,13 @@ impl WorkflowRun {
 
     pub fn status(&self) -> WorkflowStatus {
         self.status
+    }
+
+    pub fn event(&self) -> &str {
+        &self.event
+    }
+    pub fn set_event(&mut self, event: &str) {
+        self.event = event.to_string();
     }
 
     pub fn add_job(&mut self, status: WorkflowStatus) {
