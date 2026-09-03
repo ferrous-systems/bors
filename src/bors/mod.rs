@@ -31,10 +31,12 @@ pub mod event;
 mod gitops;
 pub mod gitops_queue;
 mod handlers;
+mod job_cache;
 mod labels;
 pub mod merge_queue;
 pub mod mergeability_queue;
 pub mod process;
+pub mod unroll_queue;
 
 use crate::PgDbClient;
 use crate::bors::command::BorsCommand;
@@ -43,18 +45,28 @@ use crate::database::{PullRequestModel, WorkflowStatus};
 use crate::github::api::operations::CommitAuthor;
 pub use command::CommandPrefix;
 pub use gitops::Git;
+pub use job_cache::{WorkflowJobData, WorkflowJobStatus};
 
 /// Branch where CI checks run for auto builds.
 /// This branch should run CI checks.
 pub const AUTO_BRANCH_NAME: &str = "automation/bors/auto";
 
+/// Branch where CI checks run for try builds.
 /// This branch should run CI checks.
 pub const TRY_BRANCH_NAME: &str = "automation/bors/try";
 
+/// Branch where CI checks run for unrolled perf builds.
+/// This branch should run CI checks.
+pub const TRY_PERF_BRANCH_NAME: &str = "automation/bors/try-perf";
+
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum BuildKind {
+    /// Try build on a PR, to test a set of CI jobs.
     Try,
+    /// Merge build, which attempts to merge a PR into the target branch.
     Auto,
+    /// Unrolled build of a rollup member, designed for compiler performance tests.
+    UnrolledMember,
 }
 
 /// Format the bors command help in Markdown format.
@@ -72,7 +84,11 @@ pub fn format_help() -> &'static str {
         BorsCommand::Unapprove => {}
         BorsCommand::Help => {}
         BorsCommand::Ping => {}
-        BorsCommand::Try { parent: _, jobs: _ } => {}
+        BorsCommand::Try {
+            parent: _,
+            jobs: _,
+            nolimit: _,
+        } => {}
         BorsCommand::TryCancel => {}
         BorsCommand::SetPriority {
             priority: _,
@@ -118,12 +134,13 @@ You can use the following commands:
 - `delegate` | `delegate+`: Delegate approval permissions to the PR author
     - Shortcut for `delegate review`
 - `delegate-`: Remove any previously granted permission delegation
-- `try [parent=<parent>] [job|jobs=<jobs>]`: Start a try build.
+- `try [parent=<parent>] [job|jobs=<jobs>] [nolimit]`: Start a try build.
     - Optionally, you can specify a `<parent>` SHA with which will the PR be merged. You can specify `parent=last` to use the same parent SHA as the previous try build.
     - Optionally, you can select a comma-separated list of CI `<jobs>` to run in the try build.
       Examples:
         - `@bors try jobs=x86_64-gnu-nopt`
         - `@bors try jobs=x86_64-gnu-nopt,x86_64-mingw-*` (matches `x86_64-gnu-nopt` and jobs starting with `x86_64-mingw-`)
+    - Optionally, you can turn off the limit on the number of executed try jobs with `nolimit`.
 - `try cancel`: Cancel a running try build on the current PR.
 - `retry`: Clear a failed auto build status from an approved PR. This will cause the merge queue to eventually attempt to merge the PR again.
 - `cancel` | `yield`: Cancel a running auto build on the current PR.
@@ -346,7 +363,10 @@ impl FromStr for PullRequestStatus {
 
 #[derive(Debug, Clone)]
 pub enum MergeType {
-    Try { try_jobs: Vec<String> },
+    Try {
+        try_jobs: Vec<String>,
+        nolimit: bool,
+    },
     Auto,
 }
 
@@ -384,6 +404,8 @@ pub fn normalize_merge_message(message: &str) -> String {
 }
 
 pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: MergeType) -> String {
+    use std::fmt::Write;
+
     /// Prefix used to specify custom try jobs in PR descriptions.
     const CUSTOM_TRY_JOB_PREFIX: &str = "try-job:";
 
@@ -398,7 +420,10 @@ pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: Me
         // Only keep any lines starting with `CUSTOM_TRY_JOB_PREFIX`.
         // If we do not have any custom try jobs, keep the ones that might be in the PR
         // description.
-        MergeType::Try { try_jobs } if try_jobs.is_empty() => pr
+        MergeType::Try {
+            try_jobs,
+            nolimit: _,
+        } if try_jobs.is_empty() => pr
             .github
             .message
             .lines()
@@ -422,9 +447,12 @@ pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: Me
     );
 
     match merge_type {
-        MergeType::Try { try_jobs } => {
+        MergeType::Try { try_jobs, nolimit } => {
             for job in try_jobs {
-                message.push_str(&format!("\n{CUSTOM_TRY_JOB_PREFIX} {job}"));
+                write!(message, "\n{CUSTOM_TRY_JOB_PREFIX} {job}").unwrap();
+            }
+            if nolimit {
+                writeln!(message, "\ntry-nolimit").unwrap();
             }
         }
         MergeType::Auto => {}

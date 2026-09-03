@@ -122,11 +122,24 @@ Nevertheless, sometimes it might be easier to test it on your own repository. Th
 ### One-time setup
 - Create your own [GitHub app](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app).
   - Configure its webhook secret and private key and write them down.
-  - Give it permissions for `Actions` (r/w), `Checks` (r/w), `Contents` (r/w), `Issues` (r/w) and `Pull requests` (r/w).
-  - Subscribe it to webhook events `Issue comment`, `Push`, `Pull request`, `Pull request review`, `Pull request review comment` and `Workflow run`.
+  - Give it the following permissions:
+    - `Actions` (r/w)
+    - `Checks` (r/w)
+    - `Contents` (r/w)
+    - `Issues` (r/w)
+    - `Pull requests` (r/w)
+    - `Self-hosted runners` (r/w) if you want to spawn EC2 CI runners
+  - Subscribe it to the following webhook events:
+    - `Issue comment`
+    - `Push`
+    - `Pull request`
+    - `Pull request review`
+    - `Pull request review comment`
+    - `Workflow job`
+    - `Workflow run`
 - Install your GitHub app on some test repository where you want to test bors.
 - Add `rust-bors.toml` in the root of the repository, and also add some example CI workflows.
-- If you want to use custom permissions for PR approvals, create team data files for GitHub users in `data/team`. You can find examples in that directory, which you should copy and remove the `.example` suffix. 
+- If you want to use custom permissions for PR approvals, create team data files for GitHub users in `data/team`. You can find examples in that directory, which you should copy and remove the `.example` suffix.
   - Get your GitHub user `ID` `https://api.github.com/users/<your_github_user_name>`
   - Edit both `bors.review.json` and `bors.try.json` files to include your GitHub `ID`: `{ "github_ids": [123] }`
 - Add `<WEB_URL>/oauth/callback` as a callback URL (usually substituting `<WEB_URL>` below with `http://localhost:8080`)

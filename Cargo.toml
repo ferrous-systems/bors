@@ -43,6 +43,8 @@ jsonwebtoken = "10"
 url = "2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 http = "1"
+http-body-util = "0.1"
+bytes = "1"
 askama = "0.16"
 
 # Cryptography
@@ -70,14 +72,12 @@ which = "8"
 pulldown-cmark = "0.13"
 regex = "1"
 axum_session = { version = "0.20.1", features = ["key-store"] }
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 insta = "1.26"
 wiremock = "0.6"
-base64 = "0.22"
 tracing-test = "0.2"
-regex = "1"
 parking_lot = "0.12"
 thread_local = "1"
 sqlparser = { version = "0.62", features = ["visitor"] }

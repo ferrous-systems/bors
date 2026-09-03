@@ -1,7 +1,7 @@
 use crate::database::{WorkflowStatus, WorkflowType};
 use crate::github::{CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestNumber};
 use chrono::Duration;
-use octocrab::models::{CheckSuiteId, RunId};
+use octocrab::models::{CheckSuiteId, JobId, RunId};
 
 #[derive(Debug)]
 pub enum BorsRepositoryEvent {
@@ -30,16 +30,20 @@ pub enum BorsRepositoryEvent {
     /// When there is a push to a branch. This includes when a commit is pushed, when a commit tag is pushed,
     /// when a branch is deleted or when a tag is deleted.
     PushToBranch(PushToBranch),
-    /// A workflow run on Github Actions or a check run from external CI system has been started.
+    /// A workflow run on Github Actions or a check run from external CI system has started.
     WorkflowStarted(WorkflowRunStarted),
-    /// A workflow run on Github Actions or a check run from external CI system has been completed.
+    /// A workflow run on Github Actions or a check run from external CI system has completed.
     WorkflowCompleted(WorkflowRunCompleted),
+    /// A workflow job on Github Actions has started.
+    WorkflowJobStarted(WorkflowJobStarted),
+    /// A workflow job on Github Actions has completed.
+    WorkflowJobCompleted(WorkflowJobCompleted),
 }
 
 impl BorsRepositoryEvent {
     pub fn repository(&self) -> &GithubRepoName {
         match self {
-            BorsRepositoryEvent::Comment(comment) => &comment.repository,
+            BorsRepositoryEvent::Comment(payload) => &payload.repository,
             BorsRepositoryEvent::PullRequestCommitPushed(payload) => &payload.repository,
             BorsRepositoryEvent::PullRequestEdited(payload) => &payload.repository,
             BorsRepositoryEvent::PullRequestOpened(payload) => &payload.repository,
@@ -51,8 +55,10 @@ impl BorsRepositoryEvent {
             BorsRepositoryEvent::PullRequestUnassigned(payload) => &payload.repository,
             BorsRepositoryEvent::PullRequestReadyForReview(payload) => &payload.repository,
             BorsRepositoryEvent::PushToBranch(payload) => &payload.repository,
-            BorsRepositoryEvent::WorkflowStarted(workflow) => &workflow.repository,
-            BorsRepositoryEvent::WorkflowCompleted(workflow) => &workflow.repository,
+            BorsRepositoryEvent::WorkflowStarted(payload) => &payload.repository,
+            BorsRepositoryEvent::WorkflowCompleted(payload) => &payload.repository,
+            BorsRepositoryEvent::WorkflowJobStarted(payload) => &payload.repository,
+            BorsRepositoryEvent::WorkflowJobCompleted(payload) => &payload.repository,
         }
     }
 }
@@ -73,6 +79,14 @@ pub enum BorsGlobalEvent {
     RefreshPullRequestState,
     /// Try to process the merge queue.
     ProcessMergeQueue,
+    /// Try to terminate old EC2 running instances.
+    TerminateOldEC2Instances,
+    /// Try to create EC2 instances for jobs that have been queued for some time.
+    BackfillEC2Instances,
+    /// Reload jobs of pending workfows into the in-memory job cache.
+    ReloadWorkflowJobCache,
+    /// Start or complete unrolled builds of rollups.
+    ProcessUnrolledMemberBuilds,
 }
 
 #[derive(Debug)]
@@ -183,4 +197,25 @@ pub struct WorkflowRunCompleted {
     pub running_time: Option<Duration>,
     /// Check suite to which this workflow is attached.
     pub check_suite_id: CheckSuiteId,
+}
+
+#[derive(Debug)]
+pub struct WorkflowJobStarted {
+    pub repository: GithubRepoName,
+    pub job_id: JobId,
+    pub name: String,
+    pub branch: String,
+    pub commit_sha: CommitSha,
+    pub run_id: RunId,
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct WorkflowJobCompleted {
+    pub repository: GithubRepoName,
+    pub job_id: JobId,
+    pub name: String,
+    pub branch: String,
+    pub commit_sha: CommitSha,
+    pub run_id: RunId,
 }

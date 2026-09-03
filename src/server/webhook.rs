@@ -1,6 +1,4 @@
 //! This module handles parsing webhooks and generating [`BorsEvent`]s from them.
-use std::fmt::Debug;
-
 use axum::RequestExt;
 use axum::body::Bytes;
 use axum::extract::FromRequest;
@@ -13,7 +11,7 @@ use octocrab::models::events::payload::{
 };
 use octocrab::models::pulls::{PullRequest, Review};
 use octocrab::models::webhook_events::payload::PullRequestWebhookEventAction;
-use octocrab::models::{Author, CheckSuiteId, Repository, workflows};
+use octocrab::models::{Author, CheckSuiteId, JobId, Repository, RunId, workflows};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
 
@@ -21,7 +19,8 @@ use crate::bors::event::{
     BorsEvent, BorsGlobalEvent, BorsRepositoryEvent, PullRequestAssigned, PullRequestClosed,
     PullRequestComment, PullRequestConvertedToDraft, PullRequestEdited, PullRequestMerged,
     PullRequestOpened, PullRequestPushed, PullRequestReadyForReview, PullRequestReopened,
-    PullRequestUnassigned, PushToBranch, WorkflowRunCompleted, WorkflowRunStarted,
+    PullRequestUnassigned, PushToBranch, WorkflowJobCompleted, WorkflowJobStarted,
+    WorkflowRunCompleted, WorkflowRunStarted,
 };
 use crate::database::{WorkflowStatus, WorkflowType};
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
@@ -68,6 +67,23 @@ struct WorkflowRunInner {
     check_suite_id: CheckSuiteId,
     #[serde(flatten)]
     run: workflows::Run,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct WebhookWorkflowJob<'a> {
+    action: &'a str,
+    workflow_job: WorkflowJobInner,
+    repository: Repository,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct WorkflowJobInner {
+    id: JobId,
+    run_id: RunId,
+    head_branch: String,
+    head_sha: String,
+    name: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -164,6 +180,7 @@ fn parse_webhook_event(request: Parts, body: &[u8]) -> anyhow::Result<Option<Bor
             BorsGlobalEvent::InstallationsChanged,
         ))),
         b"workflow_run" => parse_workflow_run_events(body),
+        b"workflow_job" => parse_workflow_job_events(body),
         _ => {
             tracing::debug!(
                 "Ignoring unknown webhook event type {:?}",
@@ -318,6 +335,14 @@ fn parse_pull_request_review_comment_events(body: &[u8]) -> anyhow::Result<Optio
 fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
     let payload: WebhookWorkflowRun = serde_json::from_slice(body)?;
     let repository_name = parse_repository_name(&payload.repository)?;
+
+    // As a security precaution, we eagerly prefilter all workflow runs other than "push" here,
+    // to ensure that only workflows from privileged pushes to branches in the repository are
+    // registered by bors.
+    if payload.workflow_run.run.event != "push" {
+        return Ok(None);
+    }
+
     let result = match payload.action {
         "requested" => Some(BorsEvent::Repository(BorsRepositoryEvent::WorkflowStarted(
             WorkflowRunStarted {
@@ -360,6 +385,36 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                 }),
             ))
         }
+        _ => None,
+    };
+    Ok(result)
+}
+
+fn parse_workflow_job_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
+    let payload: WebhookWorkflowJob = serde_json::from_slice(body)?;
+    let repository_name = parse_repository_name(&payload.repository)?;
+    let result = match payload.action {
+        "queued" => Some(BorsEvent::Repository(
+            BorsRepositoryEvent::WorkflowJobStarted(WorkflowJobStarted {
+                repository: repository_name,
+                job_id: payload.workflow_job.id,
+                name: payload.workflow_job.name,
+                branch: payload.workflow_job.head_branch,
+                commit_sha: CommitSha(payload.workflow_job.head_sha),
+                run_id: payload.workflow_job.run_id,
+                labels: payload.workflow_job.labels,
+            }),
+        )),
+        "completed" => Some(BorsEvent::Repository(
+            BorsRepositoryEvent::WorkflowJobCompleted(WorkflowJobCompleted {
+                repository: repository_name,
+                job_id: payload.workflow_job.id,
+                name: payload.workflow_job.name,
+                branch: payload.workflow_job.head_branch,
+                commit_sha: CommitSha(payload.workflow_job.head_sha),
+                run_id: payload.workflow_job.run_id,
+            }),
+        )),
         _ => None,
     };
     Ok(result)
@@ -1725,6 +1780,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_job_started() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/workflow-job-queued.json", "workflow_job").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    WorkflowJobStarted(
+                        WorkflowJobStarted {
+                            repository: kobzol/bors-kindergarten2,
+                            job_id: JobId(
+                                89214823120,
+                            ),
+                            name: "init",
+                            branch: "automation/bors/try",
+                            commit_sha: CommitSha(
+                                "13e4ae6263d3ffab811a472772e03b7d345e81fb",
+                            ),
+                            run_id: RunId(
+                                30009847987,
+                            ),
+                            labels: [
+                                "ubuntu-latest",
+                            ],
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_job_completed() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/workflow-job-completed.json", "workflow_job").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    WorkflowJobCompleted(
+                        WorkflowJobCompleted {
+                            repository: kobzol/bors-kindergarten2,
+                            job_id: JobId(
+                                91138434504,
+                            ),
+                            name: "init",
+                            branch: "automation/bors/auto",
+                            commit_sha: CommitSha(
+                                "a0455bb1ebc7d836b1d0d7acb60700787725ea4e",
+                            ),
+                            run_id: RunId(
+                                30625113817,
+                            ),
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_event() {
         assert_eq!(
             check_webhook(
@@ -1758,6 +1878,7 @@ mod tests {
                 Arc::new(RepositoryStore::default()),
                 None,
                 "",
+                None,
                 None,
             )),
         )));

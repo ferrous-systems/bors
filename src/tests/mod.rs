@@ -5,7 +5,8 @@ use crate::bors::{
 };
 use crate::database::{
     BuildModel, BuildStatus, DelegatedPermission, DelegationStatus, MergeableState,
-    OctocrabMergeableState, PullRequestModel, WorkflowStatus,
+    OctocrabMergeableState, PullRequestModel, RollupMemberForUnrolling, UnrollState,
+    WorkflowStatus,
 };
 use crate::github::PullRequestNumber;
 use crate::{
@@ -41,6 +42,7 @@ use crate::bors::gitops_queue::{GitOpsQueueReceiver, handle_gitops_entry};
 use crate::bors::merge_queue::merge_queue_tick;
 use crate::bors::mergeability_queue::{MergeabilityQueueReceiver, check_mergeability};
 use crate::bors::process::QueueSenders;
+use crate::bors::unroll_queue::{UnrollQueueEvent, UnrollQueueReceiver, handle_unroll_queue_event};
 use crate::github::api::client::HideCommentReason;
 use crate::server::{ServerState, create_app};
 use crate::tests::github::{
@@ -63,7 +65,7 @@ pub use github::User;
 pub use github::{BranchPushBehaviour, BranchPushError, MergeBehavior};
 pub use github::{WorkflowEvent, WorkflowJob};
 pub use github::{default_branch_name, default_repo_name};
-pub use mock::ExternalHttpMock;
+pub use mock::{ExternalHttpMock, ZulipMessage};
 pub use utils::io::load_test_file;
 pub use utils::sync::TestSyncMarker;
 pub use utils::webhook::{TEST_WEBHOOK_SECRET, create_webhook_request};
@@ -75,6 +77,8 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TEST_CONDITION_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long should we wait until a mergeability item is dequeued.
 const TEST_MERGEABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long should we wait until an unroll item is dequeued.
+const TEST_UNROLL_TIMEOUT: Duration = Duration::from_secs(1);
 /// How often should we check whether a custom condition in a test is hit.
 const TEST_CONDITION_CHECK: Duration = Duration::from_millis(100);
 /// How long should we wait for a sync marker to be hit.
@@ -84,6 +88,7 @@ const COMMENT_RECEIVE_TIMEOUT: Duration = TEST_CONDITION_TIMEOUT;
 
 const TRY_BRANCH: &str = "automation/bors/try";
 const AUTO_BRANCH: &str = "automation/bors/auto";
+const UNROLLED_BRANCH: &str = "automation/bors/try-perf";
 
 pub fn default_cmd_prefix() -> CommandPrefix {
     "@bors".to_string().into()
@@ -195,8 +200,10 @@ pub struct BorsTester {
     senders: QueueSenders,
     mergeability_queue_rx: MergeabilityQueueReceiver,
     gitops_queue_rx: GitOpsQueueReceiver,
+    unroll_queue_rx: UnrollQueueReceiver,
     ctx: Arc<BorsContext>,
     current_session: Option<String>,
+    wait_for_markers: bool,
 }
 
 impl BorsTester {
@@ -228,6 +235,7 @@ impl BorsTester {
             // local git ops, but we do not currently mock git in tests.
             Some(Git::from_path(PathBuf::from("/tmp/git"))),
             "https://bors-test.com",
+            Some(mock.zulip_client()),
             None,
         ));
 
@@ -238,6 +246,7 @@ impl BorsTester {
             bors_process,
             mergeability_queue_rx,
             gitops_queue_rx,
+            unroll_queue_rx,
         } = create_bors_process(
             ctx.clone(),
             mock.github_client(),
@@ -267,8 +276,10 @@ impl BorsTester {
                 global_tx,
                 mergeability_queue_rx,
                 gitops_queue_rx,
+                unroll_queue_rx,
                 ctx,
                 current_session: None,
+                wait_for_markers: true,
             },
             bors,
         )
@@ -304,6 +315,34 @@ impl BorsTester {
 
     pub fn auto_workflow(&self) -> RunId {
         self.create_workflow(default_repo_name(), AUTO_BRANCH)
+    }
+
+    /// Creates N unrolled workflows, for the past N commits pushed to the unrolled branch.
+    /// This can be used to create workflows for unrolled builds, which are created in a batch,
+    /// and thus we cannot create a workflow for the latest SHA of the unrolled branch only.
+    ///
+    /// The workflows are returned from the oldest to the newest.
+    pub fn unrolled_workflows(&mut self, n: usize) -> Vec<RunId> {
+        let repo_name = default_repo_name();
+        let branch = self
+            .get_repo(&repo_name)
+            .lock()
+            .get_branch_by_name(UNROLLED_BRANCH)
+            .unwrap()
+            .clone();
+
+        assert!(
+            branch.get_commit_history().len() >= n,
+            "Branch doesn't have enough commits in its history.\n{branch:?}"
+        );
+        let mut workflows = vec![];
+        for commit in branch.get_commit_history().into_iter().rev().take(n).rev() {
+            let workflow = self.create_workflow(&repo_name, UNROLLED_BRANCH);
+            // Overwrite the SHA of the workflow
+            self.modify_workflow(workflow, |w| w.set_head_sha(commit.sha()));
+            workflows.push(workflow);
+        }
+        workflows
     }
 
     pub fn create_workflow<Id: Into<RepoIdentifier>>(&self, id: Id, branch: &str) -> RunId {
@@ -348,6 +387,26 @@ impl BorsTester {
         .await
     }
 
+    /// Get a rollup proxy that can be used to assert various things about it and its members.
+    pub async fn get_rollup<Id: Into<PrIdentifier>>(&self, id: Id) -> anyhow::Result<RollupProxy> {
+        let rollup = self.pr(id).await;
+        let pr_db = rollup.require_db_pr();
+        let members = self.db.get_rollup_members(pr_db).await?;
+        let mut members_enriched = vec![];
+        for member in members {
+            let pr = self
+                .db
+                .get_pull_request(&pr_db.repository, member.member)
+                .await?
+                .expect("Rollup member PR not found in the DB");
+            members_enriched.push(RollupMemberForUnrolling { member, pr });
+        }
+
+        Ok(RollupProxy {
+            members: members_enriched,
+        })
+    }
+
     pub fn try_branch(&self) -> Branch {
         self.repo()
             .lock()
@@ -360,6 +419,14 @@ impl BorsTester {
         self.repo()
             .lock()
             .get_branch_by_name(AUTO_BRANCH)
+            .unwrap()
+            .clone()
+    }
+
+    pub fn unrolled_branch(&self) -> Branch {
+        self.repo()
+            .lock()
+            .get_branch_by_name(UNROLLED_BRANCH)
             .unwrap()
             .clone()
     }
@@ -428,6 +495,20 @@ impl BorsTester {
         id: Id,
     ) -> anyhow::Result<Comment> {
         GitHub::get_next_comment(self.github.clone(), id).await
+    }
+
+    pub async fn zulip_messages(&self) -> Vec<ZulipMessage> {
+        self.http_mock.zulip_messages().await
+    }
+
+    /// Expect that `count` Zulip messages will be received, without checking their contents.
+    pub async fn expect_zulip_messages(&self, count: usize) {
+        let messages = self.zulip_messages().await;
+        assert_eq!(
+            messages.len(),
+            count,
+            "Expected {count} Zulip messages, got {messages:#?}"
+        );
     }
 
     pub async fn post_comment<C: Into<Comment>>(&mut self, comment: C) -> anyhow::Result<Comment> {
@@ -513,10 +594,36 @@ impl BorsTester {
                     .unwrap();
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_BUILD_QUEUE,
         )
         .await
         .unwrap();
+    }
+
+    /// Trigger and process a single unroll queue event.
+    pub async fn trigger_and_run_unroll_queue(&mut self) -> anyhow::Result<()> {
+        self.senders
+            .unroll_queue()
+            .process_unrolled_members(&default_repo_name())
+            .await?;
+        self.run_unroll_queue().await
+    }
+
+    /// Process a single unroll queue event.
+    pub async fn run_unroll_queue(&mut self) -> anyhow::Result<()> {
+        let ran = try_run_unroll_queue(self.ctx.clone(), &mut self.unroll_queue_rx).await?;
+        assert!(ran);
+        Ok(())
+    }
+
+    /// Directly run processing of unrolled members, without going through the queue.
+    pub async fn run_unroll_queue_concurrent(&self) -> anyhow::Result<()> {
+        handle_unroll_queue_event(
+            self.ctx.clone(),
+            UnrollQueueEvent::ProcessUnrolledMembers(default_repo_name()),
+        )
+        .await
     }
 
     /// Enqueue PRs with stale/unknown mergeability into the mergeability queue.
@@ -530,6 +637,7 @@ impl BorsTester {
                     .unwrap();
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_MERGEABILITY_STATUS_REFRESH,
         )
         .await
@@ -546,6 +654,7 @@ impl BorsTester {
                     .unwrap();
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_PR_STATUS_REFRESH,
         )
         .await
@@ -562,6 +671,7 @@ impl BorsTester {
                     .unwrap();
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_CONFIG_REFRESH,
         )
         .await
@@ -581,6 +691,7 @@ impl BorsTester {
                 self.senders.merge_queue().perform_tick().await.unwrap();
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_MERGE_QUEUE,
         )
         .await
@@ -591,11 +702,16 @@ impl BorsTester {
     pub async fn run_merge_queue_directly(&self) {
         wait_for_marker(
             async || {
-                merge_queue_tick(self.ctx.clone(), self.senders.mergeability_queue())
-                    .await
-                    .unwrap();
+                merge_queue_tick(
+                    self.ctx.clone(),
+                    self.senders.mergeability_queue(),
+                    self.senders.unroll_queue(),
+                )
+                .await
+                .unwrap();
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_MERGE_QUEUE,
         )
         .await
@@ -1194,6 +1310,7 @@ impl BorsTester {
                 );
                 Ok(())
             },
+            self.wait_for_markers,
             &WAIT_FOR_WEBHOOK_COMPLETED,
         )
         .await?;
@@ -1216,8 +1333,19 @@ impl BorsTester {
             .assert_status(StatusCode::from_u16(303).unwrap());
         Ok(())
     }
+    /// Run the provided async function while not waiting for markers to be hit.
+    pub async fn skip_waiting_for_marker<F, R>(&mut self, func: F) -> R
+    where
+        F: AsyncFnOnce(&mut Self) -> R,
+    {
+        let orig = self.wait_for_markers;
+        self.wait_for_markers = false;
+        let res = func(self).await;
+        self.wait_for_markers = orig;
+        res
+    }
 
-    async fn finish(self, bors: JoinHandle<()>) -> anyhow::Result<GitHub> {
+    async fn finish(mut self, bors: JoinHandle<()>) -> anyhow::Result<GitHub> {
         // Tell the mergeability queue that it should shutdown once it has nothing else to do
         self.senders.mergeability_queue().shutdown();
 
@@ -1230,6 +1358,9 @@ impl BorsTester {
         // Drain the mergeability queue
         while try_run_mergeability_check(self.ctx.clone(), &self.mergeability_queue_rx).await? {}
 
+        // Drain unroll mergeability queue
+        while try_run_unroll_queue(self.ctx.clone(), &mut self.unroll_queue_rx).await? {}
+
         // Wait until all events are handled in the bors service
         match tokio::time::timeout(Duration::from_secs(5), bors).await {
             Ok(Ok(_)) => {}
@@ -1241,7 +1372,7 @@ impl BorsTester {
             }
         };
         // Flush any local queues
-        self.http_mock.gh_server.assert_empty_queues().await?;
+        self.http_mock.assert_empty_queues().await?;
         Ok(Arc::into_inner(self.github).unwrap().into_inner())
     }
 }
@@ -1346,6 +1477,10 @@ impl PullRequestProxy {
 
     pub fn get_gh_pr(&self) -> PullRequest {
         self.gh_pr.clone()
+    }
+
+    pub fn get_db_pr(&self) -> &PullRequestModel {
+        self.require_db_pr()
     }
 
     /// Useful for debugging the GitHub and DB PR state.
@@ -1538,9 +1673,52 @@ impl PullRequestProxy {
     }
 }
 
+/// A proxy object for checking assertions on rollup members.
+pub struct RollupProxy {
+    members: Vec<RollupMemberForUnrolling>,
+}
+
+impl RollupProxy {
+    /// Check that all members have this unroll state
+    #[track_caller]
+    pub fn expect_unroll_state_all(&self, state: UnrollState) -> &Self {
+        for member in &self.members {
+            assert_eq!(
+                member.member.unroll_state,
+                Some(state),
+                "Member {} has invalid unroll state",
+                member.member.member
+            );
+        }
+        self
+    }
+
+    /// Check if the given rollup memmber has the specified unroll state
+    #[track_caller]
+    pub fn expect_unroll_state(&self, member: u32, state: UnrollState) -> &Self {
+        let member = self
+            .members
+            .iter()
+            .find(|pr| pr.pr.number.0 == member as u64)
+            .expect("Cannot find rollup member");
+
+        assert_eq!(
+            member.member.unroll_state,
+            Some(state),
+            "Member {} has invalid unroll state",
+            member.member.member
+        );
+        self
+    }
+}
+
 /// Start an async operation and wait until a specific [`TestSyncMarker`]
 /// is marked.
-async fn wait_for_marker<Func, R>(func: Func, marker: &TestSyncMarker) -> anyhow::Result<R>
+async fn wait_for_marker<Func, R>(
+    func: Func,
+    wait: bool,
+    marker: &TestSyncMarker,
+) -> anyhow::Result<R>
 where
     Func: AsyncFnOnce() -> anyhow::Result<R>,
 {
@@ -1551,7 +1729,7 @@ where
     marker.drain().await;
 
     let res = func().await;
-    if res.is_ok() {
+    if wait && res.is_ok() {
         tokio::time::timeout(SYNC_MARKER_TIMEOUT, marker.sync())
             .await
             .map_err(|_| anyhow::anyhow!("Timed out waiting for a test marker to be marked"))?;
@@ -1576,6 +1754,25 @@ async fn try_run_mergeability_check(
             panic!(
                 "Timed out while waiting for a mergeability item to be popped off the mergeability queue"
             );
+        }
+    }
+}
+
+/// Tries to pop a single unroll item from the unroll queue and handle it.
+/// Returns true if there was some entry handled.
+async fn try_run_unroll_queue(
+    ctx: Arc<BorsContext>,
+    unroll_queue_rx: &mut UnrollQueueReceiver,
+) -> anyhow::Result<bool> {
+    let fut = tokio::time::timeout(TEST_UNROLL_TIMEOUT, unroll_queue_rx.recv());
+    match fut.await {
+        Ok(Some(event)) => {
+            handle_unroll_queue_event(ctx, event).await?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(_) => {
+            panic!("Timed out while waiting for an unroll item to be popped off the unroll queue");
         }
     }
 }
