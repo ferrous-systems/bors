@@ -42,6 +42,7 @@ pub struct RepositoryConfig {
     /// Defaults to false.
     #[serde(default)]
     pub report_merge_conflicts: bool,
+    /// Whether to allow delegation on PRs.
     #[serde(default)]
     pub allow_delegate: bool,
     /// Optional configuration for spawning EC2 instances that will execute certain
