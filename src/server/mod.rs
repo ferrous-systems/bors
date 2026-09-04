@@ -1,12 +1,12 @@
 use crate::bors::event::BorsEvent;
-use crate::bors::{BuildKind, CommandPrefix, RepositoryState, format_help};
-use crate::database::{ApprovalStatus, QueueStatus};
+use crate::bors::{BuildKind, CheckRun, CommandPrefix, RepositoryState, format_help};
+use crate::database::{ApprovalStatus, QueueStatus, WorkflowStatus};
 use crate::ec2::{Ec2Instance, Ec2InstanceStatus, get_aws_credentials, get_ec2_instances};
 use crate::github::{GitHubSession, GithubRepoName, OAuthExchangeCode, PullRequestNumber, rollup};
 use crate::server::cached::Cached;
 use crate::templates::{
-    EC2Template, HelpTemplate, HtmlTemplate, NotFoundTemplate, PendingBuild, PendingWorkflow,
-    PullRequestStats, QueueTemplate, RepositoryView, RollupsInfo,
+    EC2Template, HelpTemplate, HtmlTemplate, NotFoundTemplate, PendingBuild, PullRequestStats,
+    QueueTemplate, RepositoryView, RollupsInfo,
 };
 use crate::utils::sort_queue::sort_queue_prs;
 use crate::{
@@ -481,24 +481,18 @@ pub async fn queue_handler(
         });
         let mut pending = HashMap::new();
         for (pr, build_model) in builds {
-            let workflow = db
-                .get_workflows_for_build(build_model)
+            let check_runs = db
+                .get_check_runs_with_status_for_build(build_model, WorkflowStatus::Pending)
                 .await?
                 .into_iter()
-                .next();
-            let workflow = workflow.map(|workflow| {
-                let jobs = state
-                    .ctx
-                    .get_job_cache()
-                    .get_jobs(&repo.name, workflow.run_id.into());
-                PendingWorkflow { workflow, jobs }
-            });
+                .map(CheckRun::from)
+                .collect();
 
             pending.insert(
                 pr,
                 PendingBuild {
                     build: build_model.clone(),
-                    workflow,
+                    check_runs,
                 },
             );
         }
@@ -506,10 +500,10 @@ pub async fn queue_handler(
     };
 
     // We assume that there is at most one of these, so the order doesn't matter
-    let pending_auto_workflow = pending_builds
+    let pending_auto_check_runs: Option<&[_]> = pending_builds
         .values()
         .filter(|build| build.build.kind == BuildKind::Auto)
-        .filter_map(|b| b.workflow.as_ref())
+        .map(|b| b.check_runs.as_ref())
         .next();
 
     let average_build_duration = {
@@ -548,14 +542,19 @@ pub async fn queue_handler(
 
         match &status {
             QueueStatus::Pending(_, _) => {
-                // Try to guess already elapsed time of the pending workflow
-                let elapsed = if let Some(workflow) = &pending_auto_workflow {
-                    (Utc::now() - workflow.workflow.created_at)
-                        .to_std()
-                        .unwrap_or_default()
-                } else {
-                    Duration::ZERO
-                };
+                // Try to guess already elapsed time of the pending check runs
+                let started = pending_auto_check_runs
+                    .iter()
+                    .map(|check_runs| check_runs.into_iter())
+                    .flatten()
+                    .map(|check_run| check_run.started_at)
+                    .min();
+
+                let elapsed = started
+                    .map(|start| (Utc::now() - start).to_std().ok())
+                    .flatten()
+                    .unwrap_or_default();
+
                 in_queue.insert(pr.number, average_build_duration.saturating_sub(elapsed));
             }
             // For an approved PR, assume that it will take the average auto build duration

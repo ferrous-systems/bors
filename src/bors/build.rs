@@ -1,7 +1,8 @@
 use crate::PgDbClient;
-use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
+use crate::bors::{BuildKind, CheckRun, RepositoryState};
 use crate::database::{
-    BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams, WorkflowModel,
+    BuildModel, BuildStatus, CheckRunModel, ExclusiveLockProof, PullRequestModel,
+    UpdateBuildParams, WorkflowStatus,
 };
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::api::operations::{CommitAuthor, ForcePush};
@@ -40,7 +41,7 @@ pub async fn cancel_build(
     db: &PgDbClient,
     build: &BuildModel,
     conclusion: CancelBuildConclusion,
-) -> Result<Vec<WorkflowModel>, CancelBuildError> {
+) -> Result<Vec<CheckRunModel>, CancelBuildError> {
     assert_eq!(
         build.status,
         BuildStatus::Pending,
@@ -57,20 +58,22 @@ pub async fn cancel_build(
         .await
         .map_err(CancelBuildError::FailedToMarkBuildAsCancelled)?;
 
-    let pending_workflows = db
-        .get_pending_workflows_for_build(build)
+    let pending_check_runs = db
+        .get_check_runs_with_status_for_build(build, WorkflowStatus::Pending)
         .await
         .map_err(CancelBuildError::FailedToCancelWorkflows)?;
-    let pending_workflow_ids: Vec<octocrab::models::RunId> = pending_workflows
+    let pending_workflow_ids: Vec<octocrab::models::RunId> = pending_check_runs
         .iter()
-        .map(|workflow| octocrab::models::RunId(workflow.run_id.0))
+        .filter_map(|check_run| check_run.github_workflow_run_id())
         .collect();
 
-    tracing::info!("Cancelling workflows {:?}", pending_workflow_ids);
-    client
-        .cancel_workflows(&pending_workflow_ids)
-        .await
-        .map_err(CancelBuildError::FailedToCancelWorkflows)?;
+    if !pending_workflow_ids.is_empty() {
+        tracing::info!("Cancelling workflows {pending_workflow_ids:?}");
+        client
+            .cancel_workflows(&pending_workflow_ids)
+            .await
+            .map_err(CancelBuildError::FailedToCancelWorkflows)?;
+    }
 
     let check_run_conclusion = match conclusion {
         CancelBuildConclusion::Timeout => CheckRunConclusion::TimedOut,
@@ -88,7 +91,7 @@ pub async fn cancel_build(
         tracing::error!("Could not update check run {check_run_id} for build {build:?}: {error:?}");
     }
 
-    Ok(pending_workflows)
+    Ok(pending_check_runs)
 }
 
 /// Return failed jobs from the given workflow run.
@@ -112,33 +115,33 @@ pub async fn get_failed_jobs(
 }
 
 /// Load workflows for the given build both from the DB and GitHub, and consolidate their state.
-pub async fn load_workflow_runs(
+pub async fn load_check_runs(
     repo: &RepositoryState,
     db: &PgDbClient,
     build: &BuildModel,
-) -> anyhow::Result<Vec<WorkflowRun>> {
-    // Load the workflow runs that we know about from the DB. We know about workflow runs for
-    // which we have received a started or a completed event.
-    let db_workflow_runs = db.get_workflows_for_build(build).await?;
-    tracing::debug!("Workflow runs from DB: {db_workflow_runs:?}");
+) -> anyhow::Result<Vec<CheckRun>> {
+    // Load the check runs that we know about from the DB. We know about check runs for
+    // which we have received a created or a completed event.
+    let db_check_runs = db.get_check_runs_for_build(build).await?;
+    tracing::debug!("Check runs from DB: {db_check_runs:?}");
 
-    // Ask GitHub about all workflow runs attached to the build commit.
-    // This tells us for how many workflow runs we should wait.
-    let mut workflow_runs: Vec<WorkflowRun> = repo
+    // Ask GitHub about all check runs attached to the build commit.
+    // This tells us for how many check runs we should wait.
+    let mut check_runs = repo
         .client
-        .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+        .get_check_runs_for_commit_sha(&build.commit_sha)
         .await?;
-    tracing::debug!("Workflow runs from GitHub: {workflow_runs:?}");
+    tracing::debug!("Check runs from GitHub: {check_runs:?}");
 
     // It is possible that the GitHub state is not fully up-to-date, or that we have overridden
     // it somehow in our DB (for example with the min_ci time mechanism).
     // It is also possible that we learn here about new GitHub workflow state that hasn't been
     // propagated to the DB yet.
     // Here we reconcile the two world views.
-    for db_run in db_workflow_runs {
-        if let Some(gh_run) = workflow_runs
+    for db_run in db_check_runs {
+        if let Some(gh_run) = check_runs
             .iter_mut()
-            .find(|gh_run| gh_run.id == db_run.run_id.into())
+            .find(|gh_check_run| gh_check_run.id == db_run.check_run_id())
         {
             if gh_run.status != db_run.status && !db_run.status.is_pending() {
                 // If our DB has a conclusion for the workflow that does not match GH state, we
@@ -150,25 +153,15 @@ pub async fn load_workflow_runs(
             // For some reason, we have a workflow in the DB that is not on GitHub. This shouldn't
             // really happen, but in any case we backfill it.
             tracing::warn!(
-                "Found DB workflow {} with status {:?} that was not on GitHub",
-                db_run.run_id,
+                "Found DB check-run {} with status {:?} that was not on GitHub",
+                db_run.check_run_id(),
                 db_run.status
             );
-            workflow_runs.push(WorkflowRun {
-                id: db_run.run_id.into(),
-                name: db_run.name,
-                url: db_run.url,
-                status: db_run.status,
-                // This is not really the time the workflow started running, but rather when we
-                // inserted it into the DB. But that hopefully should not matter, as the duration is
-                // `None` and this should never occur anyway :)
-                created_at: db_run.created_at,
-                // We currently do not store workflow duration in the DB
-                duration: None,
-            });
+
+            check_runs.push(db_run.into());
         }
     }
-    Ok(workflow_runs)
+    Ok(check_runs)
 }
 
 pub struct StartBuildContext {
@@ -324,7 +317,7 @@ pub async fn start_build(
             .await;
         match check_run_result {
             Ok(check_run) => {
-                let check_run_id = check_run.id.into_inner() as i64;
+                let check_run_id = check_run.into_inner() as i64;
                 if let Err(error) = db
                     .update_build(
                         build_id,

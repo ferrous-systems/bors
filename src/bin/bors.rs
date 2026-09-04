@@ -278,7 +278,6 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
             BorsGlobalEvent::RefreshPendingBuilds,
             BorsGlobalEvent::ProcessMergeQueue,
             BorsGlobalEvent::TerminateOldEC2Instances,
-            BorsGlobalEvent::ReloadWorkflowJobCache,
             BorsGlobalEvent::ProcessUnrolledMemberBuilds,
         ];
         for event in startup_events {

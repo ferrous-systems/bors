@@ -12,6 +12,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 pub use client::{ExclusiveLockProof, ExclusiveOperationOutcome, PgDbClient};
+use octocrab::models::CheckRunId;
 pub use octocrab::models::pulls::MergeableState as OctocrabMergeableState;
 use sqlx::error::BoxDynError;
 use sqlx::{Database, Postgres, postgres::types::PgInterval};
@@ -405,7 +406,7 @@ pub struct BuildModel {
     /// The branch where this build is running (e.g., "automation/bors/try").
     pub branch: String,
     /// The SHA of the commit being built.
-    pub commit_sha: String,
+    pub commit_sha: CommitSha,
     /// Current status of the build (pending, success, failure, etc.).
     pub status: BuildStatus,
     /// The base commit SHA that this build is merged with (e.g., main branch HEAD).
@@ -621,18 +622,6 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for DelegationStatus {
     }
 }
 
-/// Describes whether a workflow is a Github Actions workflow or if it's a job from some external
-/// CI.
-#[derive(Debug, Clone, PartialEq, sqlx::Type)]
-#[sqlx(type_name = "TEXT")]
-#[sqlx(rename_all = "lowercase")]
-pub enum WorkflowType {
-    /// GitHub Actions workflow.
-    Github,
-    /// External CI system workflow.
-    External,
-}
-
 /// Status of a workflow.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "TEXT")]
@@ -650,25 +639,42 @@ impl WorkflowStatus {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
     }
+
+    pub fn is_completed(&self) -> bool {
+        !self.is_pending()
+    }
 }
 
-/// Represents a workflow run, coming either from Github Actions or from some external CI.
+/// Represents a "check run" - some system that reports a status about a build.
+///
+/// Analogous to [GitHub Check Runs](https://docs.github.com/en/rest/checks/runs?apiVersion=2026-03-10).
 #[derive(Debug)]
-pub struct WorkflowModel {
+pub struct CheckRunModel {
     pub id: PrimaryKey,
-    /// The build this workflow is associated with.
+    /// The build this check run is associated with.
     pub build: BuildModel,
-    /// The name of the workflow (e.g., "CI", "Tests").
+    /// The name of the check-run (e.g., "CI", "Tests").
     pub name: String,
-    /// URL to view this workflow run on GitHub or external CI.
+    /// GitHub-assigned check-run ID.
+    check_run_id: i64,
+    /// URL to view this check-run on GitHub.
     pub url: String,
-    /// Unique identifier for this workflow run.
-    pub run_id: RunId,
-    /// Whether this is a GitHub Actions workflow or external CI.
-    pub workflow_type: WorkflowType,
-    /// Current status of the workflow (pending, success, failure).
+    /// Current status of the check-run.
     pub status: WorkflowStatus,
-    pub created_at: DateTime<Utc>,
+    /// When the check-run was started.
+    pub started_at: DateTime<Utc>,
+    /// If this check-run is a GitHub Actions Workflow run, then the ID of the run.
+    github_workflow_run_id: Option<i64>,
+}
+
+impl CheckRunModel {
+    pub fn check_run_id(&self) -> octocrab::models::CheckRunId {
+        CheckRunId(self.check_run_id as _)
+    }
+
+    pub fn github_workflow_run_id(&self) -> Option<octocrab::models::RunId> {
+        self.github_workflow_run_id.map(|id| (id as u64).into())
+    }
 }
 
 /// Represents the state of a repository's tree.

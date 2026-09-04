@@ -2,13 +2,16 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use crate::PgDbClient;
+use crate::bors::build;
+use crate::bors::build::CancelBuildConclusion;
+use crate::bors::build::CancelBuildError;
 use crate::bors::comment::no_auto_build_in_progress_comment;
-use crate::bors::handlers::workflow::{AutoBuildCancelReason, maybe_cancel_auto_build};
 use crate::bors::handlers::{PullRequestData, deny_request, has_permission};
 use crate::bors::labels::handle_label_trigger;
 use crate::bors::merge_queue::{MergeQueueSender, get_pr_at_front_of_merge_queue};
 use crate::bors::{CommandPrefix, Comment, RepositoryState};
-use crate::database::{BuildStatus, QueueStatus};
+use crate::database::{BuildStatus, PullRequestModel, QueueStatus};
+use crate::github::api::client::GithubRepositoryClient;
 use crate::github::{GithubUser, LabelTrigger, PullRequestNumber};
 use crate::permissions::PermissionType;
 
@@ -148,6 +151,84 @@ async fn notify_of_invalid_retry_state(
         .post_comment(pr_number, Comment::new(msg), db)
         .await?;
     Ok(())
+}
+
+/// Why did we cancel an auto build?
+pub enum AutoBuildCancelReason {
+    /// A new commit was pushed to a PR while it was being tested in an auto build.
+    PushToPR,
+    /// A PR was unapproved while it was being tested in an auto build.
+    Unapproval,
+    /// A PR was closed while it was being tested in an auto build.
+    Close,
+    /// An auto build was manually cancelled with `@bors cancel`.
+    Cancel,
+}
+
+/// Cancel an auto build attached to the PR, if there is any.
+/// Returns an optional string that can be attached to a PR comment, which describes the result of
+/// the workflow cancellation.
+///
+/// If the function returns `None`, there was no pending build happening on the PR.
+pub async fn maybe_cancel_auto_build(
+    client: &GithubRepositoryClient,
+    db: &PgDbClient,
+    pr: &PullRequestModel,
+    reason: AutoBuildCancelReason,
+) -> anyhow::Result<Option<String>> {
+    let auto_build = match pr
+        .auto_build
+        .as_ref()
+        .take_if(|b| b.status == BuildStatus::Pending)
+    {
+        Some(build) => build,
+        _ => return Ok(None),
+    };
+
+    tracing::info!("Cancelling auto build {auto_build:?}");
+
+    match build::cancel_build(client, db, auto_build, CancelBuildConclusion::Cancel).await {
+        Ok(workflows) => {
+            tracing::info!("Auto build cancelled");
+            let workflow_urls = workflows.into_iter().map(|w| w.url).collect();
+            Ok(Some(auto_build_cancelled_msg(reason, Some(workflow_urls))))
+        }
+        Err(CancelBuildError::FailedToMarkBuildAsCancelled(error)) => Err(error),
+        Err(CancelBuildError::FailedToCancelWorkflows(error)) => {
+            tracing::error!(
+                "Could not cancel workflows for auto build with SHA {}: {error:?}",
+                auto_build.commit_sha
+            );
+            Ok(Some(auto_build_cancelled_msg(reason, None)))
+        }
+    }
+}
+
+/// If `workflow_urls` is `None`, it was not possible to cancel workflows.
+fn auto_build_cancelled_msg(
+    reason: AutoBuildCancelReason,
+    cancelled_workflow_urls: Option<Vec<String>>,
+) -> String {
+    use std::fmt::Write;
+
+    let reason = match reason {
+        AutoBuildCancelReason::PushToPR => " due to push",
+        AutoBuildCancelReason::Unapproval => " due to unapproval",
+        AutoBuildCancelReason::Close => " due to the PR being closed",
+        AutoBuildCancelReason::Cancel => "",
+    };
+    let mut comment = format!("Auto build was cancelled{reason}.");
+    match cancelled_workflow_urls {
+        Some(workflow_urls) => {
+            comment.push_str(" Cancelled workflows:\n");
+            for url in workflow_urls {
+                write!(comment, "\n- {url}").unwrap();
+            }
+        }
+        None => comment.push_str(" It was not possible to cancel some workflows."),
+    }
+
+    comment
 }
 
 #[cfg(test)]

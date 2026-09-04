@@ -320,7 +320,7 @@ pub async fn backfill_ec2_instances(
     for build in &builds {
         let Ok(workflows) = repo
             .client
-            .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+            .get_workflow_runs_for_commit_sha(&build.commit_sha)
             .await
         else {
             continue;
@@ -380,7 +380,7 @@ pub async fn backfill_ec2_instances(
             job_id: job.id,
             job_name: job.name,
             run_id: job.run_id.into(),
-            commit_sha: CommitSha(build.commit_sha.clone()),
+            commit_sha: build.commit_sha.clone(),
             pr_number,
             build_kind: build.kind,
         };

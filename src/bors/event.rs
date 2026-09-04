@@ -1,7 +1,7 @@
-use crate::database::{WorkflowStatus, WorkflowType};
+use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestNumber};
 use chrono::Duration;
-use octocrab::models::{CheckSuiteId, JobId, RunId};
+use octocrab::models::{CheckRunId, RunId};
 
 #[derive(Debug)]
 pub enum BorsRepositoryEvent {
@@ -30,14 +30,16 @@ pub enum BorsRepositoryEvent {
     /// When there is a push to a branch. This includes when a commit is pushed, when a commit tag is pushed,
     /// when a branch is deleted or when a tag is deleted.
     PushToBranch(PushToBranch),
-    /// A workflow run on Github Actions or a check run from external CI system has started.
-    WorkflowStarted(WorkflowRunStarted),
-    /// A workflow run on Github Actions or a check run from external CI system has completed.
-    WorkflowCompleted(WorkflowRunCompleted),
-    /// A workflow job on Github Actions has started.
-    WorkflowJobStarted(WorkflowJobStarted),
-    /// A workflow job on Github Actions has completed.
-    WorkflowJobCompleted(WorkflowJobCompleted),
+    // /// A workflow run on Github Actions or a check run from external CI system has started.
+    // WorkflowStarted(WorkflowRunStarted),
+    // /// A workflow run on Github Actions or a check run from external CI system has completed.
+    // WorkflowCompleted(WorkflowRunCompleted),
+    // /// A workflow job on Github Actions has started.
+    // WorkflowJobStarted(WorkflowJobStarted),
+    // /// A workflow job on Github Actions has completed.
+    // WorkflowJobCompleted(WorkflowJobCompleted),
+    CheckRunCreated(CheckRunCreated),
+    CheckRunCompleted(CheckRunCompleted),
 }
 
 impl BorsRepositoryEvent {
@@ -55,10 +57,12 @@ impl BorsRepositoryEvent {
             BorsRepositoryEvent::PullRequestUnassigned(payload) => &payload.repository,
             BorsRepositoryEvent::PullRequestReadyForReview(payload) => &payload.repository,
             BorsRepositoryEvent::PushToBranch(payload) => &payload.repository,
-            BorsRepositoryEvent::WorkflowStarted(payload) => &payload.repository,
-            BorsRepositoryEvent::WorkflowCompleted(payload) => &payload.repository,
-            BorsRepositoryEvent::WorkflowJobStarted(payload) => &payload.repository,
-            BorsRepositoryEvent::WorkflowJobCompleted(payload) => &payload.repository,
+            // BorsRepositoryEvent::WorkflowStarted(payload) => &payload.repository,
+            // BorsRepositoryEvent::WorkflowCompleted(payload) => &payload.repository,
+            // BorsRepositoryEvent::WorkflowJobStarted(payload) => &payload.repository,
+            // BorsRepositoryEvent::WorkflowJobCompleted(payload) => &payload.repository,
+            BorsRepositoryEvent::CheckRunCreated(payload) => &payload.repository,
+            BorsRepositoryEvent::CheckRunCompleted(payload) => &payload.repository,
         }
     }
 }
@@ -83,8 +87,6 @@ pub enum BorsGlobalEvent {
     TerminateOldEC2Instances,
     /// Try to create EC2 instances for jobs that have been queued for some time.
     BackfillEC2Instances,
-    /// Reload jobs of pending workfows into the in-memory job cache.
-    ReloadWorkflowJobCache,
     /// Start or complete unrolled builds of rollups.
     ProcessUnrolledMemberBuilds,
 }
@@ -177,45 +179,22 @@ pub struct PushToBranch {
 }
 
 #[derive(Debug)]
-pub struct WorkflowRunStarted {
+pub struct CheckRunCreated {
     pub repository: GithubRepoName,
+    pub id: CheckRunId,
     pub name: String,
-    pub branch: String,
     pub commit_sha: CommitSha,
-    pub run_id: RunId,
-    pub workflow_type: WorkflowType,
-    pub url: String,
+    pub html_url: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub github_workflow_run_id: Option<RunId>,
 }
 
 #[derive(Debug)]
-pub struct WorkflowRunCompleted {
+pub struct CheckRunCompleted {
     pub repository: GithubRepoName,
-    pub branch: String,
+    pub id: CheckRunId,
+    pub name: String,
     pub commit_sha: CommitSha,
-    pub run_id: RunId,
     pub status: WorkflowStatus,
     pub running_time: Option<Duration>,
-    /// Check suite to which this workflow is attached.
-    pub check_suite_id: CheckSuiteId,
-}
-
-#[derive(Debug)]
-pub struct WorkflowJobStarted {
-    pub repository: GithubRepoName,
-    pub job_id: JobId,
-    pub name: String,
-    pub branch: String,
-    pub commit_sha: CommitSha,
-    pub run_id: RunId,
-    pub labels: Vec<String>,
-}
-
-#[derive(Debug)]
-pub struct WorkflowJobCompleted {
-    pub repository: GithubRepoName,
-    pub job_id: JobId,
-    pub name: String,
-    pub branch: String,
-    pub commit_sha: CommitSha,
-    pub run_id: RunId,
 }

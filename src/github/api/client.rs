@@ -3,7 +3,6 @@ use base64::Engine;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
-use octocrab::models::checks::CheckRun;
 use octocrab::models::pulls::MergeableState;
 use octocrab::models::{CheckRunId, Repository, RunId, RunnerGroupId, UserId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
@@ -14,7 +13,7 @@ use tracing::log;
 
 use crate::PgDbClient;
 use crate::bors::event::PullRequestComment;
-use crate::bors::{Comment, PullRequestStatus, WorkflowRun};
+use crate::bors::{CheckRun, Comment, PullRequestStatus, WorkflowRun};
 use crate::config::{CONFIG_FILE_PATH, RepositoryConfig, deserialize_config};
 use crate::database::WorkflowStatus;
 use crate::github::api::CommitAuthor;
@@ -471,7 +470,7 @@ impl GithubRepositoryClient {
         status: CheckRunStatus,
         output: CheckRunOutput,
         external_id: &str,
-    ) -> anyhow::Result<CheckRun> {
+    ) -> anyhow::Result<CheckRunId> {
         let check_run = perform_retryable("create_check_run", RetryMethod::no_retry(), || {
             let output = output.clone();
             async {
@@ -481,7 +480,7 @@ impl GithubRepositoryClient {
             }
         })
         .await?;
-        Ok(check_run)
+        Ok(check_run.id)
     }
 
     /// Update a check run with the given check run ID.
@@ -490,20 +489,54 @@ impl GithubRepositoryClient {
         check_run_id: CheckRunId,
         status: CheckRunStatus,
         conclusion: Option<CheckRunConclusion>,
-    ) -> anyhow::Result<CheckRun> {
-        let check_run = perform_retryable("update_check_run", RetryMethod::no_retry(), || async {
+    ) -> anyhow::Result<()> {
+        perform_retryable("update_check_run", RetryMethod::no_retry(), || async {
             update_check_run(self, check_run_id, status, conclusion)
                 .await
                 .context("Cannot update check run")
         })
         .await?;
-        Ok(check_run)
+        Ok(())
+    }
+
+    pub async fn get_check_runs_for_commit_sha(
+        &self,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<CheckRun>> {
+        let runs = perform_retryable(
+            "get_check_runs_for_commit_sha",
+            RetryMethod::default(),
+            async || -> anyhow::Result<_> {
+                let mut runs = vec![];
+                for page in 0u32.. {
+                    let response = self
+                        .client
+                        .checks(self.repo_name.name(), self.repo_name.name())
+                        .list_check_runs_for_git_ref(commit_sha.0.clone().into())
+                        .per_page(100)
+                        .page(page)
+                        .send()
+                        .await?;
+                    let remaining = (response.total_count as usize) - runs.len();
+                    runs.reserve_exact(remaining);
+                    runs.extend(response.check_runs.into_iter().map(CheckRun::from));
+
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+
+                Ok(runs)
+            },
+        )
+        .await?;
+        Ok(runs)
     }
 
     /// Find all workflows attached to a specific commit SHA.
     pub async fn get_workflow_runs_for_commit_sha(
         &self,
-        commit_sha: CommitSha,
+        commit_sha: &CommitSha,
     ) -> anyhow::Result<Vec<WorkflowRun>> {
         let runs = perform_retryable("get_workflows_for_commit_sha", RetryMethod::default(), || async {
             let response = self.client.workflows(self.repo_name.owner(), self.repo_name.name())

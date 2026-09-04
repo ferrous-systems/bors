@@ -1,7 +1,7 @@
-use crate::bors::RollupMode::*;
-use crate::bors::{BuildKind, WorkflowJobData, WorkflowJobStatus};
+use crate::bors::BuildKind;
+use crate::bors::{CheckRun, RollupMode::*};
 use crate::database::{
-    BuildModel, MergeableState::*, PullRequestModel, QueueStatus, TreeState, WorkflowModel,
+    BuildModel, MergeableState::*, PullRequestModel, QueueStatus, TreeState, WorkflowStatus,
 };
 use crate::ec2::{Ec2Instance, Ec2InstanceStatus};
 use crate::github::{GitHubSession, PullRequestNumber};
@@ -91,14 +91,9 @@ impl From<HashMap<PullRequestNumber, HashSet<PullRequestNumber>>> for RollupsInf
     }
 }
 
-pub struct PendingWorkflow {
-    pub workflow: WorkflowModel,
-    pub jobs: Vec<WorkflowJobData>,
-}
-
 pub struct PendingBuild {
     pub build: BuildModel,
-    pub workflow: Option<PendingWorkflow>,
+    pub check_runs: Vec<CheckRun>,
 }
 
 #[derive(Template)]
@@ -186,29 +181,30 @@ impl QueueTemplate {
         pr.note() == Some("rustc-perf")
     }
 
-    fn count_completed_jobs(&self, jobs: &[WorkflowJobData]) -> u64 {
-        jobs.iter()
-            .filter(|j| matches!(j.status, WorkflowJobStatus::Completed))
+    fn count_completed_check_runs(&self, check_runs: &[CheckRun]) -> u64 {
+        check_runs
+            .into_iter()
+            .filter(|cr| cr.status != WorkflowStatus::Pending)
             .count() as u64
     }
 
-    /// Format jobs that are not yet completed, to be rendered into a title attribute.
-    fn remaining_jobs_formatted_title(&self, jobs: &[WorkflowJobData]) -> String {
+    /// Format check-runs that are not yet completed, to be rendered into a title attribute.
+    fn remaining_check_runs_formatted_title(&self, check_runs: &[CheckRun]) -> String {
         use std::fmt::Write;
 
-        const MAX_JOBS_TO_SHOW: usize = 20;
+        const MAX_CHECK_RUNS_TO_SHOW: usize = 20;
 
-        let remaining = get_remaining_jobs(jobs);
+        let remaining = get_remaining_check_runs(check_runs);
         if remaining.is_empty() {
             return String::new();
         }
-        let mut data = format!("\n\nRemaining jobs ({}):\n", remaining.len());
-        for job in remaining.iter().take(MAX_JOBS_TO_SHOW) {
-            writeln!(data, "{}", normalize_job_name(&job.name)).unwrap();
+        let mut data = format!("\n\nRemaining checks ({}):\n", remaining.len());
+        for job in remaining.iter().take(MAX_CHECK_RUNS_TO_SHOW) {
+            writeln!(data, "{}", normalize_check_run_name(&job.name)).unwrap();
         }
 
-        if remaining.len() > MAX_JOBS_TO_SHOW {
-            let leftover = remaining.len() - MAX_JOBS_TO_SHOW;
+        if remaining.len() > MAX_CHECK_RUNS_TO_SHOW {
+            let leftover = remaining.len() - MAX_CHECK_RUNS_TO_SHOW;
             writeln!(
                 data,
                 "(and {leftover} other{})",
@@ -221,13 +217,13 @@ impl QueueTemplate {
     }
 
     /// Format jobs that are not yet completed, to be rendered into the jobs column.
-    fn remaining_jobs_formatted_column(&self, jobs: &[WorkflowJobData]) -> String {
-        let remaining = get_remaining_jobs(jobs);
+    fn remaining_check_runs_formatted_column(&self, check_runs: &[CheckRun]) -> String {
+        let remaining = get_remaining_check_runs(check_runs);
         if remaining.is_empty() {
             return String::new();
         }
 
-        const MAX_JOBS_TO_SHOW: usize = 5;
+        const MAX_CHECK_RUNS_TO_SHOW: usize = 5;
 
         let mut data = String::new();
         write!(
@@ -235,12 +231,12 @@ impl QueueTemplate {
             " ({}",
             remaining
                 .iter()
-                .take(MAX_JOBS_TO_SHOW)
-                .map(|j| normalize_job_name(&j.name))
+                .take(MAX_CHECK_RUNS_TO_SHOW)
+                .map(|j| normalize_check_run_name(&j.name))
                 .join(", ")
         )
         .unwrap();
-        if remaining.len() > MAX_JOBS_TO_SHOW {
+        if remaining.len() > MAX_CHECK_RUNS_TO_SHOW {
             write!(data, ", ...").unwrap();
         }
         data.push(')');
@@ -249,15 +245,18 @@ impl QueueTemplate {
 }
 
 /// A hardcoded logic for rust-lang/rust, to strip auto/try prefixes.
-fn normalize_job_name(name: &str) -> String {
+fn normalize_check_run_name(name: &str) -> String {
     name.split_once(" - ")
         .map(|(_, rest)| rest)
         .unwrap_or_else(|| name)
         .to_string()
 }
 
-fn get_remaining_jobs(jobs: &[WorkflowJobData]) -> Vec<&WorkflowJobData> {
-    let mut remaining: Vec<_> = jobs.iter().filter(|j| !j.status.is_completed()).collect();
+fn get_remaining_check_runs(check_runs: &[CheckRun]) -> Vec<&CheckRun> {
+    let mut remaining: Vec<_> = check_runs
+        .iter()
+        .filter(|j| !j.status.is_completed())
+        .collect();
     remaining.sort_by(|a, b| a.name.cmp(&b.name));
     remaining
 }
@@ -339,12 +338,12 @@ pub struct NotFoundTemplate {
 
 #[cfg(test)]
 mod tests {
-    use crate::templates::normalize_job_name;
+    use crate::templates::normalize_check_run_name;
 
     #[test]
-    fn test_normalize_job() {
+    fn test_normalize_check_run() {
         assert_eq!(
-            normalize_job_name("auto - aarch64-apple-macos-26"),
+            normalize_check_run_name("auto - aarch64-apple-macos-26"),
             "aarch64-apple-macos-26"
         );
     }

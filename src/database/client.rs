@@ -1,36 +1,39 @@
 use super::operations::{
-    approve_pull_request, clear_auto_build, create_build, create_workflow, delegate_pull_request,
+    approve_pull_request, clear_auto_build, create_build, create_check_run, delegate_pull_request,
     delete_tagged_bot_comment, find_build, find_pr_by_build, find_rollups_for_member_pr,
+    get_check_run_names_and_urls_for_build, get_check_runs_for_build,
     get_last_n_successful_auto_builds, get_nonclosed_pull_requests, get_nonclosed_rollups,
     get_pending_builds, get_prs_with_stale_mergeability_or_approved, get_pull_request,
     get_pull_request_by_id, get_repository, get_repository_by_name, get_rollup_members,
-    get_rollup_members_for_unrolling, get_tagged_bot_comments, get_workflow_urls_for_build,
-    get_workflows_for_build, insert_repo_if_not_exists, is_rollup, record_tagged_bot_comment,
-    register_rollup_pr_member, set_pr_assignees, set_pr_mergeability_state, set_pr_priority,
-    set_pr_rollup_mode, set_pr_status, set_rollup_member_unrolled_state,
-    set_rollup_members_unrolled_state, set_stale_mergeability_status_by_base_branch,
-    unapprove_pull_request, undelegate_all, undelegate_pull_request, update_build,
-    update_pr_auto_build_id, update_pr_try_build_id, update_pr_unrolled_build_id,
-    update_workflow_status, upsert_pull_request, upsert_repository,
+    get_rollup_members_for_unrolling, get_tagged_bot_comments, insert_repo_if_not_exists,
+    is_rollup, record_tagged_bot_comment, register_rollup_pr_member, set_pr_assignees,
+    set_pr_mergeability_state, set_pr_priority, set_pr_rollup_mode, set_pr_status,
+    set_rollup_member_unrolled_state, set_rollup_members_unrolled_state,
+    set_stale_mergeability_status_by_base_branch, unapprove_pull_request, undelegate_all,
+    undelegate_pull_request, update_build, update_check_run_status, update_pr_auto_build_id,
+    update_pr_try_build_id, update_pr_unrolled_build_id, upsert_pull_request, upsert_repository,
 };
 use super::{
     ApprovalInfo, DelegatedPermission, MergeableState, PrimaryKey, RegisterRollupMemberParams,
-    RollupMember, RollupMemberForUnrolling, RunId, UnrollState, UpdateBuildParams,
+    RollupMember, RollupMemberForUnrolling, UnrollState, UpdateBuildParams,
     UpsertPullRequestParams,
 };
 use std::collections::{HashMap, HashSet};
 
 use crate::bors::comment::CommentTag;
 use crate::bors::{BuildKind, PullRequestStatus, RollupMode};
+use crate::database::operations::{
+    find_builds_by_commit_sha, get_check_runs_with_status_for_build,
+};
 use crate::database::{
-    BuildModel, CommentModel, PullRequestModel, RepoModel, TreeState, WorkflowModel,
-    WorkflowStatus, WorkflowType,
+    BuildModel, CheckRunModel, CommentModel, PullRequestModel, RepoModel, TreeState, WorkflowStatus,
 };
 use crate::github::PullRequestNumber;
 use crate::github::{CommitSha, GithubRepoName};
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use itertools::Either;
-use octocrab::models::UserId;
+use octocrab::models::{CheckRunId, UserId};
 use sqlx::PgPool;
 use sqlx::postgres::PgAdvisoryLock;
 use tracing::log;
@@ -308,6 +311,14 @@ impl PgDbClient {
         find_build(&self.pool, repo, branch, &commit_sha).await
     }
 
+    pub async fn find_builds_by_commit_sha(
+        &self,
+        repo: &GithubRepoName,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<BuildModel>> {
+        find_builds_by_commit_sha(&self.pool, repo, commit_sha).await
+    }
+
     pub async fn get_pending_builds(
         &self,
         repo: &GithubRepoName,
@@ -323,62 +334,55 @@ impl PgDbClient {
         update_build(&self.pool, build_id, params).await
     }
 
-    pub async fn create_workflow(
+    pub async fn create_check_run(
         &self,
         build: &BuildModel,
-        name: String,
-        url: String,
-        run_id: RunId,
-        workflow_type: WorkflowType,
-        status: WorkflowStatus,
+        id: CheckRunId,
+        name: &str,
+        url: &str,
+        started_at: DateTime<Utc>,
+        github_workflow_run_id: Option<octocrab::models::RunId>,
     ) -> anyhow::Result<()> {
-        create_workflow(
+        create_check_run(
             &self.pool,
-            build.id,
-            &name,
-            &url,
-            run_id,
-            workflow_type,
-            status,
+            build,
+            id,
+            name,
+            url,
+            started_at,
+            github_workflow_run_id,
         )
         .await
     }
 
-    pub async fn update_workflow_status(
+    pub async fn update_check_run_status(
         &self,
-        run_id: u64,
+        check_run_id: CheckRunId,
         status: WorkflowStatus,
     ) -> anyhow::Result<()> {
-        update_workflow_status(&self.pool, run_id, status).await
+        update_check_run_status(&self.pool, check_run_id, status).await
     }
 
-    pub async fn get_workflows_for_build(
+    pub async fn get_check_runs_for_build(
         &self,
         build: &BuildModel,
-    ) -> anyhow::Result<Vec<WorkflowModel>> {
-        get_workflows_for_build(&self.pool, build.id).await
+    ) -> anyhow::Result<Vec<CheckRunModel>> {
+        get_check_runs_for_build(&self.pool, build).await
     }
 
-    pub async fn get_workflow_urls_for_build(
+    pub async fn get_check_run_names_and_urls_for_build(
         &self,
         build: &BuildModel,
-    ) -> anyhow::Result<Vec<String>> {
-        get_workflow_urls_for_build(&self.pool, build.id).await
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        get_check_run_names_and_urls_for_build(&self.pool, build).await
     }
 
-    pub async fn get_pending_workflows_for_build(
+    pub async fn get_check_runs_with_status_for_build(
         &self,
         build: &BuildModel,
-    ) -> anyhow::Result<Vec<WorkflowModel>> {
-        let workflows = self
-            .get_workflows_for_build(build)
-            .await?
-            .into_iter()
-            .filter(|w| {
-                w.status == WorkflowStatus::Pending && w.workflow_type == WorkflowType::Github
-            })
-            .collect::<Vec<WorkflowModel>>();
-        Ok(workflows)
+        status: WorkflowStatus,
+    ) -> anyhow::Result<Vec<CheckRunModel>> {
+        get_check_runs_with_status_for_build(&self.pool, build, status).await
     }
 
     pub async fn repo_db(&self, repo: &GithubRepoName) -> anyhow::Result<Option<RepoModel>> {
