@@ -293,7 +293,7 @@ Average duration of recent auto builds: {{ format_duration(*average_build_durati
         <thead>
           <tr>
             <th>#</th>
-            <th>Workflow URL</th>
+            <th>Check Run URL</th>
             <th>Started at</th>
             <th>Elapsed</th>
             <th>Remaining (est.)</th>
@@ -311,13 +311,13 @@ Average duration of recent auto builds: {{ format_duration(*average_build_durati
                 {{ pr.0 }}
               </a>
             </td>
-            {% if let Some(workflow) = pending.workflow %}
+            {% for check_run in pending.check_runs %}
               <td>
-                <a href="{{ workflow.workflow.url }}">{{ workflow.workflow.run_id }}</a>
+                <a href="{{ check_run.url }}">{{ check_run.id }}</a>
               </td>
             {% else %}
               <td></td>
-            {% endif %}
+            {% endfor %}
             <td>
               <span class="timestamp"></span>
             </td>
@@ -327,11 +327,11 @@ Average duration of recent auto builds: {{ format_duration(*average_build_durati
             <td>
               <span class="remaining-time-display"></span>
             </td>
-            {% if let Some(workflow) = pending.workflow %}
+            {% if !pending.check_runs.is_empty() %}
               <td
                 class="job-list"
-                title="Number of completed/started jobs. Note that this can be inaccurate!{{ remaining_jobs_formatted_title(&workflow.jobs) }}">
-                  {{ count_completed_jobs(&workflow.jobs) }}/{{ workflow.jobs.len() }}{{ remaining_jobs_formatted_column(&workflow.jobs) }}
+                title="Number of completed/started check runs. Note that this can be inaccurate!{{ remaining_check_runs_formatted_title(&pending.check_runs) }}">
+                  {{ count_completed_check_runs(&pending.check_runs) }}/{{ pending.check_runs.len() }}{{ remaining_check_runs_formatted_column(&pending.check_runs) }}
               </td>
             {% else %}
               <td class="job-list"></td>
@@ -404,11 +404,7 @@ Average duration of recent auto builds: {{ format_duration(*average_build_durati
                         ready for merge
                       {%- when QueueStatus::Pending(_, _) -%}
                         <div>
-                        {%- if let Some(pending) = pending && let Some(workflow) = pending.workflow -%}
-                          <a href="{{ workflow.workflow.url }}">pending</a>
-                        {%- else -%}
                           pending
-                        {%- endif -%}
                         <span class="elapsed-time-display"></span>
                         </div>
                       {%- when QueueStatus::Failed(_, _) -%}
@@ -766,7 +762,7 @@ Average duration of recent auto builds: {{ format_duration(*average_build_durati
         pageLength: 100,
         columns: [
           { name: "pr", className: "dt-right" },
-          { name: "workflow-url", className: "dt-right" },
+          { name: "check-run-url", className: "dt-right" },
           { name: "started", className: "dt-right" },
           { name: "elapsed", className: "dt-right" },
           { name: "remaining", className: "dt-right" },

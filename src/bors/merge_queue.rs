@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use super::{Comment, MergeType, bors_commit_author, create_merge_commit_message};
-use crate::bors::build::load_workflow_runs;
+use crate::bors::build::load_check_runs;
 use crate::bors::build::{
     StartBuildCheckRun, StartBuildCommit, StartBuildContext, StartBuildError, StartBuildOutcome,
     start_build,
@@ -270,12 +270,12 @@ async fn handle_successful_build(
     pr_num: PullRequestNumber,
     unroll_queue_sender: &UnrollQueueSender,
 ) -> anyhow::Result<()> {
-    let commit_sha = CommitSha(auto_build.commit_sha.clone());
-    let workflow_runs = load_workflow_runs(repo, &ctx.db, auto_build)
+    let commit_sha = auto_build.commit_sha.clone();
+    let check_runs = load_check_runs(repo, &ctx.db, auto_build)
         .await
-        .context("Cannot load workflow runs")?;
+        .context("Cannot load check runs")?;
     let comment = auto_build_succeeded_comment(
-        workflow_runs,
+        check_runs,
         &approval_info.approver,
         &commit_sha,
         &pr.base_branch,

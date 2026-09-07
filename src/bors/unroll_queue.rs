@@ -301,14 +301,14 @@ async fn create_unroll_result_comment(
                 | BuildStatus::Pending
                 | BuildStatus::Timeouted => {
                     // This is best effort, so we ignore errors
-                    let workflow_url = db
-                        .get_workflow_urls_for_build(build)
+                    let check_run_name_url = db
+                        .get_check_run_names_and_urls_for_build(build)
                         .await
                         .unwrap_or_default()
                         .into_iter()
                         .next();
-                    let status = if let Some(url) = workflow_url {
-                        format!("[failed]({url})")
+                    let status = if let Some((name, url)) = check_run_name_url {
+                        format!("[{name} failed]({url})")
                     } else {
                         "failed".to_string()
                     };

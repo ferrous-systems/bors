@@ -1,5 +1,5 @@
 use crate::bors::command::CommandPrefix;
-use crate::bors::{FailedWorkflowRun, WorkflowRun};
+use crate::bors::{CheckRun, FailedCheckRun};
 use crate::database::PullRequestModel;
 use crate::github::{GithubRepoName, GithubUser, PullRequestNumber};
 use crate::utils::text::pluralize;
@@ -66,20 +66,20 @@ impl Comment {
 }
 
 pub fn try_build_succeeded_comment(
-    mut workflows: Vec<WorkflowRun>,
+    mut check_runs: Vec<CheckRun>,
     commit_sha: CommitSha,
     parent_sha: CommitSha,
 ) -> Comment {
     let mut text = String::from(":sunny: Try build successful");
 
-    workflows.sort_by(|a, b| a.name.cmp(&b.name));
+    check_runs.sort_by(|a, b| a.name.cmp(&b.name));
 
     // If there is only a single workflow (the common case), compress the output
     // so that it doesn't take so much space
-    if workflows.len() == 1 {
-        writeln!(text, " ([{}]({}))", workflows[0].name, workflows[0].url).unwrap();
+    if check_runs.len() == 1 {
+        writeln!(text, " ([{}]({}))", check_runs[0].name, check_runs[0].url).unwrap();
     } else {
-        let workflows_status = list_workflows_status(&workflows);
+        let workflows_status = list_check_runs_status(&check_runs);
         writeln!(text, "\n{workflows_status}").unwrap();
     }
     writeln!(
@@ -150,53 +150,46 @@ pub fn try_build_cancelled_comment(workflow_urls: impl Iterator<Item = String>) 
 }
 
 pub fn build_failed_comment(
-    repo: &GithubRepoName,
     commit_sha: CommitSha,
-    failed_workflows: Vec<FailedWorkflowRun>,
+    failed_check_runs: Vec<FailedCheckRun>,
     error_context: Option<String>,
 ) -> Comment {
     let mut msg = format!(":broken_heart: Test for {commit_sha} failed");
-    let mut workflow_links = failed_workflows
+    let mut check_run_links = failed_check_runs
         .iter()
-        .map(|w| format!("[{}]({})", w.workflow_run.name, w.workflow_run.url));
-    if !failed_workflows.is_empty() {
-        write!(msg, ": {}", workflow_links.join(", ")).unwrap();
+        .map(|w| format!("[{}]({})", w.check_run.name, w.check_run.url));
+    if !failed_check_runs.is_empty() {
+        write!(msg, ": {}", check_run_links.join(", ")).unwrap();
 
-        let mut failed_jobs: Vec<Job> = failed_workflows
+        let mut failed_github_jobs: Vec<Job> = failed_check_runs
             .into_iter()
-            .flat_map(|w| w.failed_jobs)
+            .flat_map(|w| w.failed_github_jobs)
             // When multiple jobs are executed and one fails, the rest is cancelled.
             // But showing the cancelled jobs as failed is not very useful, so we filter them out
             .filter(|j| j.conclusion != Some(Conclusion::Cancelled))
             .collect();
-        failed_jobs.sort_by(|l, r| l.name.cmp(&r.name));
+        failed_github_jobs.sort_by(|l, r| l.name.cmp(&r.name));
 
-        if !failed_jobs.is_empty() {
-            write!(msg, ". Failed {}:\n\n", pluralize("job", failed_jobs.len())).unwrap();
+        if !failed_github_jobs.is_empty() {
+            write!(
+                msg,
+                ". Failed {}:\n\n",
+                pluralize("job", failed_github_jobs.len())
+            )
+            .unwrap();
 
             let max_jobs_to_show = 5;
-            for job in failed_jobs.iter().take(max_jobs_to_show) {
+            for job in failed_github_jobs.iter().take(max_jobs_to_show) {
                 // Ignore this special conclusion job, as it's not very useful to show its error
                 if job.name == "bors build finished" {
                     continue;
                 }
 
                 let logs_url = job.html_url.to_string();
-                let enhanced_logs_url = format!(
-                    "https://triage.rust-lang.org/gha-logs/{}/{}/{}",
-                    repo.owner(),
-                    repo.name(),
-                    job.id
-                );
-                writeln!(
-                    msg,
-                    "- `{}` ([web logs]({}), [enhanced plaintext logs]({}))",
-                    job.name, logs_url, enhanced_logs_url
-                )
-                .unwrap();
+                writeln!(msg, "- [{}]({})", job.name, logs_url).unwrap();
             }
-            if failed_jobs.len() > max_jobs_to_show {
-                let remaining = failed_jobs.len() - max_jobs_to_show;
+            if failed_github_jobs.len() > max_jobs_to_show {
+                let remaining = failed_github_jobs.len() - max_jobs_to_show;
                 writeln!(
                     msg,
                     "- (and {remaining} other {})",
@@ -239,17 +232,25 @@ pub fn try_build_started_comment(
     Comment::new(msg).with_tag(CommentTag::TryBuildStarted)
 }
 
-pub fn append_workflow_links_to_comment(comment_content: &mut String, workflow_urls: Vec<String>) {
+pub fn append_check_run_links_to_comment<T: AsRef<str>>(
+    comment_content: &mut String,
+    check_run_names_and_urls: Vec<(T, T)>,
+) {
     if !comment_content.ends_with("\n") {
         comment_content.push('\n');
     }
 
-    if workflow_urls.len() == 1 {
-        comment_content.push_str(&format!("\n**Workflow**: {}", workflow_urls[0]));
+    if check_run_names_and_urls.len() == 1 {
+        let (name, url) = &check_run_names_and_urls[0];
+        comment_content.push_str(&format!(
+            "\n**Check**: [{}]({})",
+            name.as_ref(),
+            url.as_ref()
+        ));
     } else {
-        comment_content.push_str("\n**Workflows**:\n\n");
-        for url in workflow_urls {
-            comment_content.push_str(&format!("- {url}\n"));
+        comment_content.push_str("\n**Checks**:\n\n");
+        for (name, url) in check_run_names_and_urls {
+            comment_content.push_str(&format!("- [{}]({})\n", name.as_ref(), url.as_ref()));
         }
     }
 }
@@ -451,15 +452,15 @@ pub fn build_timed_out_comment(timeout: Duration) -> Comment {
     ))
 }
 
-fn list_workflows_status(workflows: &[WorkflowRun]) -> String {
+fn list_check_runs_status(workflows: &[CheckRun]) -> String {
     workflows
         .iter()
-        .map(|w| {
+        .map(|cr| {
             format!(
                 "- [{}]({}) {}",
-                w.name,
-                w.url,
-                match w.status {
+                cr.name,
+                cr.url,
+                match cr.status {
                     WorkflowStatus::Success => ":white_check_mark:",
                     WorkflowStatus::Failure => ":x:",
                     WorkflowStatus::Pending => ":question:",
@@ -478,14 +479,14 @@ pub fn auto_build_started_comment(head_sha: &CommitSha, merge_sha: &CommitSha) -
 }
 
 pub fn auto_build_succeeded_comment(
-    mut workflows: Vec<WorkflowRun>,
+    mut check_runs: Vec<CheckRun>,
     approved_by: &str,
     merge_sha: &CommitSha,
     base_ref: &str,
     duration: Option<Duration>,
 ) -> Comment {
-    workflows.sort_by(|a, b| a.name.cmp(&b.name));
-    let urls = workflows
+    check_runs.sort_by(|a, b| a.name.cmp(&b.name));
+    let urls = check_runs
         .iter()
         .map(|w| format!("[{}]({})", w.name, w.url))
         .collect::<Vec<_>>()

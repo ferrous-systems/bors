@@ -292,7 +292,7 @@ mod tests {
         TRY_BRANCH_NAME, TRY_BUILD_CHECK_RUN_NAME, TRY_MERGE_BRANCH_NAME,
     };
     use crate::database::WorkflowStatus;
-    use crate::database::operations::get_all_workflows;
+    use crate::database::operations::get_all_check_runs;
     use crate::github::CommitSha;
     use crate::github::api::client::HideCommentReason;
     use crate::tests::default_repo_name;
@@ -947,7 +947,7 @@ try-job: Bar
             Ok(())
         })
         .await;
-        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 0);
+        assert_eq!(get_all_check_runs(&pool).await.unwrap().len(), 0);
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

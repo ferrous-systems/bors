@@ -1,4 +1,5 @@
 use crate::github::api::DEFAULT_REQUEST_TIMEOUT;
+use anyhow::Context;
 use itertools::Itertools;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
@@ -6,10 +7,10 @@ use tokio::time;
 use tracing::Instrument;
 
 /// Measures the duration of a database query and logs it using tracing.
-pub async fn measure_db_query<T, F, Fut>(query_name: &str, f: F) -> T
+pub async fn measure_db_query<T, F, Fut>(query_name: &str, f: F) -> anyhow::Result<T>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = T>,
+    Fut: Future<Output = Result<T, sqlx::Error>>,
 {
     let start = Instant::now();
 
@@ -25,7 +26,7 @@ where
         );
     });
 
-    result
+    result.with_context(|| format!("executing query {query_name}"))
 }
 
 /// Signals if a retryable operation should be retried or not.

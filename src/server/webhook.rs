@@ -11,20 +11,21 @@ use octocrab::models::events::payload::{
 };
 use octocrab::models::pulls::{PullRequest, Review};
 use octocrab::models::webhook_events::payload::PullRequestWebhookEventAction;
-use octocrab::models::{Author, CheckSuiteId, JobId, Repository, RunId, workflows};
+use octocrab::models::{App, AppId, Author, CheckRunId, Repository, RunId};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
 
 use crate::bors::event::{
-    BorsEvent, BorsGlobalEvent, BorsRepositoryEvent, PullRequestAssigned, PullRequestClosed,
-    PullRequestComment, PullRequestConvertedToDraft, PullRequestEdited, PullRequestMerged,
-    PullRequestOpened, PullRequestPushed, PullRequestReadyForReview, PullRequestReopened,
-    PullRequestUnassigned, PushToBranch, WorkflowJobCompleted, WorkflowJobStarted,
-    WorkflowRunCompleted, WorkflowRunStarted,
+    BorsEvent, BorsGlobalEvent, BorsRepositoryEvent, CheckRunCompleted, CheckRunCreated,
+    PullRequestAssigned, PullRequestClosed, PullRequestComment, PullRequestConvertedToDraft,
+    PullRequestEdited, PullRequestMerged, PullRequestOpened, PullRequestPushed,
+    PullRequestReadyForReview, PullRequestReopened, PullRequestUnassigned, PushToBranch,
 };
-use crate::database::{WorkflowStatus, WorkflowType};
+use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
 use crate::server::ServerStateRef;
+
+const GITHUB_ACTIONS_APP_ID: AppId = AppId(15368);
 
 /// Wrapper for a secret which is zeroed on drop and can be exposed only through the
 /// [`WebhookSecret::expose`] method.
@@ -56,34 +57,43 @@ struct WebhookRepository {
 }
 
 #[derive(serde::Deserialize, Debug)]
-struct WebhookWorkflowRun<'a> {
-    action: &'a str,
-    workflow_run: WorkflowRunInner,
-    repository: Repository,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct WorkflowRunInner {
-    check_suite_id: CheckSuiteId,
-    #[serde(flatten)]
-    run: workflows::Run,
-}
-
-#[derive(serde::Deserialize, Debug)]
 struct WebhookWorkflowJob<'a> {
     action: &'a str,
-    workflow_job: WorkflowJobInner,
+    workflow_job: WorkflowJobInner<'a>,
     repository: Repository,
 }
 
 #[derive(serde::Deserialize, Debug)]
-struct WorkflowJobInner {
-    id: JobId,
+struct WorkflowJobInner<'a> {
+    id: CheckRunId,
     run_id: RunId,
-    head_branch: String,
     head_sha: String,
     name: String,
+    #[allow(unused)] // TODO
     labels: Vec<String>,
+    html_url: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    conclusion: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct WebhookCheckRun<'a> {
+    action: &'a str,
+    check_run: CheckRunInner<'a>,
+    repository: Repository,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct CheckRunInner<'a> {
+    app: App,
+    id: CheckRunId,
+    name: String,
+    conclusion: Option<&'a str>,
+    head_sha: String,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    html_url: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -179,8 +189,9 @@ fn parse_webhook_event(request: Parts, body: &[u8]) -> anyhow::Result<Option<Bor
         b"installation_repositories" | b"installation" => Ok(Some(BorsEvent::Global(
             BorsGlobalEvent::InstallationsChanged,
         ))),
-        b"workflow_run" => parse_workflow_run_events(body),
+        // b"workflow_run" => parse_workflow_run_events(body),
         b"workflow_job" => parse_workflow_job_events(body),
+        b"check_run" => parse_check_run_events(body),
         _ => {
             tracing::debug!(
                 "Ignoring unknown webhook event type {:?}",
@@ -332,87 +343,131 @@ fn parse_pull_request_review_comment_events(body: &[u8]) -> anyhow::Result<Optio
     }
 }
 
-fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
-    let payload: WebhookWorkflowRun = serde_json::from_slice(body)?;
-    let repository_name = parse_repository_name(&payload.repository)?;
+// fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
+//     let payload: WebhookWorkflowRun = serde_json::from_slice(body)?;
+//     let repository_name = parse_repository_name(&payload.repository)?;
 
-    // As a security precaution, we eagerly prefilter all workflow runs other than "push" here,
-    // to ensure that only workflows from privileged pushes to branches in the repository are
-    // registered by bors.
-    if payload.workflow_run.run.event != "push" {
-        return Ok(None);
-    }
+//     // As a security precaution, we eagerly prefilter all workflow runs other than "push" here,
+//     // to ensure that only workflows from privileged pushes to branches in the repository are
+//     // registered by bors.
+//     if payload.workflow_run.run.event != "push" {
+//         return Ok(None);
+//     }
 
-    let result = match payload.action {
-        "requested" => Some(BorsEvent::Repository(BorsRepositoryEvent::WorkflowStarted(
-            WorkflowRunStarted {
-                repository: repository_name,
-                name: payload.workflow_run.run.name,
-                branch: payload.workflow_run.run.head_branch,
-                commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-                run_id: payload.workflow_run.run.id,
-                workflow_type: WorkflowType::Github,
-                url: payload.workflow_run.run.html_url.into(),
-            },
-        ))),
-        "completed" => {
-            let running_time = if let (Some(started_at), Some(completed_at)) = (
-                Some(payload.workflow_run.run.created_at),
-                Some(payload.workflow_run.run.updated_at),
-            ) {
-                Some(completed_at - started_at)
-            } else {
-                None
-            };
-            Some(BorsEvent::Repository(
-                BorsRepositoryEvent::WorkflowCompleted(WorkflowRunCompleted {
-                    repository: repository_name,
-                    branch: payload.workflow_run.run.head_branch,
-                    commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-                    run_id: payload.workflow_run.run.id,
-                    check_suite_id: payload.workflow_run.check_suite_id,
-                    running_time,
-                    status: match payload
-                        .workflow_run
-                        .run
-                        .conclusion
-                        .unwrap_or_default()
-                        .as_str()
-                    {
-                        "success" => WorkflowStatus::Success,
-                        _ => WorkflowStatus::Failure,
-                    },
-                }),
-            ))
-        }
-        _ => None,
-    };
-    Ok(result)
-}
+//     let result = match payload.action {
+//         "requested" => Some(BorsEvent::Repository(BorsRepositoryEvent::WorkflowStarted(
+//             WorkflowRunStarted {
+//                 repository: repository_name,
+//                 name: payload.workflow_run.run.name,
+//                 branch: payload.workflow_run.run.head_branch,
+//                 commit_sha: CommitSha(payload.workflow_run.run.head_sha),
+//                 run_id: payload.workflow_run.run.id,
+//                 workflow_type: WorkflowType::Github,
+//                 url: payload.workflow_run.run.html_url.into(),
+//             },
+//         ))),
+//         "completed" => {
+//             let running_time = if let (Some(started_at), Some(completed_at)) = (
+//                 Some(payload.workflow_run.run.created_at),
+//                 Some(payload.workflow_run.run.updated_at),
+//             ) {
+//                 Some(completed_at - started_at)
+//             } else {
+//                 None
+//             };
+//             Some(BorsEvent::Repository(
+//                 BorsRepositoryEvent::WorkflowCompleted(WorkflowRunCompleted {
+//                     repository: repository_name,
+//                     branch: payload.workflow_run.run.head_branch,
+//                     commit_sha: CommitSha(payload.workflow_run.run.head_sha),
+//                     run_id: payload.workflow_run.run.id,
+//                     check_suite_id: payload.workflow_run.check_suite_id,
+//                     running_time,
+//                     status: match payload
+//                         .workflow_run
+//                         .run
+//                         .conclusion
+//                         .unwrap_or_default()
+//                         .as_str()
+//                     {
+//                         "success" => WorkflowStatus::Success,
+//                         _ => WorkflowStatus::Failure,
+//                     },
+//                 }),
+//             ))
+//         }
+//         _ => None,
+//     };
+//     Ok(result)
+// }
 
 fn parse_workflow_job_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
     let payload: WebhookWorkflowJob = serde_json::from_slice(body)?;
     let repository_name = parse_repository_name(&payload.repository)?;
     let result = match payload.action {
-        "queued" => Some(BorsEvent::Repository(
-            BorsRepositoryEvent::WorkflowJobStarted(WorkflowJobStarted {
+        "in_progress" => Some(BorsEvent::Repository(BorsRepositoryEvent::CheckRunCreated(
+            CheckRunCreated {
                 repository: repository_name,
-                job_id: payload.workflow_job.id,
+                id: payload.workflow_job.id,
                 name: payload.workflow_job.name,
-                branch: payload.workflow_job.head_branch,
-                commit_sha: CommitSha(payload.workflow_job.head_sha),
-                run_id: payload.workflow_job.run_id,
-                labels: payload.workflow_job.labels,
+                commit_sha: payload.workflow_job.head_sha.into(),
+                html_url: payload.workflow_job.html_url,
+                started_at: payload.workflow_job.started_at,
+                github_workflow_run_id: Some(payload.workflow_job.run_id),
+            },
+        ))),
+        "completed" => Some(BorsEvent::Repository(
+            BorsRepositoryEvent::CheckRunCompleted(CheckRunCompleted {
+                repository: repository_name,
+                id: payload.workflow_job.id,
+                name: payload.workflow_job.name,
+                commit_sha: payload.workflow_job.head_sha.into(),
+                running_time: payload
+                    .workflow_job
+                    .completed_at
+                    .map(|completed| completed - payload.workflow_job.started_at),
+                status: match payload.workflow_job.conclusion {
+                    Some("success") => WorkflowStatus::Success,
+                    _ => WorkflowStatus::Failure,
+                },
             }),
         )),
+        _ => None,
+    };
+    Ok(result)
+}
+
+fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
+    let payload: WebhookCheckRun = serde_json::from_slice(body)?;
+    let repository = parse_repository_name(&payload.repository)?;
+    let result = match payload.action {
+        // handle github-actions check-runs via workflow_run webhook
+        _ if payload.check_run.app.id == GITHUB_ACTIONS_APP_ID => None,
+        "created" => Some(BorsEvent::Repository(BorsRepositoryEvent::CheckRunCreated(
+            CheckRunCreated {
+                repository,
+                id: payload.check_run.id,
+                name: payload.check_run.name,
+                commit_sha: payload.check_run.head_sha.into(),
+                html_url: payload.check_run.html_url,
+                github_workflow_run_id: None,
+                started_at: payload.check_run.started_at,
+            },
+        ))),
         "completed" => Some(BorsEvent::Repository(
-            BorsRepositoryEvent::WorkflowJobCompleted(WorkflowJobCompleted {
-                repository: repository_name,
-                job_id: payload.workflow_job.id,
-                name: payload.workflow_job.name,
-                branch: payload.workflow_job.head_branch,
-                commit_sha: CommitSha(payload.workflow_job.head_sha),
-                run_id: payload.workflow_job.run_id,
+            BorsRepositoryEvent::CheckRunCompleted(CheckRunCompleted {
+                repository,
+                id: payload.check_run.id,
+                name: payload.check_run.name,
+                commit_sha: payload.check_run.head_sha.into(),
+                running_time: payload
+                    .check_run
+                    .completed_at
+                    .map(|completed| completed - payload.check_run.started_at),
+                status: match payload.check_run.conclusion {
+                    Some("success") => WorkflowStatus::Success,
+                    _ => WorkflowStatus::Failure,
+                },
             }),
         )),
         _ => None,

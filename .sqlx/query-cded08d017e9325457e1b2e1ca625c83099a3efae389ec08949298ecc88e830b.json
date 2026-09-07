@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE check_run\n                SET status = $1\n                WHERE check_run_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cded08d017e9325457e1b2e1ca625c83099a3efae389ec08949298ecc88e830b"
+}

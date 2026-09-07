@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT\n                    id,\n                    repository AS \"repository: GithubRepoName\",\n                    branch,\n                    commit_sha,\n                    status AS \"status: BuildStatus\",\n                    parent,\n                    created_at,\n                    check_run_id,\n                    kind AS \"kind: BuildKind\",\n                    duration AS \"duration: PgDuration\",\n                    pr_number AS \"pr_number: PullRequestNumber\"\n                FROM build\n                WHERE repository = $1\n                    AND commit_sha = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository: GithubRepoName",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "branch",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "commit_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "status: BuildStatus",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "parent",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "check_run_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "kind: BuildKind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "duration: PgDuration",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 10,
+        "name": "pr_number: PullRequestNumber",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "e469f00550fc4bdca6fefabfa266b0999777cc657870399136c2ef64b1669774"
+}

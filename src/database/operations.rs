@@ -1,16 +1,15 @@
 use chrono::DateTime;
 use chrono::Utc;
+use octocrab::models::CheckRunId;
 use sqlx::postgres::PgExecutor;
 use std::collections::{HashMap, HashSet};
 
 use super::DelegatedPermission;
 use super::MergeableState;
 use super::PullRequestModel;
-use super::RunId;
 use super::TreeState;
 use super::UpsertPullRequestParams;
 use super::WorkflowStatus;
-use super::WorkflowType;
 use super::{ApprovalInfo, PrimaryKey, UpdateBuildParams};
 use super::{ApprovalStatus, RollupMember};
 use super::{Assignees, RegisterRollupMemberParams};
@@ -21,10 +20,10 @@ use crate::bors::RollupMode;
 use crate::bors::comment::CommentTag;
 use crate::database::BuildKind;
 use crate::database::BuildStatus;
+use crate::database::CheckRunModel;
 use crate::database::DelegationStatus;
 use crate::database::PgDuration;
 use crate::database::RepoModel;
-use crate::database::WorkflowModel;
 use crate::github::CommitSha;
 use crate::github::GithubRepoName;
 use crate::github::PullRequestNumber;
@@ -806,6 +805,40 @@ WHERE repository = $1
     .await
 }
 
+pub(crate) async fn find_builds_by_commit_sha(
+    executor: impl PgExecutor<'_>,
+    repo: &GithubRepoName,
+    commit_sha: &CommitSha,
+) -> anyhow::Result<Vec<BuildModel>> {
+    measure_db_query("find_builds_by_commit_sha", async || {
+        sqlx::query_as!(
+            BuildModel,
+            r#"
+                SELECT
+                    id,
+                    repository AS "repository: GithubRepoName",
+                    branch,
+                    commit_sha,
+                    status AS "status: BuildStatus",
+                    parent,
+                    created_at,
+                    check_run_id,
+                    kind AS "kind: BuildKind",
+                    duration AS "duration: PgDuration",
+                    pr_number AS "pr_number: PullRequestNumber"
+                FROM build
+                WHERE repository = $1
+                    AND commit_sha = $2
+            "#,
+            repo as _,
+            commit_sha as _,
+        )
+        .fetch_all(executor)
+        .await
+    })
+    .await
+}
+
 pub(crate) async fn update_build(
     executor: impl PgExecutor<'_>,
     build_id: PrimaryKey,
@@ -839,27 +872,36 @@ WHERE id = $4
     .await
 }
 
-pub(crate) async fn create_workflow(
+pub(crate) async fn create_check_run(
     executor: impl PgExecutor<'_>,
-    build_id: i32,
+    build: &BuildModel,
+    id: CheckRunId,
     name: &str,
     url: &str,
-    run_id: RunId,
-    workflow_type: WorkflowType,
-    status: WorkflowStatus,
+    started_at: DateTime<Utc>,
+    github_workflow_run_id: Option<octocrab::models::RunId>,
 ) -> anyhow::Result<()> {
-    measure_db_query("create_workflow", || async {
+    measure_db_query("create_check_run", async || {
         sqlx::query!(
             r#"
-INSERT INTO workflow (build_id, name, url, run_id, type, status)
-VALUES ($1, $2, $3, $4, $5, $6)
-"#,
-            build_id,
+                INSERT INTO check_run (
+                    build_id,
+                    check_run_id,
+                    name,
+                    url,
+                    status,
+                    started_at,
+                    github_workflow_run_id
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+            build.id,
+            id.into_inner() as i64,
             name,
             url,
-            run_id.0 as i64,
-            workflow_type as _,
-            status as _
+            WorkflowStatus::Pending as _,
+            started_at,
+            github_workflow_run_id.map(|id| id.into_inner() as i64),
         )
         .execute(executor)
         .await?;
@@ -868,16 +910,20 @@ VALUES ($1, $2, $3, $4, $5, $6)
     .await
 }
 
-pub(crate) async fn update_workflow_status(
+pub(crate) async fn update_check_run_status(
     executor: impl PgExecutor<'_>,
-    run_id: u64,
+    check_run_id: CheckRunId,
     status: WorkflowStatus,
 ) -> anyhow::Result<()> {
-    measure_db_query("update_workflow_status", || async {
+    measure_db_query("update_check_run_status", async || {
         sqlx::query!(
-            "UPDATE workflow SET status = $1 WHERE run_id = $2",
+            r#"
+                UPDATE check_run
+                SET status = $1
+                WHERE check_run_id = $2
+            "#,
             status as _,
-            run_id as i64
+            check_run_id.into_inner() as i64,
         )
         .execute(executor)
         .await?;
@@ -954,81 +1000,111 @@ pub(crate) async fn set_pr_assignees(
     .await
 }
 
-pub(crate) async fn get_workflows_for_build(
+pub(crate) async fn get_check_runs_for_build(
     executor: impl PgExecutor<'_>,
-    build_id: i32,
-) -> anyhow::Result<Vec<WorkflowModel>> {
-    measure_db_query("get_workflows_for_build", || async {
-        let workflows = sqlx::query_as!(
-            WorkflowModel,
+    build: &BuildModel,
+) -> anyhow::Result<Vec<CheckRunModel>> {
+    measure_db_query("get_check_runs_for_build", async || {
+        sqlx::query_as!(
+            CheckRunModel,
             r#"
-SELECT
-    workflow.id,
-    workflow.name,
-    workflow.url,
-    workflow.run_id,
-    workflow.type as "workflow_type: WorkflowType",
-    workflow.status as "status: WorkflowStatus",
-    workflow.created_at as "created_at: DateTime<Utc>",
-    build AS "build!: BuildModel"
-FROM workflow
-    LEFT JOIN build ON workflow.build_id = build.id
-WHERE build.id = $1
-"#,
-            build_id
+                SELECT
+                    check_run.id,
+                    build AS "build!: BuildModel",
+                    check_run.name,
+                    check_run.check_run_id,
+                    check_run.url,
+                    check_run.status as "status: _",
+                    check_run.started_at,
+                    check_run.github_workflow_run_id
+                FROM check_run
+                LEFT JOIN build ON check_run.build_id = build.id
+                WHERE build.id = $1
+            "#,
+            build.id,
         )
         .fetch_all(executor)
-        .await?;
-        Ok(workflows)
+        .await
     })
     .await
 }
 
-pub(crate) async fn get_workflow_urls_for_build(
+pub(crate) async fn get_check_runs_with_status_for_build(
     executor: impl PgExecutor<'_>,
-    build_id: i32,
-) -> anyhow::Result<Vec<String>> {
-    measure_db_query("get_workflow_urls_for_build", || async {
+    build: &BuildModel,
+    status: WorkflowStatus,
+) -> anyhow::Result<Vec<CheckRunModel>> {
+    measure_db_query("get_check_runs_with_status_for_build", async || {
+        sqlx::query_as!(
+            CheckRunModel,
+            r#"
+                SELECT
+                    check_run.id,
+                    build as "build!: BuildModel",
+                    check_run.name,
+                    check_run.check_run_id,
+                    check_run.url,
+                    check_run.status as "status: WorkflowStatus",
+                    check_run.started_at,
+                    check_run.github_workflow_run_id
+                FROM check_run
+                LEFT JOIN build ON check_run.build_id = build.id
+                WHERE check_run.build_id = $1
+                    AND check_run.status = $2
+            "#,
+            build.id,
+            status as _,
+        )
+        .fetch_all(executor)
+        .await
+    })
+    .await
+}
+
+pub(crate) async fn get_check_run_names_and_urls_for_build(
+    executor: impl PgExecutor<'_>,
+    build: &BuildModel,
+) -> anyhow::Result<Vec<(String, String)>> {
+    measure_db_query("get_check_run_names_and_urls_for_build", async || {
         let results = sqlx::query!(
             r#"
-SELECT url
-FROM workflow
-WHERE build_id = $1
-"#,
-            build_id
+                SELECT name, url
+                FROM check_run
+                WHERE build_id = $1
+            "#,
+            build.id,
         )
         .fetch_all(executor)
         .await?;
 
-        Ok(results.into_iter().map(|r| r.url).collect())
+        Ok(results.into_iter().map(|r| (r.name, r.url)).collect())
     })
     .await
 }
 
 #[cfg(test)]
-pub(crate) async fn get_all_workflows(
+pub(crate) async fn get_all_check_runs(
     executor: impl PgExecutor<'_>,
-) -> anyhow::Result<Vec<WorkflowModel>> {
-    measure_db_query("get_all_workflows", || async {
-        let workflows = sqlx::query_as!(
-            WorkflowModel,
+) -> anyhow::Result<Vec<CheckRunModel>> {
+    measure_db_query("get_all_check_runs", async || {
+        sqlx::query_as!(
+            CheckRunModel,
             r#"
-SELECT
-    workflow.id,
-    workflow.name,
-    workflow.url,
-    workflow.run_id,
-    workflow.type as "workflow_type: WorkflowType",
-    workflow.status as "status: WorkflowStatus",
-    workflow.created_at as "created_at: DateTime<Utc>",
-    build AS "build!: BuildModel"
-FROM workflow
-    LEFT JOIN build ON workflow.build_id = build.id
-"#
+                SELECT
+                    check_run.id,
+                    build as "build!: BuildModel",
+                    check_run.name,
+                    check_run.check_run_id,
+                    check_run.url,
+                    check_run.status as "status: _",
+                    check_run.started_at,
+                    check_run.github_workflow_run_id
+                FROM check_run
+                LEFT JOIN build ON check_run.build_id = build.id
+            "#
         )
         .fetch_all(executor)
-        .await?;
-        Ok(workflows)
+        .await
     })
     .await
 }

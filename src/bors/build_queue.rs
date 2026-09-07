@@ -10,17 +10,17 @@
 //! other background sync processes. We want to finish builds as fast as possible.
 
 use crate::bors::build::{
-    CancelBuildConclusion, CancelBuildError, cancel_build, get_failed_jobs, load_workflow_runs,
+    CancelBuildConclusion, CancelBuildError, cancel_build, get_failed_jobs, load_check_runs,
 };
 use crate::bors::comment::{
     CommentTag, build_failed_comment, build_timed_out_comment, try_build_succeeded_comment,
 };
-use crate::bors::event::WorkflowRunCompleted;
+use crate::bors::event::CheckRunCompleted;
 use crate::bors::labels::handle_label_trigger;
 use crate::bors::merge_queue::MergeQueueSender;
 use crate::bors::unroll_queue::UnrollQueueSender;
 use crate::bors::{
-    BuildKind, FailedWorkflowRun, RepositoryState, elapsed_time_since, hide_tagged_comments,
+    BuildKind, FailedCheckRun, RepositoryState, elapsed_time_since, hide_tagged_comments,
 };
 use crate::database::{
     BuildModel, BuildStatus, PullRequestModel, UpdateBuildParams, WorkflowStatus,
@@ -51,27 +51,29 @@ impl BuildQueueSender {
             .await
     }
 
-    pub async fn on_workflow_completed(
+    pub async fn on_check_run_completed(
         &self,
-        event: WorkflowRunCompleted,
+        event: CheckRunCompleted,
+        build: BuildModel,
         error_context: Option<String>,
     ) -> Result<(), mpsc::error::SendError<BuildQueueEvent>> {
         // If we're in a test, we want to wait until the workflow completed event is actually
         // handled, to avoid possible race conditions.
         #[cfg(test)]
-        crate::bors::WAIT_FOR_WORKFLOW_COMPLETED_HANDLED
+        crate::bors::WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED
             .drain()
             .await;
 
         self.inner
-            .send(BuildQueueEvent::OnWorkflowCompleted {
+            .send(BuildQueueEvent::OnCheckRunCompleted {
                 event,
+                build,
                 error_context,
             })
             .await?;
 
         #[cfg(test)]
-        crate::bors::WAIT_FOR_WORKFLOW_COMPLETED_HANDLED
+        crate::bors::WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED
             .sync()
             .await;
 
@@ -87,8 +89,9 @@ pub fn create_build_queue() -> (BuildQueueSender, BuildQueueReceiver) {
 #[derive(Debug)]
 pub enum BuildQueueEvent {
     RefreshPendingBuilds(GithubRepoName),
-    OnWorkflowCompleted {
-        event: WorkflowRunCompleted,
+    OnCheckRunCompleted {
+        event: CheckRunCompleted,
+        build: BuildModel,
         error_context: Option<String>,
     },
 }
@@ -152,17 +155,12 @@ pub async fn handle_build_queue_event(
                 }
             }
         }
-        BuildQueueEvent::OnWorkflowCompleted {
+        BuildQueueEvent::OnCheckRunCompleted {
             event,
+            build,
             error_context,
         } => {
             let handle = async {
-                let build = db
-                    .find_build(&event.repository, &event.branch, event.commit_sha.clone())
-                    .await?;
-                let Some(build) = build else {
-                    return Ok(());
-                };
                 if build.status != BuildStatus::Pending {
                     tracing::warn!("Received workflow completed for an already completed build");
                     return Ok(());
@@ -187,7 +185,7 @@ pub async fn handle_build_queue_event(
             let res = handle.await;
 
             #[cfg(test)]
-            crate::bors::WAIT_FOR_WORKFLOW_COMPLETED_HANDLED.mark();
+            crate::bors::WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED.mark();
 
             return res;
         }
@@ -268,7 +266,7 @@ async fn maybe_complete_build(
         "Attempting to complete a non-pending build"
     );
 
-    let workflow_runs = load_workflow_runs(repo, db, build)
+    let check_runs = load_check_runs(repo, db, build)
         .await
         .context("Cannot load workflow runs")?;
 
@@ -277,7 +275,7 @@ async fn maybe_complete_build(
     // If not, then we could have a race condition where we check the completion of this build
     // *just* after it has been inserted into the DB, but before CI had a chance to start the
     // workflow runs. In that case, bail out and wait for a later opportunity.
-    if workflow_runs.is_empty() {
+    if check_runs.is_empty() {
         match &completion_trigger {
             Some(_) => {
                 return Err(anyhow::anyhow!(
@@ -298,16 +296,16 @@ async fn maybe_complete_build(
     // At this point, we assume that the number of GH workflow runs is final, and after a single
     // workflow run has been completed, no other workflow runs attached to the same commit can
     // appear out of nowhere.
-    assert!(!workflow_runs.is_empty());
+    assert!(!check_runs.is_empty());
 
-    let has_failure = workflow_runs
+    let has_failure = check_runs
         .iter()
         .any(|run| matches!(run.status, WorkflowStatus::Failure));
     // If we have a failure, then we want to immediately finish the build with a failure.
     // If we don't have any failures, then we should check if we are still waiting for some
     // workflows to finish.
     if !has_failure
-        && workflow_runs
+        && check_runs
             .iter()
             .any(|run| matches!(run.status, WorkflowStatus::Pending))
     {
@@ -344,10 +342,10 @@ async fn maybe_complete_build(
 
     let compute_duration = || {
         // Compute the time when the earliest workflow started, and when the latest workflow ended
-        let start = workflow_runs.iter().map(|run| run.created_at).min()?;
-        let end = workflow_runs
+        let start = check_runs.iter().map(|run| run.started_at).min()?;
+        let end = check_runs
             .iter()
-            .filter_map(|run| run.duration.map(|d| run.created_at + d))
+            .filter_map(|run| run.duration.map(|d| run.started_at + d))
             .max()?;
 
         // The build duration is the difference between those two
@@ -399,8 +397,8 @@ async fn maybe_complete_build(
 
         match build.kind {
             BuildKind::Try => Some(try_build_succeeded_comment(
-                workflow_runs,
-                CommitSha(build.commit_sha.clone()),
+                check_runs,
+                build.commit_sha.clone(),
                 CommitSha(build.parent.clone()),
             )),
             BuildKind::Auto => {
@@ -416,29 +414,32 @@ async fn maybe_complete_build(
         tracing::info!("Build failed for PR {pr_num}");
 
         // Download failed jobs
-        let mut failed_workflow_runs: Vec<FailedWorkflowRun> = vec![];
-        for workflow_run in workflow_runs {
-            let failed_jobs = match get_failed_jobs(repo, workflow_run.id).await {
-                Ok(jobs) => jobs,
-                Err(error) => {
-                    tracing::error!(
-                        "Cannot download jobs for workflow run {}: {error:?}",
-                        workflow_run.id
-                    );
-                    vec![]
-                }
+        let mut failed_check_runs = vec![];
+        for check_run in check_runs {
+            let failed_github_jobs = match check_run.github_workflow_run_id {
+                Some(workflow_id) => match get_failed_jobs(repo, workflow_id).await {
+                    Ok(jobs) => jobs,
+                    Err(error) => {
+                        tracing::error!(
+                            "Cannot download jobs for workflow run {}: {error:?}",
+                            check_run.id
+                        );
+                        vec![]
+                    }
+                },
+                None => vec![],
             };
-            failed_workflow_runs.push(FailedWorkflowRun {
-                workflow_run,
-                failed_jobs,
+
+            failed_check_runs.push(FailedCheckRun {
+                check_run: check_run,
+                failed_github_jobs,
             })
         }
 
         let error_context = completion_trigger.and_then(|t| t.error_context);
         Some(build_failed_comment(
-            repo.repository(),
-            CommitSha(build.commit_sha.clone()),
-            failed_workflow_runs,
+            build.commit_sha.clone(),
+            failed_check_runs,
             error_context,
         ))
     };

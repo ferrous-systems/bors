@@ -1,6 +1,6 @@
 use crate::config::RepositoryConfig;
-use crate::github::GithubRepoName;
 use crate::github::api::client::{GithubRepositoryClient, HideCommentReason};
+use crate::github::{CommitSha, GithubRepoName};
 use crate::permissions::UserPermissions;
 #[cfg(test)]
 use crate::tests::TestSyncMarker;
@@ -12,8 +12,8 @@ pub use comment::Comment;
 pub use context::BorsContext;
 pub use handlers::{handle_bors_global_event, handle_bors_repository_event};
 use itertools::Itertools;
-use octocrab::models::RunId;
 use octocrab::models::workflows::Job;
+use octocrab::models::{CheckRunId, RunId};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -31,7 +31,6 @@ pub mod event;
 mod gitops;
 pub mod gitops_queue;
 mod handlers;
-mod job_cache;
 mod labels;
 pub mod merge_queue;
 pub mod mergeability_queue;
@@ -45,7 +44,6 @@ use crate::database::{PullRequestModel, WorkflowStatus};
 use crate::github::api::operations::CommitAuthor;
 pub use command::CommandPrefix;
 pub use gitops::Git;
-pub use job_cache::{WorkflowJobData, WorkflowJobStatus};
 
 /// Branch where CI checks run for auto builds.
 /// This branch should run CI checks.
@@ -181,7 +179,7 @@ pub static WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT: TestSyncMarker = TestSyncMarker::
 
 /// The build queue has handled a workflow completed event.
 #[cfg(test)]
-pub static WAIT_FOR_WORKFLOW_COMPLETED_HANDLED: TestSyncMarker = TestSyncMarker::new();
+pub static WAIT_FOR_CHECK_RUN_COMPLETED_HANDLED: TestSyncMarker = TestSyncMarker::new();
 
 #[cfg(test)]
 pub static WAIT_FOR_CONFIG_REFRESH: TestSyncMarker = TestSyncMarker::new();
@@ -237,10 +235,85 @@ pub struct WorkflowRun {
     pub duration: Option<Duration>,
 }
 
-pub struct FailedWorkflowRun {
-    pub workflow_run: WorkflowRun,
-    pub failed_jobs: Vec<Job>,
+/// Corresponds to a single execution of a check.
+#[derive(Clone, Debug)]
+pub struct CheckRun {
+    pub id: CheckRunId,
+    pub name: String,
+    pub commit_sha: CommitSha,
+    pub url: String,
+    pub status: WorkflowStatus,
+    pub started_at: DateTime<Utc>,
+    pub duration: Option<Duration>,
+    pub github_workflow_run_id: Option<octocrab::models::RunId>,
 }
+
+impl From<octocrab::models::checks::CheckRun> for CheckRun {
+    fn from(value: octocrab::models::checks::CheckRun) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            url: value.html_url.unwrap_or_default(),
+            commit_sha: value.head_sha.into(),
+            started_at: value.started_at.unwrap_or_default(),
+            github_workflow_run_id: None,
+            status: match value.conclusion.as_deref() {
+                Some("success") => WorkflowStatus::Success,
+                Some(_) => WorkflowStatus::Failure,
+                None => WorkflowStatus::Pending,
+            },
+            duration: match (value.started_at, value.completed_at) {
+                (Some(started), Some(completed)) => {
+                    Some((completed - started).to_std().ok().unwrap_or_default())
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
+impl From<crate::database::CheckRunModel> for CheckRun {
+    fn from(value: crate::database::CheckRunModel) -> Self {
+        Self {
+            id: value.check_run_id(),
+            github_workflow_run_id: value.github_workflow_run_id(),
+            name: value.name,
+            url: value.url,
+            commit_sha: value.build.commit_sha,
+            // duration currently not stored in db
+            duration: None,
+            started_at: value.started_at,
+            status: value.status,
+        }
+    }
+}
+
+pub struct FailedCheckRun {
+    pub check_run: CheckRun,
+    pub failed_github_jobs: Vec<Job>,
+}
+
+// impl From<octocrab::models::workflows::Job> for CheckRun {
+//     fn from(value: octocrab::models::workflows::Job) -> Self {
+//         Self {
+//             id: value.id.0.into(), // github reuses check-run id for workflow jobs
+//             name: value.name,
+//             url: value.html_url.to_string(),
+//             commit_sha: value.head_sha.into(),
+//             github_workflow_run_id: Some(value.run_id),
+//             started_at: value.started_at,
+//             status: match value.conclusion.as_deref() {
+//                 Some("success") => WorkflowStatus::Success,
+//                 Some(_) => WorkflowStatus::Failure,
+//                 None => WorkflowStatus::Pending,
+//             },
+//             duration: value
+//                 .completed_at
+//                 .map(|completed| (completed - value.started_at).to_std().ok())
+//                 .flatten(),
+//         }
+//     }
+// }
 
 /// An access point to a single repository.
 /// Can be used to query permissions for the repository, and also to perform various

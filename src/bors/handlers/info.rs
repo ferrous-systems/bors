@@ -45,10 +45,10 @@ pub(super) async fn command_info(
     {
         writeln!(message, "- Try build is in progress")?;
 
-        if let Ok(urls) = db.get_workflow_urls_for_build(try_build).await {
+        if let Ok(urls) = db.get_check_run_names_and_urls_for_build(try_build).await {
             message.extend(
                 urls.into_iter()
-                    .map(|url| format!("\t- Workflow URL: {url}")),
+                    .map(|(name, url)| format!("\t- [{name}]({url})")),
             );
         }
     }
@@ -72,10 +72,10 @@ pub(super) async fn command_info(
             }
         }
 
-        if let Ok(urls) = db.get_workflow_urls_for_build(auto_build).await {
+        if let Ok(urls) = db.get_check_run_names_and_urls_for_build(auto_build).await {
             message.extend(
                 urls.into_iter()
-                    .map(|url| format!("\t- Workflow URL: {url}")),
+                    .map(|(name, url)| format!("\t- [{name}]({url})")),
             );
         }
     }
