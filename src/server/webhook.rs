@@ -1771,29 +1771,11 @@ mod tests {
     async fn workflow_run_requested() {
         insta::assert_debug_snapshot!(
             check_webhook("webhook/workflow-run-requested.json", "workflow_run").await,
-            @r#"
-        Ok(
-            GitHubWebhook(
-                Repository(
-                    WorkflowStarted(
-                        WorkflowRunStarted {
-                            repository: kobzol/bors-kindergarten,
-                            name: "Workflow 2",
-                            branch: "automation/bors/try",
-                            commit_sha: CommitSha(
-                                "c9abcadf285659684c0975cead8bf982fa84e123",
-                            ),
-                            run_id: RunId(
-                                4900979074,
-                            ),
-                            workflow_type: Github,
-                            url: "https://github.com/Kobzol/bors-kindergarten/actions/runs/4900979074",
-                        },
-                    ),
-                ),
-            ),
+            @"
+        Err(
+            200,
         )
-        "#
+        "
         );
     }
 
@@ -1801,36 +1783,11 @@ mod tests {
     async fn workflow_run_completed() {
         insta::assert_debug_snapshot!(
             check_webhook("webhook/workflow-run-completed.json", "workflow_run").await,
-            @r#"
-        Ok(
-            GitHubWebhook(
-                Repository(
-                    WorkflowCompleted(
-                        WorkflowRunCompleted {
-                            repository: kobzol/bors-kindergarten,
-                            branch: "automation/bors/try",
-                            commit_sha: CommitSha(
-                                "c9abcadf285659684c0975cead8bf982fa84e123",
-                            ),
-                            run_id: RunId(
-                                4900979072,
-                            ),
-                            status: Failure,
-                            running_time: Some(
-                                TimeDelta {
-                                    secs: 13,
-                                    nanos: 0,
-                                },
-                            ),
-                            check_suite_id: CheckSuiteId(
-                                12717696197,
-                            ),
-                        },
-                    ),
-                ),
-            ),
+            @"
+        Err(
+            200,
         )
-        "#
+        "
         );
     }
 
@@ -1838,33 +1795,11 @@ mod tests {
     async fn workflow_job_started() {
         insta::assert_debug_snapshot!(
             check_webhook("webhook/workflow-job-queued.json", "workflow_job").await,
-            @r#"
-        Ok(
-            GitHubWebhook(
-                Repository(
-                    WorkflowJobStarted(
-                        WorkflowJobStarted {
-                            repository: kobzol/bors-kindergarten2,
-                            job_id: JobId(
-                                89214823120,
-                            ),
-                            name: "init",
-                            branch: "automation/bors/try",
-                            commit_sha: CommitSha(
-                                "13e4ae6263d3ffab811a472772e03b7d345e81fb",
-                            ),
-                            run_id: RunId(
-                                30009847987,
-                            ),
-                            labels: [
-                                "ubuntu-latest",
-                            ],
-                        },
-                    ),
-                ),
-            ),
+            @"
+        Err(
+            200,
         )
-        "#
+        "
         );
     }
 
@@ -1876,19 +1811,22 @@ mod tests {
         Ok(
             GitHubWebhook(
                 Repository(
-                    WorkflowJobCompleted(
-                        WorkflowJobCompleted {
+                    CheckRunCompleted(
+                        CheckRunCompleted {
                             repository: kobzol/bors-kindergarten2,
-                            job_id: JobId(
+                            id: CheckRunId(
                                 91138434504,
                             ),
                             name: "init",
-                            branch: "automation/bors/auto",
                             commit_sha: CommitSha(
                                 "a0455bb1ebc7d836b1d0d7acb60700787725ea4e",
                             ),
-                            run_id: RunId(
-                                30625113817,
+                            status: Success,
+                            running_time: Some(
+                                TimeDelta {
+                                    secs: 2,
+                                    nanos: 0,
+                                },
                             ),
                         },
                     ),
