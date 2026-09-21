@@ -1,28 +1,41 @@
-name: Build and Push to Harbor
+name: Build and Deploy
 
 on:
   workflow_dispatch:
   push:
     branches:
+      - carmen/fleet-deploy
+      - automation/bors/auto
       - main
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  GIT_VERSION: ferrous-systems/bors@${{ github.sha }}
+  IMAGE_NAME: ops/bors
+  IMAGE: ${{ vars.REGISTRY }}/ops/bors
 
 jobs:
-  deploy-bors:
-    name: Deploy Bors to Ferrous Systems Harbor
+  deploy-staging:
+    name: Deploy Bors to ferrous-systems-test
     runs-on: ubuntu-latest
-    environment: deployment
+    environment: fleet-deploy
     concurrency:
-      group: deployment
+      group: deploy-staging
       cancel-in-progress: true
-    if: github.repository_owner == 'ferrous-systems'
+    # if: ${{ github.branch }} == 'automation/bors/auto'
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          persist-credentials: true
+
+      # - run: |-
+      #     git config --get user.name
+      #     git config --get user.email
+      #     git checkout -b carmen/weee
+      #     git push origin carmen/weee
 
       - name: Authenticate to Harbor
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
@@ -35,14 +48,82 @@ jobs:
 
       - name: Build and tag the container image
         env:
-          REGISTRY: ${{ vars.REGISTRY }}
-          REPOSITORY: ops/bors
-          IMAGE_TAG: latest
+          IMAGE_TAG: staging
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          tags: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}
+          tags: |
+            ${{ env.IMAGE }}:staging
+            ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
           push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: GIT_VERSION=ferrous-systems/bors@${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:build-cache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:build-cache
+          build-args: GIT_VERSION=${{ env.GIT_VERSION }}
+
+      - name: Deploy to ferrous-systems-test
+        uses: ferrous-systems/shared-github-actions/fleet-deploy@1d0a7ec52a703035257b78e207ec0ec96ec2cae1
+        with:
+          target: ferrous-systems-test
+          patch: |-
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: bors
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: bors
+                      image: ${{ env.IMAGE }}:${{ github.sha }}
+
+
+      # - name: Create the deployment kustomization
+      #   run: |-
+      #     cat >fleet/env.yaml <<-EOF
+      #       apiVersion: apps/v1
+      #     EOF
+
+      # - name: Push to ferrous-systems-test branch
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      #     git checkout -B automation/fleet/ferrous-systems-test
+      #     git add deployment/env.yaml
+      #     git commit -m "Deploy commit ${{ github.sha }}"
+      #     git push --force origin automation/fleet/ferrous-systems-test
+
+      # - name: Wait for ref to deploy
+      #   run: ci/wait-ref-deployed.sh bors-test ${{ env.GIT_VERSION }}
+
+  deploy-production:
+    strategy:
+      matrix:
+        org: [ferrous-systems, ferrocene]
+    name: Deploy Bors to ${{ matrix.org }}
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: fleet-deploy
+    concurrency:
+      group: deploy-production
+      queue: single
+    if: github.branch == 'main' # || github.branch == 'carmen/fleet-deploy'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: automation/fleet/ferrous-systems-test
+
+      - name: Push to ${{ matrix.org }} branch
+        run: |-
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B automation/fleet/${{ matrix.org }}
+          git push --force origin automation/fleet/${{ matrix.org }}
+
+      - name: Wait for ref to deploy
+        run: |-
+          declare -A subdomains
+          subdomains[ferrous-systems]="bors"
+          subdomains[ferrocene]="ferrocene-bors"
+          ci/wait-ref-deployed.sh "${subdomains[${{ matrix.org }}]}" ${{ env.GIT_VERSION }}
