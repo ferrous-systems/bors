@@ -22,6 +22,8 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
+mod approval;
+mod approval_queue;
 mod build;
 mod build_queue;
 mod command;
@@ -39,7 +41,7 @@ pub mod process;
 pub mod unroll_queue;
 
 use crate::PgDbClient;
-use crate::bors::command::BorsCommand;
+use crate::bors::command::{ApproveInfo, BorsCommand};
 use crate::bors::comment::CommentTag;
 use crate::database::{PullRequestModel, WorkflowStatus};
 use crate::github::api::operations::CommitAuthor;
@@ -75,12 +77,13 @@ pub fn format_help() -> &'static str {
     // We do a no-op destructuring of `BorsCommand` to make it harder to modify help in case new
     // commands are added though.
     match BorsCommand::Ping {
-        BorsCommand::Approve {
+        BorsCommand::Approve(ApproveInfo {
             approver: _,
             rollup: _,
             priority: _,
             note: _,
-        } => {}
+            force: _,
+        }) => {}
         BorsCommand::Unapprove => {}
         BorsCommand::Help => {}
         BorsCommand::Ping => {}
@@ -106,19 +109,23 @@ pub fn format_help() -> &'static str {
         BorsCommand::Retry => {}
         BorsCommand::Cancel => {}
         BorsCommand::Squash { .. } => {}
+        BorsCommand::SquashApprove { .. } => {}
     }
 
     r#"
 You can use the following commands:
 
 ## PR management
-- `r+ [p=<priority>] [rollup=<never|iffy|maybe|always>] [note=<note>]`: Approve this PR on your behalf
+- `r+ [p=<priority>] [rollup=<never|iffy|maybe|always>] [force] [note=<note>]`: Approve this PR on your behalf
     - Optionally, you can specify the `<priority>` of the PR and if it is eligible for rollups (`<rollup>)`.
+    - The default is for approvals to remain tentative until PR CI succeeds. Pass `force` to approve the PR immediately.
     - Optionally, you can attach a `<note>` to the PR that will be displayed on the queue page.
-- `r=<user> [p=<priority>] [rollup=<never|iffy|maybe|always>] [note=<note>]`: Approve this PR on behalf of `<user>`
+- `r=<user> [p=<priority>] [rollup=<never|iffy|maybe|always>] [force] [note=<note>]`: Approve this PR on behalf of `<user>`
     - Optionally, you can specify the `<priority>` of the PR and if it is eligible for rollups (`<rollup>)`.
     - You can pass a comma-separated list of GitHub usernames.
+    - The default is for approvals to remain tentative until PR CI succeeds. Pass `force` to approve the PR immediately.
     - Optionally, you can attach a `<note>` to the PR that will be displayed on the queue page.
+- `r+ squash`: Squash the commits of a PR into a single commit, then approve it.
 - `r-`: Unapprove this PR
 - `p=<priority> [note=[<note>]]` | `priority=<priority> [note=[<note>]]`: Set the priority of this PR
     - Optionally, you can attach a `<note>` to the PR that will be displayed on the queue page.
@@ -161,6 +168,13 @@ You can use the following commands:
 
 #[cfg(test)]
 pub static WAIT_FOR_BUILD_QUEUE: TestSyncMarker = TestSyncMarker::new();
+
+#[cfg(test)]
+pub static WAIT_FOR_APPROVAL_QUEUE: TestSyncMarker = TestSyncMarker::new();
+
+/// The approval queue has handled a workflow completed event.
+#[cfg(test)]
+pub static WAIT_FOR_APPROVAL_WORKFLOW_COMPLETED_HANDLED: TestSyncMarker = TestSyncMarker::new();
 
 #[cfg(test)]
 pub static WAIT_FOR_MERGEABILITY_STATUS_REFRESH: TestSyncMarker = TestSyncMarker::new();
@@ -406,8 +420,8 @@ pub fn normalize_merge_message(message: &str) -> String {
 pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: MergeType) -> String {
     use std::fmt::Write;
 
-    /// Prefix used to specify custom try jobs in PR descriptions.
-    const CUSTOM_TRY_JOB_PREFIX: &str = "try-job:";
+    /// Prefixes used to specify custom try jobs in PR descriptions.
+    const CUSTOM_TRY_JOB_PREFIXES: &[&str] = &["try-job:", "try-jobs:"];
 
     let pr_number = pr.number();
 
@@ -428,7 +442,11 @@ pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: Me
             .message
             .lines()
             .map(|l| l.trim())
-            .filter(|l| l.starts_with(CUSTOM_TRY_JOB_PREFIX))
+            .filter(|l| {
+                CUSTOM_TRY_JOB_PREFIXES
+                    .iter()
+                    .any(|prefix| l.starts_with(prefix))
+            })
             .join("\n"),
         // If we do have custom jobs, ignore the original description completely
         MergeType::Try { .. } => String::new(),
@@ -449,7 +467,7 @@ pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: Me
     match merge_type {
         MergeType::Try { try_jobs, nolimit } => {
             for job in try_jobs {
-                write!(message, "\n{CUSTOM_TRY_JOB_PREFIX} {job}").unwrap();
+                write!(message, "\n{} {job}", CUSTOM_TRY_JOB_PREFIXES[0]).unwrap();
             }
             if nolimit {
                 writeln!(message, "\ntry-nolimit").unwrap();

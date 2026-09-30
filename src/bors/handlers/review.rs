@@ -1,10 +1,11 @@
 use crate::bors::RepositoryState;
+use crate::bors::approval::{ApprovalNote, PrCiStatus, get_pr_ci_status};
 use crate::bors::command::{Approver, CommandPrefix, Delegatee};
 use crate::bors::command::{DelegateCommand, RollupMode};
 use crate::bors::comment::{
     approve_blocking_labels_present, approve_merge_conflict_comment, approve_non_open_pr_comment,
     approve_wip_title, approved_comment, delegate_comment, delegate_try_builds_comment,
-    unapprove_non_open_pr_comment, unapprove_not_approved,
+    tentative_approval_failed_comment, unapprove_non_open_pr_comment, unapprove_not_approved,
 };
 use crate::bors::handlers::{InvalidationInfo, InvalidationReason, PullRequestData, deny_request};
 use crate::bors::handlers::{has_permission, invalidate_pr};
@@ -12,9 +13,9 @@ use crate::bors::labels::handle_label_trigger;
 use crate::bors::merge_queue::MergeQueueSender;
 use crate::bors::{Comment, PullRequestStatus};
 use crate::database::DelegatedPermission;
-use crate::database::{ApprovalInfo, PullRequestModel};
+use crate::database::{ApprovalInfo, ApprovalMode, PullRequestModel};
 use crate::database::{MergeableState, TreeState};
-use crate::github::{CommitSha, LabelTrigger, PullRequest};
+use crate::github::{CommitSha, LabelTrigger, PullRequest, PullRequestInfo};
 use crate::github::{GithubUser, PullRequestNumber};
 use crate::permissions::PermissionType;
 use crate::{BorsContext, PgDbClient, ZulipClient};
@@ -26,7 +27,7 @@ use tracing::log;
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn command_approve(
     ctx: Arc<BorsContext>,
-    repo_state: Arc<RepositoryState>,
+    repo: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -34,24 +35,18 @@ pub(super) async fn command_approve(
     priority: Option<u32>,
     rollup_mode: Option<RollupMode>,
     note: Option<String>,
+    approval_mode: ApprovalMode,
     merge_queue_tx: &MergeQueueSender,
+    sha: CommitSha,
 ) -> anyhow::Result<()> {
     tracing::info!("Approving PR {}", pr.number());
-    if !has_permission(&repo_state, author, pr, PermissionType::Review).await? {
-        deny_request(
-            &repo_state,
-            &db,
-            pr.number(),
-            author,
-            PermissionType::Review,
-        )
-        .await?;
+    if !has_permission(&repo, author, pr, PermissionType::Review).await? {
+        deny_request(&repo, &db, pr.number(), author, PermissionType::Review).await?;
         return Ok(());
     };
 
-    if let Some(error_comment) = check_pr_approval_validity(pr, &repo_state).await? {
-        repo_state
-            .client
+    if let Some(error_comment) = check_pr_approval_validity(pr, &repo).await? {
+        repo.client
             .post_comment(pr.number(), error_comment, &db)
             .await?;
         return Ok(());
@@ -61,48 +56,79 @@ pub(super) async fn command_approve(
         && rollup_mode != RollupMode::Never
         && db.is_rollup(pr.db).await?
     {
-        repo_state
-            .client
+        repo.client
             .post_comment(pr.number(), rollup_pr_invalid_rollup_mode_comment(), &db)
             .await?;
         return Ok(());
     }
 
-    let (approver, unknown_reviewers) = match approver {
-        Approver::Myself => (author.username.clone(), Vec::new()),
-        Approver::Specified(approver) => {
-            let normalized = normalize_approvers(approver);
-            let unknown = check_unknown_reviewers(&repo_state, &normalized).await;
-            (normalized.join(","), unknown)
-        }
+    let approver = match approver {
+        Approver::Myself => author.username.clone(),
+        Approver::Specified(approver) => normalize_approvers(approver).join(","),
     };
 
     let approval_info = ApprovalInfo {
         approver: approver.clone(),
-        sha: pr.github.head.sha.to_string(),
+        sha: sha.to_string(),
     };
 
-    db.approve(pr.db, approval_info, priority, rollup_mode, note)
-        .await?;
+    let pr_ci_status = get_pr_ci_status(&repo, pr.github).await?;
+    let already_approved = pr.db.is_approved();
 
-    let was_failed = pr
+    // Potentially upgrade the tentative approval to a full approval
+    let approval_mode = match (approval_mode, pr_ci_status) {
+        (ApprovalMode::Eager, _) => approval_mode,
+        // If PR CI is already green, just treat the approval as eager
+        (ApprovalMode::Tentative, PrCiStatus::Success) => ApprovalMode::Eager,
+        // It is possible that the PR was already (fully) approved before.
+        // If we are now doing a tentative approval, we will "upgrade" it to a full approval, which is
+        // usually what the user wants.
+        // This situation should be very rare anyway.
+        (ApprovalMode::Tentative, _) if already_approved => ApprovalMode::Eager,
+        (ApprovalMode::Tentative, PrCiStatus::Failed | PrCiStatus::Pending) => approval_mode,
+    };
+
+    if matches!(approval_mode, ApprovalMode::Tentative)
+        && matches!(pr_ci_status, PrCiStatus::Failed)
+    {
+        repo.client
+            .post_comment(
+                pr.number(),
+                tentative_approval_failed_comment(&pr.github.head.sha),
+                &db,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    db.approve(
+        pr.db,
+        approval_info,
+        approval_mode,
+        priority,
+        rollup_mode,
+        note,
+    )
+    .await?;
+
+    let priority = priority.or(pr.db.priority.map(|p| p as u32));
+
+    let unknown_reviewers = check_unknown_reviewers(&repo, &approver);
+    let had_failed_auto_build = pr
         .db
         .auto_build
         .as_ref()
         .map(|b| b.status.is_failure())
         .unwrap_or(false);
+
     // Re-approval should act as a retry
-    if was_failed {
-        db.clear_auto_build(pr.db).await?;
+    if had_failed_auto_build {
+        ctx.db.clear_auto_build(pr.db).await?;
     }
-
-    let priority = priority.or(pr.db.priority.map(|p| p as u32));
-
-    merge_queue_tx.notify().await?;
 
     let mut tree_state = ctx
         .db
-        .repo_db(repo_state.repository())
+        .get_repository(repo.repository())
         .await?
         .map(|r| r.tree_state.clone())
         .unwrap_or(TreeState::Open);
@@ -118,29 +144,57 @@ pub(super) async fn command_approve(
         tree_state = TreeState::Open;
     }
 
-    repo_state
-        .client
+    let approval_note = if matches!(pr_ci_status, PrCiStatus::Failed) {
+        Some(ApprovalNote::PrCiIsFailing)
+    } else if matches!(approval_mode, ApprovalMode::Tentative) {
+        Some(ApprovalNote::TentativeApproval)
+    } else {
+        None
+    };
+
+    // We send the response comment eagerly, even if the approval is tentative
+    // This is an optimistic happy path, which reduces the total number of sent comments on average
+    // If we only responded with a temporary tentative approval comment, we would then have to
+    // confirm it with another comment once PR CI would succeed.
+    // In this way, we will only send another comment if PR CI fails.
+    repo.client
         .post_comment(
             pr.db.number,
             approved_comment(
                 ctx.get_web_url(),
-                repo_state.repository(),
-                &pr.github.head.sha,
+                repo.repository(),
+                &sha,
                 &approver,
                 unknown_reviewers,
                 tree_state,
-                was_failed,
+                had_failed_auto_build,
+                approval_note,
             ),
-            &db,
+            &ctx.db,
         )
         .await?;
 
+    merge_queue_tx.notify().await?;
+
+    // Eagerly apply label changes, even if we are only in a tentative approval, so that the PR
+    // gets out of the reviewer's GitHub queue
     handle_label_trigger(
-        &repo_state,
-        &pr.github.clone().into(),
+        &repo,
+        &PullRequestInfo::from(pr.github.clone()),
         LabelTrigger::Approved,
     )
     .await
+}
+
+/// Check if the specified approvers exist as GitHub users or teams.
+fn check_unknown_reviewers(repo: &RepositoryState, approvers: &str) -> Vec<String> {
+    let directory = repo.permissions.load();
+
+    approvers
+        .split(',')
+        .filter(|approver| !directory.user_exists(approver) && !directory.team_exists(approver))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Normalize approvers (given after @bors r=) by removing leading @, possibly from multiple
@@ -150,21 +204,6 @@ fn normalize_approvers(approvers: &str) -> Vec<String> {
         .split(',')
         .map(|approver| approver.trim_start_matches('@').to_string())
         .collect::<Vec<String>>()
-}
-
-/// Check if the specified reviewers exist as GitHub users or teams.
-/// Returns comma-separated string of unknown reviewer names, or None if all exist.
-async fn check_unknown_reviewers(
-    repo_state: &RepositoryState,
-    reviewers: &[String],
-) -> Vec<String> {
-    let directory = repo_state.permissions.load();
-
-    reviewers
-        .iter()
-        .filter(|reviewer| !directory.user_exists(reviewer) && !directory.team_exists(reviewer))
-        .cloned()
-        .collect()
 }
 
 /// Keywords that will prevent an approval if they appear in the PR's title.
@@ -656,13 +695,116 @@ mod tests {
                 @"
             :pushpin: Commit pr-1-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             "
             );
 
             ctx.pr(())
                 .await
                 .expect_rollup(None)
+                .expect_approved_by(&User::default_pr_author().name);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn approve_with_passing_ci_is_forced(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            let workflow = ctx.pr_ci_workflow(());
+            ctx.pr_workflow_success(workflow).await?;
+
+            ctx.post_comment("@bors r+").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :pushpin: Commit pr-1-sha has been approved by `default-user`
+
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
+            ");
+
+            ctx.pr(())
+                .await
+                .expect_approved_by(&User::default_pr_author().name);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn approve_with_pending_ci_is_tentative(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.pr_ci_workflow(());
+
+            ctx.post_comment("@bors r+").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :pushpin: Commit pr-1-sha has been tentatively approved by `default-user`
+
+            It will be put into the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository once PR CI succeeds.
+            ");
+
+            ctx.pr(())
+                .await
+                .expect_approver(&User::default_pr_author().name)
+                .expect_tentative_approval();
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn approve_with_pending_ci_applies_options_immediately(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.pr_ci_workflow(());
+
+            ctx.post_comment(r#"@bors r+ p=5 rollup=never note="foo bar""#)
+                .await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.pr(())
+                .await
+                .expect_priority(Some(5))
+                .expect_rollup(Some(RollupMode::Never))
+                .expect_note(Some("foo bar"))
+                .expect_tentative_approval();
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn approve_with_failed_ci_is_immediately_rejected(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            let workflow = ctx.pr_ci_workflow(());
+            ctx.pr_workflow_failure(workflow).await?;
+
+            ctx.post_comment("@bors r+").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :x: Cannot approve commit pr-1-sha, because CI currently fails on this PR. Use `@bors r+ force` to override the PR CI check.
+            ");
+
+            ctx.pr(()).await.expect_unapproved();
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn force_approve_bypasses_failed_ci(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            let workflow = ctx.pr_ci_workflow(());
+            ctx.pr_workflow_failure(workflow).await?;
+
+            ctx.post_comment("@bors r+ force").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :pushpin: Commit pr-1-sha has been approved by `default-user`
+
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
+
+            > [!WARNING]
+            > This PR was force-approved despite failing PR CI.
+            ");
+
+            ctx.pr(())
+                .await
                 .expect_approved_by(&User::default_pr_author().name);
             Ok(())
         })
@@ -704,7 +846,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `user1`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             "
             );
 
@@ -731,7 +873,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `foo`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             "
             );
 
@@ -760,7 +902,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `foo,bar,baz`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             "
             );
 
@@ -780,7 +922,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `nonexistent-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
 
             :warning: The following reviewer(s) could not be found: `nonexistent-user`
             "
@@ -801,7 +943,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `nonexistent-team`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
 
             :warning: The following reviewer(s) could not be found: `nonexistent-team`
             "
@@ -825,7 +967,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `team1`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             "
             );
 
@@ -844,7 +986,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `DEFAULT-USER`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             "
             );
             Ok(())
@@ -893,7 +1035,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
 
             :evergreen_tree: The tree is currently [closed](https://github.com/rust-lang/borstest/pull/1#issuecomment-1) for pull requests below priority 100. This pull request will be tested once the tree is reopened.
             "
@@ -915,7 +1057,7 @@ approved = ["+approved"]
                 @"
             :pushpin: Commit pr-1-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             "
             );
             Ok(())
@@ -988,7 +1130,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 @"
             :pushpin: Commit pr-1-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             ",
             );
             ctx.pr(())
@@ -1069,7 +1211,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
                 :pushpin: Commit pr-1-sha has been approved by `reviewer`
 
-                It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+                It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
                 ");
                 ctx.post_comment("@bors r-").await?;
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
@@ -1177,7 +1319,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             ]
             "#);
 
-            let repo = ctx.db().repo_db(&default_repo_name()).await?;
+            let repo = ctx.db().get_repository(&default_repo_name()).await?;
             assert_eq!(
                 repo.unwrap().tree_state,
                 TreeState::Closed {
@@ -1192,7 +1334,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
 
             Ok(())
         })
-        .await;
+            .await;
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -1220,7 +1362,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             ]
             "#);
 
-            let repo = ctx.db().repo_db(&default_repo_name()).await?;
+            let repo = ctx.db().get_repository(&default_repo_name()).await?;
             assert_eq!(
                 repo.unwrap().tree_state,
                 TreeState::Closed {
@@ -1240,7 +1382,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 @"
             :pushpin: Commit pr-2-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
 
             :evergreen_tree: The tree is currently [closed](https://github.com/rust-lang/borstest/pull/1#issuecomment-1) for pull requests below priority 5. This pull request will be tested once the tree is reopened.
 
@@ -1250,7 +1392,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
 
             Ok(())
         })
-        .await;
+            .await;
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -1285,12 +1427,12 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
             ]
             "#);
 
-            let repo = ctx.db().repo_db(&default_repo_name()).await?;
+            let repo = ctx.db().get_repository(&default_repo_name()).await?;
             assert_eq!(repo.unwrap().tree_state, TreeState::Open);
 
             Ok(())
         })
-        .await;
+            .await;
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -1391,7 +1533,7 @@ approved = { modifications = ["+foo", "+baz"], unless = ["label1", "label2"] }
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
                 :pushpin: Commit pr-1-sha has been approved by `user1`
 
-                It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+                It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
                 ");
 
                 ctx.pr(()).await.expect_approved_by(&user.name);
@@ -2116,6 +2258,23 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn tentative_approval_eagerly_applies_labels(pool: sqlx::PgPool) {
+        let gh = GitHub::default().append_to_default_config(
+            r#"
+[labels]
+approved = ["+approved"]
+"#,
+        );
+        run_test((pool, gh), async |ctx: &mut BorsTester| {
+            ctx.pr_ci_workflow(());
+            ctx.approve(()).await?;
+            ctx.pr(()).await.expect_added_labels(&["approved"]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_running_auto_build_pr_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -2205,7 +2364,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             :pushpin: Commit pr-1-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             ");
             Ok(())
         })
@@ -2223,7 +2382,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             :pushpin: Commit pr-1-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
 
             A failed build status on this PR was cleared due to the approval.
             ");

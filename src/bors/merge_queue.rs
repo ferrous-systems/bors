@@ -9,8 +9,7 @@ use tracing::Instrument;
 use super::{Comment, MergeType, bors_commit_author, create_merge_commit_message};
 use crate::bors::build::load_workflow_runs;
 use crate::bors::build::{
-    StartBuildCheckRun, StartBuildCommit, StartBuildContext, StartBuildError, StartBuildOutcome,
-    start_build,
+    StartBuildCheckRun, StartBuildContext, StartBuildError, StartBuildOutcome, start_build,
 };
 use crate::bors::comment::{
     auto_build_push_failed_comment, auto_build_started_comment, auto_build_succeeded_comment,
@@ -143,7 +142,7 @@ async fn process_repository(
     }
 
     let repo_name = repo.repository();
-    let repo_db = match ctx.db.repo_db(repo_name).await? {
+    let repo_db = match ctx.db.get_repository(repo_name).await? {
         Some(repo) => repo,
         None => {
             tracing::error!("Repository {repo_name} not found");
@@ -212,6 +211,7 @@ async fn process_repository(
                                 QueueStatus::Pending(_, _) => "pending",
                                 QueueStatus::Failed(_, _) => "failed",
                                 QueueStatus::Approved(_) => "approved",
+                                QueueStatus::TentativelyApproved(_) => "waiting for pr ci",
                                 QueueStatus::ReadyForMerge(_, _) => "ready for merge",
                                 QueueStatus::NotOpen => "not open",
                                 QueueStatus::NotApproved => "not approved"
@@ -242,7 +242,10 @@ async fn process_repository(
                 }
             }
             // We got to the end of the merge queue, stop going through the rest of the PRs
-            QueueStatus::NotApproved | QueueStatus::NotOpen | QueueStatus::Failed(..) => break,
+            QueueStatus::TentativelyApproved(_)
+            | QueueStatus::NotApproved
+            | QueueStatus::NotOpen
+            | QueueStatus::Failed(..) => break,
         }
     }
 
@@ -465,14 +468,14 @@ async fn handle_start_auto_build(
                 &ctx.db,
                 pr,
                 &gh_pr,
-                InvalidationInfo::new(InvalidationReason::CommitShaChanged),
+                InvalidationInfo::new(InvalidationReason::CommitShaChanged {
+                    sha: actual.clone(),
+                }),
                 Some(
                     InvalidationComment::new(format!(
                         r#"Commit SHA did not match the approved SHA during a merge attempt.
-Approved commit SHA: {expected_sha}
-Actual head SHA: {actual_sha}"#,
-                        expected_sha = pr.approved_sha().unwrap_or("<missing>").to_owned(),
-                        actual_sha = gh_pr.head.sha
+Approved commit SHA: {approved}
+Actual head SHA: {actual}"#,
                     ))
                     .post_always(),
                 ),
@@ -548,11 +551,13 @@ This rollup has been unapproved."#,
 
             unapprove_pr(repo, &ctx.db, pr, &gh_pr.into()).await?;
             let comment = format!(
-                r#"The bors config at `{CONFIG_FILE_PATH}` is invalid in this PR. Parse error:
+                r#"Merging this PR would produce an invalid bors config at `{CONFIG_FILE_PATH}`:
 
 ```
 {error}
 ```
+
+The pull request has been unapproved.
 "#
             );
             repo.client
@@ -720,25 +725,6 @@ async fn start_auto_build(
         .map_err(StartAutoBuildError::GitHubError)?;
     let head_sha = gh_pr.head.sha.clone();
 
-    let result = sanity_check_config(repo, &head_sha)
-        .await
-        .map_err(StartAutoBuildError::GitHubError)?;
-    match result {
-        ConfigCheckResult::Ok => {}
-        ConfigCheckResult::Missing => {
-            return Err(StartAutoBuildError::SanityCheckFailed {
-                error: SanityCheckError::ConfigMissing,
-                pr: gh_pr,
-            });
-        }
-        ConfigCheckResult::Invalid { error } => {
-            return Err(StartAutoBuildError::SanityCheckFailed {
-                error: SanityCheckError::ConfigInvalid { error },
-                pr: gh_pr,
-            });
-        }
-    }
-
     let pr_data = super::handlers::PullRequestData {
         db: pr,
         github: &gh_pr,
@@ -755,22 +741,30 @@ async fn start_auto_build(
             ci_branch: AUTO_BRANCH_NAME.to_string(),
             base_sha: base_sha.clone(),
             head_sha: head_sha.clone(),
-            build_kind: BuildKind::Auto,
-        },
-        StartBuildCommit {
             message: auto_merge_commit_message,
             author: bors_commit_author(),
+            check_run: Some(StartBuildCheckRun {
+                name: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
+                title: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
+            }),
+            build_kind: BuildKind::Auto,
         },
-        Some(StartBuildCheckRun {
-            name: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
-            title: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
-        }),
         pr,
     )
     .await
     .map_err(|error| match error {
-        StartBuildError::GithubError(error) => StartAutoBuildError::GitHubError(error),
-        StartBuildError::DatabaseError(error) => StartAutoBuildError::DatabaseError(error),
+        StartBuildError::Github(error) => StartAutoBuildError::GitHubError(error),
+        StartBuildError::Database(error) => StartAutoBuildError::DatabaseError(error),
+        StartBuildError::ConfigCheck(error) => StartAutoBuildError::SanityCheckFailed {
+            error: match error {
+                ConfigCheckError::Missing => SanityCheckError::ConfigMissing,
+                ConfigCheckError::Invalid { error } => SanityCheckError::ConfigInvalid { error },
+                ConfigCheckError::Network(error) => {
+                    return StartAutoBuildError::GitHubError(error);
+                }
+            },
+            pr: gh_pr.clone(),
+        },
     })?;
 
     let (build_commit_sha, _) = match build_commit_result {
@@ -796,30 +790,32 @@ async fn start_auto_build(
 }
 
 #[must_use]
-enum ConfigCheckResult {
-    Ok,
+#[derive(Debug)]
+pub enum ConfigCheckError {
     Missing,
     Invalid { error: String },
+    Network(anyhow::Error),
 }
 
 /// Ensures that the commit that we are about to merge has a valid bors config.
-async fn sanity_check_config(
+pub async fn sanity_check_config(
     repo: &RepositoryState,
     commit_sha: &CommitSha,
-) -> anyhow::Result<ConfigCheckResult> {
+) -> Result<(), ConfigCheckError> {
     let config = repo
         .client
         .load_file_at(CONFIG_FILE_PATH, Some(commit_sha.clone()))
-        .await?;
+        .await
+        .map_err(ConfigCheckError::Network)?;
     let Some(config) = config else {
-        return Ok(ConfigCheckResult::Missing);
+        return Err(ConfigCheckError::Missing);
     };
     if let Err(error) = deserialize_config(&config) {
-        Ok(ConfigCheckResult::Invalid {
+        Err(ConfigCheckError::Invalid {
             error: error.to_string(),
         })
     } else {
-        Ok(ConfigCheckResult::Ok)
+        Ok(())
     }
 }
 
@@ -923,7 +919,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::bors::with_mocked_time;
-    use crate::github::CommitSha;
     use crate::github::api::client::HideCommentReason;
     use crate::tests::{BorsBuilder, Commit, GitHub, run_test};
     use crate::tests::{default_branch_name, default_repo_name};
@@ -1621,7 +1616,12 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
     async fn auto_build_missing_config(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
-            ctx.repo().lock().contents.insert(CommitSha(pr.head_sha()), None);
+
+            // The config is checked on the merge commit, but we can't easily "estimate" the merge
+            // commit SHA here, so we set the contents on the `merge` SHA prefix instead.
+            ctx.modify_repo((), |repo| {
+                repo.add_contents_at_sha_prefix("merge", None);
+            });
             ctx.approve(pr.id()).await?;
             ctx.run_merge_queue_now().await;
             insta::assert_snapshot!(ctx.get_next_comment_text(pr.id()).await?, @"The bors config is missing in this PR. Ensure that the config exists at `rust-bors.toml`.");
@@ -1638,14 +1638,13 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
     async fn auto_build_invalid_config(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr = ctx.open_pr((), |_| {}).await?;
-            ctx.repo().lock().contents.insert(
-                CommitSha(pr.head_sha()),
-                Some("[foo bar I am invalid toml!".to_string()),
-            );
+            ctx.modify_repo((), |repo| {
+                repo.add_contents_at_sha_prefix("merge", Some("[foo bar I am invalid toml!"));
+            });
             ctx.approve(pr.id()).await?;
             ctx.run_merge_queue_now().await;
             insta::assert_snapshot!(ctx.get_next_comment_text(pr.id()).await?, @"
-            The bors config at `rust-bors.toml` is invalid in this PR. Parse error:
+            Merging this PR would produce an invalid bors config at `rust-bors.toml`:
 
             ```
             TOML parse error at line 1, column 5
@@ -1655,6 +1654,8 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
             unclosed table, expected `]`
 
             ```
+
+            The pull request has been unapproved.
             ");
             ctx.pr(pr.id())
                 .await
@@ -1739,7 +1740,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
             insta::assert_snapshot!(ctx.get_next_comment_text(pr2.id()).await?, @"
             :pushpin: Commit pr-2-sha has been approved by `default-user`
 
-            It is now in the [queue](https://bors-test.com/queue/borstest) for this repository.
+            It is now in the [queue](https://bors-test.com/queue/rust-lang/borstest) for this repository.
             ");
 
             ctx.start_and_finish_auto_build(pr2.id()).await?;
@@ -2091,6 +2092,25 @@ also include this pls"
             ctx.refresh_prs().await;
 
             ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn tentatively_approved_pr_is_not_merged(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            ctx.pr_ci_workflow(pr2.id());
+
+            // Tentative approval because of the pending PR CI workflow above
+            ctx.approve(pr2.id()).await?;
+
+            // This should not attempt to merge the PR
+            ctx.run_merge_queue_now().await;
+
+            ctx.pr(pr2.id()).await.expect_no_auto_build();
 
             Ok(())
         })
