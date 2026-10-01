@@ -1,3 +1,4 @@
+use crate::bors::approval::ApprovalNote;
 use crate::bors::command::CommandPrefix;
 use crate::bors::{FailedWorkflowRun, WorkflowRun};
 use crate::database::PullRequestModel;
@@ -288,6 +289,7 @@ handled during merge and rebase. This is normal, and you should still perform st
     Comment::new(message).with_tag(CommentTag::MergeConflict)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn approved_comment(
     web_url: &str,
     repo: &GithubRepoName,
@@ -295,27 +297,51 @@ pub fn approved_comment(
     reviewer: &str,
     unknown_reviewers: Vec<String>,
     tree_state: TreeState,
-    was_failed: bool,
+    had_failed_auto_build: bool,
+    note: Option<ApprovalNote>,
 ) -> Comment {
     let approve_emoji = if is_holiday_season() {
         "star2"
     } else {
         "pushpin"
     };
-    let mut comment = format!(
-        r":{approve_emoji}: Commit {commit_sha} has been approved by `{reviewer}`
 
-It is now in the [queue]({web_url}/queue/{}) for this repository.
+    let tentative_approval = matches!(note, Some(ApprovalNote::TentativeApproval));
+    let mut comment = if tentative_approval {
+        format!(
+            r":{approve_emoji}: Commit {commit_sha} has been tentatively approved by `{reviewer}`
+
+It will be put into the [queue]({web_url}/queue/{repo}) for this repository once PR CI succeeds.
 ",
-        repo.name()
-    );
+        )
+    } else {
+        format!(
+            r":{approve_emoji}: Commit {commit_sha} has been approved by `{reviewer}`
 
-    if was_failed {
+It is now in the [queue]({web_url}/queue/{repo}) for this repository.
+",
+        )
+    };
+
+    if had_failed_auto_build {
         writeln!(
             comment,
             "\nA failed build status on this PR was cleared due to the approval."
         )
         .unwrap();
+    }
+
+    if let Some(note) = note {
+        match note {
+            ApprovalNote::PrCiIsFailing => {
+                writeln!(
+                    comment,
+                    "\n> [!WARNING]\n> This PR was force-approved despite failing PR CI."
+                )
+                .unwrap();
+            }
+            ApprovalNote::TentativeApproval => {}
+        }
     }
 
     if !unknown_reviewers.is_empty() {
@@ -350,6 +376,25 @@ Reason for tree closure: `{reason}`
     }
 
     Comment::new(comment)
+}
+
+pub fn tentative_approval_removed_comment(commit_sha: &CommitSha) -> Comment {
+    Comment::new(format!(
+        ":x: Commit {commit_sha} has been unapproved due to PR CI failure. Reapprove it with `@bors r+ force` if you want to ignore the failure."
+    ))
+}
+
+pub fn tentative_approval_timed_out_comment(commit_sha: &CommitSha, timeout: Duration) -> Comment {
+    Comment::new(format!(
+        ":x: Commit {commit_sha} has been unapproved because PR CI timed out after `{}s`.",
+        timeout.as_secs()
+    ))
+}
+
+pub fn tentative_approval_failed_comment(commit_sha: &CommitSha) -> Comment {
+    Comment::new(format!(
+        ":x: Cannot approve commit {commit_sha}, because CI currently fails on this PR. Use `@bors r+ force` to override the PR CI check."
+    ))
 }
 
 pub fn approve_non_open_pr_comment() -> Comment {

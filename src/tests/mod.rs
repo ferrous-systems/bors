@@ -1,7 +1,7 @@
 use crate::bors::{
-    CommandPrefix, PullRequestStatus, RollupMode, WAIT_FOR_BUILD_QUEUE, WAIT_FOR_CONFIG_REFRESH,
-    WAIT_FOR_MERGE_QUEUE, WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT, WAIT_FOR_MERGEABILITY_STATUS_REFRESH,
-    WAIT_FOR_PR_STATUS_REFRESH, WAIT_FOR_WEBHOOK_COMPLETED,
+    CommandPrefix, PullRequestStatus, RollupMode, WAIT_FOR_APPROVAL_QUEUE, WAIT_FOR_BUILD_QUEUE,
+    WAIT_FOR_CONFIG_REFRESH, WAIT_FOR_MERGE_QUEUE, WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT,
+    WAIT_FOR_MERGEABILITY_STATUS_REFRESH, WAIT_FOR_PR_STATUS_REFRESH, WAIT_FOR_WEBHOOK_COMPLETED,
 };
 use crate::database::{
     BuildModel, BuildStatus, DelegatedPermission, DelegationStatus, MergeableState,
@@ -310,11 +310,21 @@ impl BorsTester {
     }
 
     pub fn try_workflow(&self) -> RunId {
-        self.create_workflow(default_repo_name(), TRY_BRANCH)
+        self.create_workflow(default_repo_name(), TRY_BRANCH, "push")
     }
 
     pub fn auto_workflow(&self) -> RunId {
-        self.create_workflow(default_repo_name(), AUTO_BRANCH)
+        self.create_workflow(default_repo_name(), AUTO_BRANCH, "push")
+    }
+
+    pub fn pr_ci_workflow<Id: Into<PrIdentifier>>(&self, id: Id) -> RunId {
+        let id = id.into();
+        let head_branch = self
+            .get_repo(&id.repo)
+            .lock()
+            .get_pr(id.number)
+            .head_branch_copy();
+        self.create_workflow(&id.repo, head_branch.name(), "pull_request")
     }
 
     /// Creates N unrolled workflows, for the past N commits pushed to the unrolled branch.
@@ -337,7 +347,7 @@ impl BorsTester {
         );
         let mut workflows = vec![];
         for commit in branch.get_commit_history().into_iter().rev().take(n).rev() {
-            let workflow = self.create_workflow(&repo_name, UNROLLED_BRANCH);
+            let workflow = self.create_workflow(&repo_name, UNROLLED_BRANCH, "push");
             // Overwrite the SHA of the workflow
             self.modify_workflow(workflow, |w| w.set_head_sha(commit.sha()));
             workflows.push(workflow);
@@ -345,9 +355,14 @@ impl BorsTester {
         workflows
     }
 
-    pub fn create_workflow<Id: Into<RepoIdentifier>>(&self, id: Id, branch: &str) -> RunId {
+    pub fn create_workflow<Id: Into<RepoIdentifier>>(
+        &self,
+        id: Id,
+        branch: &str,
+        event: &str,
+    ) -> RunId {
         let mut gh = self.github.lock();
-        gh.new_workflow(&id.into().0, branch)
+        gh.new_workflow(&id.into().0, branch, event)
     }
 
     pub fn modify_workflow<F: FnOnce(&mut WorkflowRun)>(&mut self, run_id: RunId, func: F) {
@@ -601,6 +616,22 @@ impl BorsTester {
         .unwrap();
     }
 
+    pub async fn refresh_tentative_approvals(&self) {
+        wait_for_marker(
+            async || {
+                self.global_tx
+                    .send(BorsGlobalEvent::RefreshTentativeApprovals)
+                    .await
+                    .unwrap();
+                Ok(())
+            },
+            self.wait_for_markers,
+            &WAIT_FOR_APPROVAL_QUEUE,
+        )
+        .await
+        .unwrap();
+    }
+
     /// Trigger and process a single unroll queue event.
     pub async fn trigger_and_run_unroll_queue(&mut self) -> anyhow::Result<()> {
         self.senders
@@ -789,6 +820,16 @@ impl BorsTester {
     pub async fn workflow_full_failure(&mut self, run_id: RunId) -> anyhow::Result<()> {
         self.workflow_full(run_id, TestWorkflowStatus::Failure)
             .await
+    }
+
+    /// Complete a PR workflow without sending its ignored start webhook.
+    pub async fn pr_workflow_success(&mut self, run_id: RunId) -> anyhow::Result<()> {
+        self.workflow_event(WorkflowEvent::success(run_id)).await
+    }
+
+    /// Fail a PR workflow without sending its ignored start webhook.
+    pub async fn pr_workflow_failure(&mut self, run_id: RunId) -> anyhow::Result<()> {
+        self.workflow_event(WorkflowEvent::failure(run_id)).await
     }
 
     /// Creates a new PR and sends a webhook about its creation.
@@ -984,6 +1025,23 @@ impl BorsTester {
             pr.mergeable_state = OctocrabMergeableState::Unknown;
             let pr = pr.clone();
             GitHubPullRequestEventPayload::new(&repo, &gh, pr, "synchronize", None)
+        };
+
+        self.send_webhook("pull_request", payload).await
+    }
+
+    /// Sends commit push webhook for the HEAD commit of the PR identified by `id`.
+    pub async fn send_push_webhook<Id: Into<PrIdentifier>>(
+        &mut self,
+        id: Id,
+    ) -> anyhow::Result<()> {
+        let id = id.into();
+        let payload = {
+            let gh = self.github.lock();
+            let repo = gh.get_repo(&id.repo);
+            let repo = repo.lock();
+            let pr = repo.pulls().get(&id.number).expect("PR not found");
+            GitHubPullRequestEventPayload::new(&repo, &gh, pr.clone(), "synchronize", None)
         };
 
         self.send_webhook("pull_request", payload).await
@@ -1558,7 +1616,19 @@ impl PullRequestProxy {
 
     #[track_caller]
     pub fn expect_approved_by(&self, approved_by: &str) -> &Self {
-        assert_eq!(self.require_db_pr().approver(), Some(approved_by));
+        assert!(self.require_db_pr().is_approved());
+        self.expect_approver(approved_by)
+    }
+
+    #[track_caller]
+    pub fn expect_approver(&self, approver: &str) -> &Self {
+        assert_eq!(self.require_db_pr().approver(), Some(approver));
+        self
+    }
+
+    #[track_caller]
+    pub fn expect_tentative_approval(&self) -> &Self {
+        assert!(self.require_db_pr().tentative_approval().is_some());
         self
     }
 

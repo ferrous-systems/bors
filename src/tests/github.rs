@@ -247,13 +247,14 @@ impl GitHub {
         );
     }
 
-    pub fn new_workflow(&mut self, repo: &GithubRepoName, branch: &str) -> RunId {
+    pub fn new_workflow(&mut self, repo: &GithubRepoName, branch: &str, event: &str) -> RunId {
         let repo = self.get_repo(repo);
         let mut repo = repo.lock();
         let branch = repo.get_branch_by_name(branch).expect("Branch not found");
         self.workflow_run_id_counter += 1;
         let run_id = RunId(self.workflow_run_id_counter);
-        let workflow = WorkflowRun::new(run_id, branch);
+        let mut workflow = WorkflowRun::new(run_id, branch);
+        workflow.set_event(event);
         repo.workflow_runs.push(workflow);
         run_id
     }
@@ -381,6 +382,8 @@ pub struct Repo {
     pub workflow_cancel_error: bool,
     /// All workflows that we know about from the side of the test.
     workflow_runs: Vec<WorkflowRun>,
+    /// Treat unconfigured PR CI as successful.
+    pub default_pr_ci: bool,
     pull_requests: HashMap<u64, PullRequest>,
     check_runs: Vec<CheckRunData>,
     /// Cause pull request fetch to fail.
@@ -389,7 +392,9 @@ pub struct Repo {
     pub push_behaviour: BranchPushBehaviour,
     pub fork_of: Option<Arc<Mutex<Repo>>>,
     pub merge_behavior: MergeBehavior,
-    pub contents: HashMap<CommitSha, Option<String>>,
+    /// File (or its absence) that will be returned if someone asks for contents on a SHA that
+    /// **begins** with the key in this map.
+    contents: Vec<(String, Option<String>)>,
 }
 
 impl Repo {
@@ -405,6 +410,7 @@ impl Repo {
             workflows_cancelled_by_bors: vec![],
             workflow_cancel_error: false,
             workflow_runs: vec![],
+            default_pr_ci: true,
             pull_request_error: false,
             check_runs: vec![],
             push_behaviour: BranchPushBehaviour::default(),
@@ -447,6 +453,23 @@ impl Repo {
     pub fn with_user_perms(mut self, user: User, permissions: &[PermissionType]) -> Self {
         self.permissions.users.insert(user, permissions.to_vec());
         self
+    }
+
+    /// Return a file that was asked on the given `sha`.
+    /// Note: completely ignores the path of the file!
+    pub fn get_contents_at_sha_prefix(&self, sha: &str) -> Option<Option<&str>> {
+        self.contents.iter().find_map(|(sha_prefix, file)| {
+            if sha.starts_with(sha_prefix) {
+                Some(file.as_deref())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn add_contents_at_sha_prefix(&mut self, sha_prefix: &str, contents: Option<&str>) {
+        self.contents
+            .push((sha_prefix.to_string(), contents.map(|s| s.to_string())))
     }
 
     pub fn add_pr(&mut self, author: User) -> &mut PullRequest {
@@ -1140,7 +1163,7 @@ pub struct WorkflowRun {
 }
 
 impl WorkflowRun {
-    fn new(run_id: RunId, branch: &Branch) -> Self {
+    pub(super) fn new(run_id: RunId, branch: &Branch) -> Self {
         Self {
             status: WorkflowStatus::Pending,
             name: "Workflow1".to_string(),

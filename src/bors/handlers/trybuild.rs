@@ -5,8 +5,7 @@ use super::{PullRequestData, deny_request};
 use crate::PgDbClient;
 use crate::bors::build::{CancelBuildConclusion, CancelBuildError, cancel_build};
 use crate::bors::build::{
-    StartBuildCheckRun, StartBuildCommit, StartBuildContext, StartBuildError, StartBuildOutcome,
-    start_build,
+    StartBuildCheckRun, StartBuildContext, StartBuildError, StartBuildOutcome, start_build,
 };
 use crate::bors::command::{CommandPrefix, Parent};
 use crate::bors::comment::try_build_cancelled_with_failed_workflow_cancel_comment;
@@ -115,9 +114,6 @@ pub(super) async fn command_try_build(
                     ci_branch: TRY_BRANCH_NAME.to_string(),
                     base_sha: base_sha.clone(),
                     head_sha: pr.github.head.sha.clone(),
-                    build_kind: BuildKind::Try,
-                },
-                StartBuildCommit {
                     message: create_merge_commit_message(
                         pr,
                         MergeType::Try {
@@ -126,17 +122,19 @@ pub(super) async fn command_try_build(
                         },
                     ),
                     author: bors_commit_author(),
+                    check_run: Some(StartBuildCheckRun {
+                        name: TRY_BUILD_CHECK_RUN_NAME.to_string(),
+                        title: TRY_BUILD_CHECK_RUN_NAME.to_string(),
+                    }),
+                    build_kind: BuildKind::Try,
                 },
-                Some(StartBuildCheckRun {
-                    name: TRY_BUILD_CHECK_RUN_NAME.to_string(),
-                    title: TRY_BUILD_CHECK_RUN_NAME.to_string(),
-                }),
                 pr.db,
             )
             .await
             .map_err(|error| match error {
-                StartBuildError::GithubError(error) | StartBuildError::DatabaseError(error) => {
-                    error
+                StartBuildError::Github(error) | StartBuildError::Database(error) => error,
+                StartBuildError::ConfigCheck(error) => {
+                    anyhow::anyhow!("Invalid bors config: {error:?}")
                 }
             })?;
 
@@ -444,6 +442,7 @@ It fixes so many issues, sir."
                 pr.description = r"This is a very good PR.
 
 try-job: Foo
+try-jobs: Bar
 
 It fixes so many issues, sir.
 
@@ -462,6 +461,7 @@ try-job: Bar
             Title of PR 1
 
             try-job: Foo
+            try-jobs: Bar
             try-job: Bar
             ");
             Ok(())

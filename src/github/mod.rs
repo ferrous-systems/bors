@@ -257,7 +257,7 @@ impl From<octocrab::models::pulls::PullRequest> for PullRequest {
                 .collect(),
             html_url: pr.html_url,
             commit_count: pr.commits.unwrap_or(0),
-            editable_by_maintainers: pr.maintainer_can_modify,
+            editable_by_maintainers: pr.maintainer_can_modify.unwrap_or(false),
         }
     }
 }

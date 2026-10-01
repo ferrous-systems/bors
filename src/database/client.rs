@@ -1,22 +1,23 @@
 use super::operations::{
-    approve_pull_request, clear_auto_build, create_build, create_workflow, delegate_pull_request,
-    delete_tagged_bot_comment, find_build, find_pr_by_build, find_rollups_for_member_pr,
-    get_last_n_successful_auto_builds, get_nonclosed_pull_requests, get_nonclosed_rollups,
-    get_pending_builds, get_prs_with_stale_mergeability_or_approved, get_pull_request,
-    get_pull_request_by_id, get_repository, get_repository_by_name, get_rollup_members,
-    get_rollup_members_for_unrolling, get_tagged_bot_comments, get_workflow_urls_for_build,
-    get_workflows_for_build, insert_repo_if_not_exists, is_rollup, record_tagged_bot_comment,
-    register_rollup_pr_member, set_pr_assignees, set_pr_mergeability_state, set_pr_priority,
-    set_pr_rollup_mode, set_pr_status, set_rollup_member_unrolled_state,
-    set_rollup_members_unrolled_state, set_stale_mergeability_status_by_base_branch,
-    unapprove_pull_request, undelegate_all, undelegate_pull_request, update_build,
+    approve_pull_request, clear_auto_build, confirm_tentative_approval, create_build,
+    create_workflow, delegate_pull_request, delete_tagged_bot_comment, find_build,
+    find_pr_by_build, find_rollups_for_member_pr, get_last_n_successful_auto_builds,
+    get_nonclosed_pull_requests, get_nonclosed_rollups, get_pending_builds,
+    get_prs_with_stale_mergeability_or_approved, get_pull_request, get_pull_request_by_id,
+    get_repository, get_rollup_members, get_rollup_members_for_unrolling, get_tagged_bot_comments,
+    get_workflow_urls_for_build, get_workflows_for_build, insert_repo_if_not_exists, is_rollup,
+    record_tagged_bot_comment, register_rollup_pr_member, set_pr_assignees,
+    set_pr_mergeability_state, set_pr_priority, set_pr_rollup_mode, set_pr_status,
+    set_rollup_member_unrolled_state, set_rollup_members_unrolled_state,
+    set_stale_mergeability_status_by_base_branch, unapprove_pull_request,
+    unapprove_pull_request_if_sha_changed, undelegate_all, undelegate_pull_request, update_build,
     update_pr_auto_build_id, update_pr_try_build_id, update_pr_unrolled_build_id,
     update_workflow_status, upsert_pull_request, upsert_repository,
 };
 use super::{
-    ApprovalInfo, DelegatedPermission, MergeableState, PrimaryKey, RegisterRollupMemberParams,
-    RollupMember, RollupMemberForUnrolling, RunId, UnrollState, UpdateBuildParams,
-    UpsertPullRequestParams,
+    ApprovalInfo, ApprovalMode, DelegatedPermission, MergeableState, PrimaryKey,
+    RegisterRollupMemberParams, RollupMember, RollupMemberForUnrolling, RunId, UnrollState,
+    UpdateBuildParams, UpsertPullRequestParams,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -100,16 +101,41 @@ impl PgDbClient {
         &self,
         pr: &PullRequestModel,
         approval_info: ApprovalInfo,
+        approval_mode: ApprovalMode,
         priority: Option<u32>,
         rollup: Option<RollupMode>,
         note: Option<String>,
     ) -> anyhow::Result<()> {
-        approve_pull_request(&self.pool, pr.id, approval_info, priority, rollup, note).await
+        approve_pull_request(
+            &self.pool,
+            pr.id,
+            approval_info,
+            approval_mode,
+            priority,
+            rollup,
+            note,
+        )
+        .await
+    }
+
+    pub async fn confirm_tentative_approval(&self, pr: &PullRequestModel) -> anyhow::Result<()> {
+        confirm_tentative_approval(&self.pool, pr.id).await
     }
 
     /// Unapprove a pull request and remove its auto build status, if there is any attached.
     pub async fn unapprove(&self, pr: &PullRequestModel) -> anyhow::Result<()> {
         unapprove_pull_request(&self.pool, pr.id).await
+    }
+
+    /// Unapprove a pull request and remove its auto build status, if there is any attached.
+    /// Only do it if `sha` wasn't already approved.
+    /// Returns true if the PR was actually unapproved.
+    pub async fn unapprove_if_sha_changed(
+        &self,
+        pr: &PullRequestModel,
+        sha: &CommitSha,
+    ) -> anyhow::Result<bool> {
+        unapprove_pull_request_if_sha_changed(&self.pool, pr.id, sha).await
     }
 
     pub async fn clear_auto_build(&self, pr: &PullRequestModel) -> anyhow::Result<()> {
@@ -381,7 +407,7 @@ impl PgDbClient {
         Ok(workflows)
     }
 
-    pub async fn repo_db(&self, repo: &GithubRepoName) -> anyhow::Result<Option<RepoModel>> {
+    pub async fn get_repository(&self, repo: &GithubRepoName) -> anyhow::Result<Option<RepoModel>> {
         get_repository(&self.pool, repo).await
     }
 
@@ -391,10 +417,6 @@ impl PgDbClient {
         tree_state: TreeState,
     ) -> anyhow::Result<()> {
         insert_repo_if_not_exists(&self.pool, repo, tree_state).await
-    }
-
-    pub async fn repo_by_name(&self, repo_name: &str) -> anyhow::Result<Option<RepoModel>> {
-        get_repository_by_name(&self.pool, repo_name).await
     }
 
     pub async fn upsert_repository(

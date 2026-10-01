@@ -1,9 +1,10 @@
 use crate::PgDbClient;
+use crate::bors::merge_queue::{ConfigCheckError, sanity_check_config};
 use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
 use crate::database::{
     BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams, WorkflowModel,
 };
-use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
+use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient, WorkflowSource};
 use crate::github::api::operations::{CommitAuthor, ForcePush};
 use crate::github::{CommitSha, MergeResult, attempt_merge};
 use octocrab::models::CheckRunId;
@@ -126,7 +127,7 @@ pub async fn load_workflow_runs(
     // This tells us for how many workflow runs we should wait.
     let mut workflow_runs: Vec<WorkflowRun> = repo
         .client
-        .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+        .get_workflow_runs_for_commit_sha(WorkflowSource::Push(CommitSha(build.commit_sha.clone())))
         .await?;
     tracing::debug!("Workflow runs from GitHub: {workflow_runs:?}");
 
@@ -180,12 +181,13 @@ pub struct StartBuildContext {
     pub base_sha: CommitSha,
     /// PR head SHA.
     pub head_sha: CommitSha,
-    pub build_kind: BuildKind,
-}
-
-pub struct StartBuildCommit {
+    /// Commit message.
     pub message: String,
+    /// Commit author.
     pub author: CommitAuthor,
+    /// Optional information to start a check run on the merged commit.
+    pub check_run: Option<StartBuildCheckRun>,
+    pub build_kind: BuildKind,
 }
 
 /// Check run shown in the GitHub UI checks tab.
@@ -205,9 +207,11 @@ pub enum StartBuildOutcome {
 
 pub enum StartBuildError {
     /// GitHub API error.
-    GithubError(anyhow::Error),
+    Github(anyhow::Error),
     /// Database error while recording the started build.
-    DatabaseError(anyhow::Error),
+    Database(anyhow::Error),
+    /// A config check on an auto build has failed.
+    ConfigCheck(ConfigCheckError),
 }
 
 /// Start a build by preparing a commit, pushing it to CI, and recording the build.
@@ -223,8 +227,6 @@ pub async fn start_build(
     repo: &RepositoryState,
     proof: &ExclusiveLockProof,
     context: StartBuildContext,
-    commit: StartBuildCommit,
-    check_run: Option<StartBuildCheckRun>,
     pr: &PullRequestModel,
 ) -> Result<StartBuildOutcome, StartBuildError> {
     let StartBuildContext {
@@ -232,9 +234,11 @@ pub async fn start_build(
         ci_branch,
         base_sha,
         head_sha,
+        message,
+        author,
+        check_run,
         build_kind,
     } = context;
-    let StartBuildCommit { message, author } = commit;
 
     // First, create the merge result commit on the merge branch.
     // Use a temporary message to not reference/spam any issue.
@@ -247,11 +251,21 @@ pub async fn start_build(
         proof,
     )
     .await
-    .map_err(StartBuildError::GithubError)?
+    .map_err(StartBuildError::Github)?
     {
         MergeResult::Success(commit) => commit,
         MergeResult::Conflict => return Ok(StartBuildOutcome::MergeConflict),
     };
+
+    // Perform a sanity check on the merged commit if we are doing an auto build
+    // We need to perform the check *after-merge*, which is why the check is here, even though
+    // it really belongs to the `merge_queue` module.
+    // But parametrizing `BuildStartContext` with an async function isn't very pretty.
+    if build_kind == BuildKind::Auto
+        && let Err(error) = sanity_check_config(repo, &merged_commit.sha).await
+    {
+        return Err(StartBuildError::ConfigCheck(error));
+    }
 
     // Then, create the actual merge commit with an explicit author, so that we can override
     // the author information to the bors account, to keep compatibility with various tools
@@ -265,13 +279,13 @@ pub async fn start_build(
             &author,
         )
         .await
-        .map_err(|error| StartBuildError::GithubError(error.into()))?;
+        .map_err(|error| StartBuildError::Github(error.into()))?;
 
     // Push the build commit to the CI branch where workflows run.
     repo.client
         .set_branch_to_sha(&ci_branch, &build_commit_sha, ForcePush::Yes)
         .await
-        .map_err(|error| StartBuildError::GithubError(error.into()))?;
+        .map_err(|error| StartBuildError::Github(error.into()))?;
 
     // Record the build.
     let build_id = match build_kind {
@@ -303,7 +317,7 @@ pub async fn start_build(
             .await
         }
     }
-    .map_err(StartBuildError::DatabaseError)?;
+    .map_err(StartBuildError::Database)?;
 
     if let Some(check_run) = check_run {
         // Create a check run to track the build status in GitHub's UI.

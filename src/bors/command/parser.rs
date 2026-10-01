@@ -1,7 +1,8 @@
 //! Defines parsers for bors commands.
 
 use crate::bors::command::{
-    Approver, BorsCommand, CommandPrefix, DelegateCommand, Delegatee, Parent, SquashCommitMessage,
+    ApproveInfo, Approver, BorsCommand, CommandPrefix, DelegateCommand, Delegatee, Parent,
+    SquashCommitMessage,
 };
 use crate::database::DelegatedPermission;
 use crate::github::CommitSha;
@@ -23,7 +24,7 @@ pub enum CommandParseError {
 }
 
 /// Part of a command, either a bare string like `try` or a key value like `parent=<sha>`.
-#[derive(PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 enum CommandPart<'a> {
     Bare(&'a str),
     KeyValue { key: &'a str, value: &'a str },
@@ -264,9 +265,14 @@ fn parse_parts(input: &str) -> Result<Vec<CommandPart<'_>>, CommandParseError> {
 }
 
 /// Parses:
-/// - "@bors r+ [p=<priority>] [rollup=<never|iffy|maybe|always>] [note=<note>]"
-/// - "@bors r=<user> [p=<priority>] [rollup=<never|iffy|maybe|always>] [note=<note>]"
+/// - "@bors r+ [p=<priority>] [rollup=<never|iffy|maybe|always>] [force] [note=<note>]"
+/// - "@bors r=<user> [p=<priority>] [rollup=<never|iffy|maybe|always>] [force] [note=<note>]"
 fn parser_approval(command: &CommandPart<'_>, parts: &[CommandPart<'_>]) -> ParseResult {
+    let also_squash = parts
+        .iter()
+        .position(|x| *x == CommandPart::Bare("squash"))
+        .map(|x| &parts[x..]);
+
     let approver = match command {
         CommandPart::Bare("r+") => Approver::Myself,
         CommandPart::KeyValue { key: "r", value } => {
@@ -297,12 +303,55 @@ fn parser_approval(command: &CommandPart<'_>, parts: &[CommandPart<'_>]) -> Pars
             _ => None,
         })
         .next();
-    Some(Ok(BorsCommand::Approve {
+    let force = parts
+        .iter()
+        .any(|part| matches!(part, CommandPart::Bare("force")));
+
+    // parse the squash part of the approve_squash command
+    if let Some(also_squash) = also_squash {
+        let filter_priority = ["r", "rollup", "p", "priority", "force", "note"];
+
+        let also_squash: Vec<CommandPart> = also_squash
+            .iter()
+            .filter(|x| !filter_priority.contains(&x.as_key()))
+            .copied()
+            .collect();
+
+        let val = parser_squash(&also_squash[0], &also_squash[1..]).unwrap();
+
+        match val {
+            Ok(val) => match val {
+                BorsCommand::Squash { commit_message, .. } => {
+                    return Some(Ok(BorsCommand::SquashApprove {
+                        commit_message,
+                        approval_info: ApproveInfo {
+                            approver,
+                            priority,
+                            rollup,
+                            note,
+                            force,
+                        },
+                    }));
+                }
+                _ => unreachable!(),
+            },
+            Err(_) => {
+                return Some(Err(CommandParseError::UnknownArg {
+                    arg: also_squash[1].as_key().to_owned(),
+                    did_you_mean: "r+ squash [msg|message=\"<commit-msg>\"|description]"
+                        .to_string(),
+                }));
+            }
+        }
+    }
+
+    Some(Ok(BorsCommand::Approve(ApproveInfo {
         approver,
         priority,
         rollup,
         note,
-    }))
+        force,
+    })))
 }
 
 /// Parses "@bors r-"
@@ -672,8 +721,8 @@ fn parser_squash(command: &CommandPart<'_>, parts: &[CommandPart<'_>]) -> ParseR
 
 #[cfg(test)]
 mod tests {
-    use crate::bors::command::BorsCommand;
     use crate::bors::command::parser::{CommandParseError, CommandParser};
+    use crate::bors::command::{ApproveInfo, Approver, BorsCommand};
 
     #[test]
     fn no_commands() {
@@ -723,18 +772,36 @@ mod tests {
     #[test]
     fn parse_default_approve() {
         let cmds = parse_commands("@bors r+");
-        insta::assert_debug_snapshot!(cmds, @"
+        insta::assert_debug_snapshot!(cmds, @r"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: None,
-                    rollup: None,
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         ");
+    }
+
+    #[test]
+    fn parse_force_approve() {
+        let cmds = parse_commands("@bors r+ force p=1");
+        assert_eq!(
+            cmds,
+            vec![Ok(BorsCommand::Approve(ApproveInfo {
+                approver: Approver::Myself,
+                priority: Some(1),
+                rollup: None,
+                note: None,
+                force: true,
+            }))]
+        );
     }
 
     #[test]
@@ -743,14 +810,17 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         insta::assert_debug_snapshot!(cmds[0], @r#"
         Ok(
-            Approve {
-                approver: Specified(
-                    "user1",
-                ),
-                priority: None,
-                rollup: None,
-                note: None,
-            },
+            Approve(
+                ApproveInfo {
+                    approver: Specified(
+                        "user1",
+                    ),
+                    priority: None,
+                    rollup: None,
+                    note: None,
+                    force: false,
+                },
+            ),
         )
         "#);
     }
@@ -761,14 +831,17 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         insta::assert_debug_snapshot!(cmds[0], @r#"
         Ok(
-            Approve {
-                approver: Specified(
-                    "user1,user2",
-                ),
-                priority: None,
-                rollup: None,
-                note: None,
-            },
+            Approve(
+                ApproveInfo {
+                    approver: Specified(
+                        "user1,user2",
+                    ),
+                    priority: None,
+                    rollup: None,
+                    note: None,
+                    force: false,
+                },
+            ),
         )
         "#);
     }
@@ -805,14 +878,17 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: Some(
-                        1,
-                    ),
-                    rollup: None,
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: Some(
+                            1,
+                        ),
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         ");
@@ -824,16 +900,19 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Specified(
-                        "user1",
-                    ),
-                    priority: Some(
-                        2,
-                    ),
-                    rollup: None,
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Specified(
+                            "user1",
+                        ),
+                        priority: Some(
+                            2,
+                        ),
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -850,26 +929,32 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: Some(
-                        1,
-                    ),
-                    rollup: None,
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: Some(
+                            1,
+                        ),
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
             Ok(
-                Approve {
-                    approver: Specified(
-                        "user2",
-                    ),
-                    priority: Some(
-                        2,
-                    ),
-                    rollup: None,
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Specified(
+                            "user2",
+                        ),
+                        priority: Some(
+                            2,
+                        ),
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -894,16 +979,19 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Specified(
-                        "user1",
-                    ),
-                    priority: Some(
-                        2,
-                    ),
-                    rollup: None,
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Specified(
+                            "user1",
+                        ),
+                        priority: Some(
+                            2,
+                        ),
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -1063,14 +1151,17 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: None,
-                    rollup: Some(
-                        Always,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: Some(
+                            Always,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         ");
@@ -1082,16 +1173,19 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Specified(
-                        "user1",
-                    ),
-                    priority: None,
-                    rollup: Some(
-                        Never,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Specified(
+                            "user1",
+                        ),
+                        priority: None,
+                        rollup: Some(
+                            Never,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -1103,16 +1197,19 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Specified(
-                        "user1",
-                    ),
-                    priority: None,
-                    rollup: Some(
-                        Always,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Specified(
+                            "user1",
+                        ),
+                        priority: None,
+                        rollup: Some(
+                            Always,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -1124,16 +1221,19 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Specified(
-                        "user1",
-                    ),
-                    priority: None,
-                    rollup: Some(
-                        Maybe,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Specified(
+                            "user1",
+                        ),
+                        priority: None,
+                        rollup: Some(
+                            Maybe,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -1150,26 +1250,32 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: None,
-                    rollup: Some(
-                        Always,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: Some(
+                            Always,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
             Ok(
-                Approve {
-                    approver: Specified(
-                        "user2",
-                    ),
-                    priority: None,
-                    rollup: Some(
-                        Iffy,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Specified(
+                            "user2",
+                        ),
+                        priority: None,
+                        rollup: Some(
+                            Iffy,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -1312,16 +1418,19 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: Some(
-                        1,
-                    ),
-                    rollup: Some(
-                        Always,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: Some(
+                            1,
+                        ),
+                        rollup: Some(
+                            Always,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         ");
@@ -1333,16 +1442,19 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: Some(
-                        1,
-                    ),
-                    rollup: Some(
-                        Iffy,
-                    ),
-                    note: None,
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: Some(
+                            1,
+                        ),
+                        rollup: Some(
+                            Iffy,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                ),
             ),
         ]
         ");
@@ -1354,18 +1466,21 @@ mod tests {
         insta::assert_debug_snapshot!(cmds, @r#"
         [
             Ok(
-                Approve {
-                    approver: Myself,
-                    priority: Some(
-                        1,
-                    ),
-                    rollup: Some(
-                        Iffy,
-                    ),
-                    note: Some(
-                        "foo bar",
-                    ),
-                },
+                Approve(
+                    ApproveInfo {
+                        approver: Myself,
+                        priority: Some(
+                            1,
+                        ),
+                        rollup: Some(
+                            Iffy,
+                        ),
+                        note: Some(
+                            "foo bar",
+                        ),
+                        force: false,
+                    },
+                ),
             ),
         ]
         "#);
@@ -2100,6 +2215,248 @@ for the crater",
     }
 
     #[test]
+    fn parse_squash_approve() {
+        let cmds = parse_commands("@bors r+ squash");
+        insta::assert_debug_snapshot!(cmds, @"
+        [
+            Ok(
+                SquashApprove {
+                    commit_message: AutoGenerate,
+                    approval_info: ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                },
+            ),
+        ]
+        ");
+    }
+
+    #[test]
+    fn parse_squash_approve_msg() {
+        let cmds = parse_commands("@bors r+ squash msg=foo");
+        insta::assert_debug_snapshot!(cmds, @r#"
+        [
+            Ok(
+                SquashApprove {
+                    commit_message: Explicit(
+                        "foo",
+                    ),
+                    approval_info: ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                },
+            ),
+        ]
+        "#);
+    }
+
+    #[test]
+    fn parse_squash_approve_message() {
+        let cmds = parse_commands("@bors r+ squash message=foo");
+        insta::assert_debug_snapshot!(cmds, @r#"
+        [
+            Ok(
+                SquashApprove {
+                    commit_message: Explicit(
+                        "foo",
+                    ),
+                    approval_info: ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                },
+            ),
+        ]
+        "#);
+    }
+
+    #[test]
+    fn parse_squash_approve_message_quoted() {
+        let cmds = parse_commands(r#"@bors r+ squash message="foo bar baz""#);
+        insta::assert_debug_snapshot!(cmds, @r#"
+        [
+            Ok(
+                SquashApprove {
+                    commit_message: Explicit(
+                        "foo bar baz",
+                    ),
+                    approval_info: ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                },
+            ),
+        ]
+        "#);
+    }
+
+    #[test]
+    fn parse_squash_approve_msg_description() {
+        let cmds = parse_commands("@bors r+ squash msg=description");
+        insta::assert_debug_snapshot!(cmds, @"
+        [
+            Ok(
+                SquashApprove {
+                    commit_message: PullRequestDescription,
+                    approval_info: ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                },
+            ),
+        ]
+        ");
+    }
+
+    #[test]
+    fn parse_squash_approve_msg_desc_rollup_priority() {
+        let cmds = parse_commands("@bors r+ rollup p=1 squash msg=description");
+        insta::assert_debug_snapshot!(cmds, @"
+        [
+            Ok(
+                SquashApprove {
+                    commit_message: PullRequestDescription,
+                    approval_info: ApproveInfo {
+                        approver: Myself,
+                        priority: Some(
+                            1,
+                        ),
+                        rollup: Some(
+                            Always,
+                        ),
+                        note: None,
+                        force: false,
+                    },
+                },
+            ),
+        ]
+        ");
+    }
+
+    #[test]
+    fn parse_squash_approve_unknown_arg() {
+        let cmds = parse_commands("@bors r+ squash commit=foo");
+        insta::assert_debug_snapshot!(cmds, @r#"
+        [
+            Err(
+                UnknownArg {
+                    arg: "commit",
+                    did_you_mean: "r+ squash [msg|message=\"<commit-msg>\"|description]",
+                },
+            ),
+        ]
+        "#);
+    }
+
+    #[test]
+    fn parse_squash_approve_extra_args() {
+        let cmds = parse_commands("@bors r+ squash message=foo baz");
+        insta::assert_debug_snapshot!(cmds, @r#"
+        [
+            Ok(
+                SquashApprove {
+                    commit_message: Explicit(
+                        "foo",
+                    ),
+                    approval_info: ApproveInfo {
+                        approver: Myself,
+                        priority: None,
+                        rollup: None,
+                        note: None,
+                        force: false,
+                    },
+                },
+            ),
+        ]
+        "#);
+    }
+
+    #[test]
+    fn parse_squash_approve_wrong_pos_args() {
+        let cmds = parse_commands("@bors r+ squash message=foo baz p=1");
+        assert_eq!(cmds.len(), 1);
+        insta::assert_debug_snapshot!(cmds[0], @r#"
+        Ok(
+            SquashApprove {
+                commit_message: Explicit(
+                    "foo",
+                ),
+                approval_info: ApproveInfo {
+                    approver: Myself,
+                    priority: Some(
+                        1,
+                    ),
+                    rollup: None,
+                    note: None,
+                    force: false,
+                },
+            },
+        )
+        "#);
+    }
+
+    #[test]
+    fn parse_squash_approve_args() {
+        let cmds = parse_commands("@bors r+ message=foo squash p=1");
+        assert_eq!(cmds.len(), 1);
+        insta::assert_debug_snapshot!(cmds[0], @"
+        Ok(
+            SquashApprove {
+                commit_message: AutoGenerate,
+                approval_info: ApproveInfo {
+                    approver: Myself,
+                    priority: Some(
+                        1,
+                    ),
+                    rollup: None,
+                    note: None,
+                    force: false,
+                },
+            },
+        )
+        ");
+    }
+
+    #[test]
+    fn parse_squash_approve_p1() {
+        let cmds = parse_commands("@bors r+ squash p=1");
+        assert_eq!(cmds.len(), 1);
+        insta::assert_debug_snapshot!(cmds[0], @"
+        Ok(
+            SquashApprove {
+                commit_message: AutoGenerate,
+                approval_info: ApproveInfo {
+                    approver: Myself,
+                    priority: Some(
+                        1,
+                    ),
+                    rollup: None,
+                    note: None,
+                    force: false,
+                },
+            },
+        )
+        ");
+    }
+
+    #[test]
     fn parse_in_html_command() {
         let cmds = parse_commands(
             r#"
@@ -2152,14 +2509,17 @@ I am markdown HTML comment
         assert_eq!(cmds.len(), 1);
         insta::assert_debug_snapshot!(cmds[0], @r#"
         Ok(
-            Approve {
-                approver: Specified(
-                    "čaujaksemáš",
-                ),
-                priority: None,
-                rollup: None,
-                note: None,
-            },
+            Approve(
+                ApproveInfo {
+                    approver: Specified(
+                        "čaujaksemáš",
+                    ),
+                    priority: None,
+                    rollup: None,
+                    note: None,
+                    force: false,
+                },
+            ),
         )
         "#);
     }
