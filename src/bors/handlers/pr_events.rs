@@ -315,7 +315,8 @@ fn create_pr_description_comment(payload: &PullRequestOpened) -> PullRequestComm
 #[cfg(test)]
 mod tests {
     use insta::assert_snapshot;
-    use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
+    use octocrab::models::workflows::Conclusion;
+    use octocrab::params::checks::CheckRunStatus;
 
     use crate::bors::PullRequestStatus;
     use crate::bors::merge_queue::AUTO_BUILD_CHECK_RUN_NAME;
@@ -982,7 +983,7 @@ conflict = ["+conflict"]
                 AUTO_BUILD_CHECK_RUN_NAME,
                 AUTO_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Cancelled),
+                Some(Conclusion::Cancelled),
             );
             Ok(())
         })

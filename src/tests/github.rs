@@ -10,7 +10,7 @@ use http::StatusCode;
 use itertools::Itertools;
 use octocrab::models::pulls::MergeableState;
 use octocrab::models::workflows::Conclusion;
-use octocrab::models::{CheckSuiteId, JobId, RunId};
+use octocrab::models::{AppId, CheckRunId, CheckSuiteId, JobId, RunId};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -528,7 +528,7 @@ impl Repo {
         &mut self,
         check_run_id: u64,
         status: String,
-        conclusion: Option<String>,
+        conclusion: Option<Conclusion>,
     ) {
         let check_run = self.check_runs.get_mut(check_run_id as usize).unwrap();
         check_run.status = status;
@@ -1065,6 +1065,12 @@ impl Permissions {
 }
 
 #[derive(Clone)]
+pub struct CheckRunEvent {
+    pub event: WorkflowEventKind,
+    pub check_run_id: CheckRunId,
+}
+
+#[derive(Clone)]
 pub struct WorkflowEvent {
     pub event: WorkflowEventKind,
     pub run_id: RunId,
@@ -1115,14 +1121,18 @@ pub enum TestWorkflowStatus {
 
 #[derive(Clone, Debug)]
 pub struct CheckRunData {
+    pub id: CheckRunId,
     pub name: String,
     pub head_sha: String,
     pub status: String,
-    pub conclusion: Option<String>,
+    pub conclusion: Option<Conclusion>,
     pub title: String,
     pub summary: String,
     pub text: String,
     pub external_id: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub github_app_id: AppId,
 }
 
 #[derive(Clone)]

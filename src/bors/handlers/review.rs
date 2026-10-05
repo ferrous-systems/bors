@@ -632,7 +632,8 @@ fn rollup_pr_invalid_rollup_mode_comment() -> Comment {
 
 #[cfg(test)]
 mod tests {
-    use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
+    use octocrab::models::workflows::Conclusion;
+    use octocrab::params::checks::CheckRunStatus;
 
     use crate::bors::TRY_BRANCH_NAME;
     use crate::bors::merge_queue::AUTO_BUILD_CHECK_RUN_NAME;
@@ -2174,7 +2175,7 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
                 AUTO_BUILD_CHECK_RUN_NAME,
                 AUTO_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Cancelled),
+                Some(Conclusion::Cancelled),
             );
             Ok(())
         })

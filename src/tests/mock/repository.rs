@@ -530,7 +530,7 @@ struct CheckRunResponse {
     html_url: String,
     details_url: Option<String>,
     status: String,
-    conclusion: Option<String>,
+    conclusion: Option<Conclusion>,
     started_at: String,
     completed_at: Option<String>,
     external_id: String,
@@ -627,7 +627,7 @@ async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                 #[derive(serde::Deserialize)]
                 struct UpdateCheckRunRequest {
                     status: String,
-                    conclusion: Option<String>,
+                    conclusion: Option<Conclusion>,
                 }
 
                 let path = request.url.path();

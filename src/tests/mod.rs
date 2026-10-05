@@ -19,7 +19,7 @@ use http::header::{COOKIE, SET_COOKIE};
 use http::{HeaderMap, Method, Request, StatusCode};
 use octocrab::models::workflows::Conclusion;
 use octocrab::models::{AppId, RunId};
-use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
+use octocrab::params::checks::CheckRunStatus;
 use parking_lot::Mutex;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -46,7 +46,8 @@ use crate::bors::unroll_queue::{UnrollQueueEvent, UnrollQueueReceiver, handle_un
 use crate::github::api::client::HideCommentReason;
 use crate::server::{ServerState, create_app};
 use crate::tests::github::{
-    RepoIdentifier, TestWorkflowStatus, WorkflowEventKind, WorkflowRun, default_oauth_config,
+    CheckRunEvent, RepoIdentifier, TestWorkflowStatus, WorkflowEventKind, WorkflowRun,
+    default_oauth_config,
 };
 use crate::tests::mock::{
     GitHubIssueCommentEventPayload, GitHubPullRequestEventPayload, GitHubPushEventPayload,
@@ -747,6 +748,12 @@ impl BorsTester {
         }
     }
 
+    pub async fn check_run_event(&mut self, event: CheckRunEvent) -> anyhow::Result<()> {
+        let payload = {};
+
+        self.send_webhook("check_run", payload).await
+    }
+
     /// Performs a single started/success/failure workflow event.
     pub async fn workflow_event(&mut self, event: WorkflowEvent) -> anyhow::Result<()> {
         // Update the status of the workflow in the GitHub state mock
@@ -1110,7 +1117,7 @@ impl BorsTester {
         name: &str,
         title: &str,
         status: CheckRunStatus,
-        conclusion: Option<CheckRunConclusion>,
+        expected_conclusion: Option<Conclusion>,
     ) -> &Self {
         let repo = self.repo();
         let repo = repo.lock();
@@ -1128,16 +1135,6 @@ impl BorsTester {
             CheckRunStatus::InProgress => "in_progress",
             CheckRunStatus::Completed => "completed",
         };
-        let expected_conclusion = conclusion.map(|c| match c {
-            CheckRunConclusion::Success => "success",
-            CheckRunConclusion::Failure => "failure",
-            CheckRunConclusion::Neutral => "neutral",
-            CheckRunConclusion::Cancelled => "cancelled",
-            CheckRunConclusion::TimedOut => "timed_out",
-            CheckRunConclusion::ActionRequired => "action_required",
-            CheckRunConclusion::Stale => "stale",
-            CheckRunConclusion::Skipped => "skipped",
-        });
 
         assert_eq!(
             (
@@ -1145,7 +1142,7 @@ impl BorsTester {
                 check_run.head_sha.as_str(),
                 check_run.status.as_str(),
                 check_run.title.as_str(),
-                check_run.conclusion.as_deref(),
+                &check_run.conclusion,
                 check_run.external_id.parse::<u64>().is_ok()
             ),
             (
@@ -1153,7 +1150,7 @@ impl BorsTester {
                 head_sha,
                 expected_status,
                 title,
-                expected_conclusion,
+                &expected_conclusion,
                 true
             )
         );

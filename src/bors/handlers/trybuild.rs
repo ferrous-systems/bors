@@ -298,10 +298,15 @@ mod tests {
     use crate::tests::default_repo_name;
     use crate::tests::{BorsTester, Branch, Commit};
     use crate::tests::{Comment, GitHub, User, WorkflowEvent, run_test};
-    use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
+    use octocrab::models::workflows::Conclusion;
+    use octocrab::params::checks::CheckRunStatus;
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_success(pool: sqlx::PgPool) {
+        tracing_subscriber::fmt()
+            .compact()
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
             ctx.expect_comments((), 1).await;
@@ -1012,7 +1017,7 @@ try_failed = ["+foo", "+bar", "-baz"]
                 TRY_BUILD_CHECK_RUN_NAME,
                 "Bors try build",
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Success),
+                Some(Conclusion::Success),
             );
 
             Ok(())
@@ -1034,7 +1039,7 @@ try_failed = ["+foo", "+bar", "-baz"]
                 TRY_BUILD_CHECK_RUN_NAME,
                 "Bors try build",
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Failure),
+                Some(Conclusion::Failure),
             );
 
             Ok(())
@@ -1056,7 +1061,7 @@ try_failed = ["+foo", "+bar", "-baz"]
                 TRY_BUILD_CHECK_RUN_NAME,
                 "Bors try build",
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Cancelled),
+                Some(Conclusion::Cancelled),
             );
 
             Ok(())
@@ -1080,7 +1085,7 @@ try_failed = ["+foo", "+bar", "-baz"]
                 TRY_BUILD_CHECK_RUN_NAME,
                 "Bors try build",
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Cancelled),
+                Some(Conclusion::Cancelled),
             );
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),

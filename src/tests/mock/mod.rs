@@ -21,6 +21,7 @@ use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod app;
+mod check_run;
 mod comment;
 mod oauth;
 mod permissions;
@@ -30,6 +31,7 @@ mod workflow;
 mod zulip;
 
 use crate::tests::mock::oauth::mock_oauth;
+pub use check_run::GitHubCheckRunEventPayload;
 pub use comment::GitHubIssueCommentEventPayload;
 pub use pull_request::{
     GitHubPullRequestEventPayload, GitHubPushEventPayload, PullRequestChangeEvent,

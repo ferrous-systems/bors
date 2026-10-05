@@ -919,7 +919,8 @@ pub fn start_merge_queue(
 
 #[cfg(test)]
 mod tests {
-    use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
+    use octocrab::models::workflows::Conclusion;
+    use octocrab::params::checks::CheckRunStatus;
     use std::time::Duration;
 
     use crate::bors::with_mocked_time;
@@ -1528,7 +1529,7 @@ merge_queue_enabled = false
                 AUTO_BUILD_CHECK_RUN_NAME,
                 AUTO_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Success),
+                Some(Conclusion::Success),
             );
             Ok(())
         })
@@ -1610,7 +1611,7 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
                 AUTO_BUILD_CHECK_RUN_NAME,
                 AUTO_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::Failure),
+                Some(Conclusion::Failure),
             );
             Ok(())
         })

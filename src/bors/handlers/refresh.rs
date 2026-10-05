@@ -159,7 +159,8 @@ mod tests {
     use crate::database::{MergeableState, OctocrabMergeableState, WorkflowStatus};
     use crate::tests::{BorsTester, Comment, GitHub, run_test};
     use crate::tests::{User, default_repo_name};
-    use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
+    use octocrab::models::workflows::Conclusion;
+    use octocrab::params::checks::CheckRunStatus;
     use std::time::Duration;
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -268,7 +269,7 @@ auto_build_failed = ["+failed"]
                 TRY_BUILD_CHECK_RUN_NAME,
                 "Bors try build",
                 CheckRunStatus::Completed,
-                Some(CheckRunConclusion::TimedOut),
+                Some(Conclusion::TimedOut),
             );
 
             Ok(())
