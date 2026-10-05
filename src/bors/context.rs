@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use octocrab::models::AppId;
+
 use super::{RepositoryState, RepositoryStore};
 use crate::bors::gitops::Git;
 use crate::ec2::Ec2Context;
@@ -13,6 +15,7 @@ pub struct BorsContext {
     web_url: String,
     zulip_client: Option<ZulipClient>,
     ec2_ctx: Option<Ec2Context>,
+    github_app_id: AppId,
 }
 
 impl BorsContext {
@@ -24,6 +27,7 @@ impl BorsContext {
         web_url: &str,
         zulip_client: Option<ZulipClient>,
         ec2_ctx: Option<Ec2Context>,
+        github_app_id: AppId,
     ) -> Self {
         Self {
             parser,
@@ -33,6 +37,7 @@ impl BorsContext {
             web_url: web_url.trim_end_matches('/').to_string(),
             zulip_client,
             ec2_ctx,
+            github_app_id,
         }
     }
 
@@ -65,5 +70,9 @@ impl BorsContext {
 
     pub fn get_ec2_ctx(&self) -> Option<&Ec2Context> {
         self.ec2_ctx.as_ref()
+    }
+
+    pub fn github_app_id(&self) -> AppId {
+        self.github_app_id
     }
 }

@@ -5,8 +5,8 @@ use crate::bors::event::{BorsGlobalEvent, BorsRepositoryEvent, PullRequestCommen
 use crate::bors::handlers::autobuild::{
     AutoBuildCancelReason, command_cancel, command_retry, maybe_cancel_auto_build,
 };
-use crate::bors::handlers::checks::handle_check_run_completed;
-use crate::bors::handlers::checks::handle_check_run_created;
+use crate::bors::handlers::check_run::handle_check_run_completed;
+use crate::bors::handlers::check_run::handle_check_run_created;
 use crate::bors::handlers::help::command_help;
 use crate::bors::handlers::info::command_info;
 use crate::bors::handlers::ping::command_ping;
@@ -44,7 +44,7 @@ use review::{command_delegate, command_set_priority, command_set_rollup, command
 use tracing::{Instrument, debug_span};
 
 mod autobuild;
-mod checks;
+mod check_run;
 mod help;
 mod info;
 mod ping;
@@ -108,50 +108,6 @@ pub async fn handle_bors_repository_event(
                 return Err(error.context("Cannot perform command"));
             }
         }
-        // BorsRepositoryEvent::WorkflowStarted(payload) => {
-        //     let span = tracing::info_span!(
-        //         "Workflow started",
-        //         repo = payload.repository.to_string(),
-        //         id = payload.run_id.into_inner()
-        //     );
-        //     handle_workflow_started(repo, db, payload)
-        //         .instrument(span.clone())
-        //         .await?;
-        // }
-        // BorsRepositoryEvent::WorkflowCompleted(payload) => {
-        //     let span = tracing::info_span!(
-        //         "Workflow completed",
-        //         repo = payload.repository.to_string(),
-        //         id = payload.run_id.into_inner()
-        //     );
-        //     handle_workflow_completed(repo, db, payload, senders.build_queue())
-        //         .instrument(span)
-        //         .await?;
-        // }
-        // BorsRepositoryEvent::WorkflowJobStarted(payload) => {
-        //     let span = tracing::info_span!(
-        //         "Workflow job started",
-        //         repo = payload.repository.to_string(),
-        //         name = payload.name,
-        //         run_id = payload.run_id.into_inner(),
-        //         job_id = payload.job_id.into_inner(),
-        //     );
-        //     handle_workflow_job_started(&ctx, db, repo, payload)
-        //         .instrument(span)
-        //         .await?;
-        // }
-        // BorsRepositoryEvent::WorkflowJobCompleted(payload) => {
-        //     let span = tracing::info_span!(
-        //         "Workflow job completed",
-        //         repo = payload.repository.to_string(),
-        //         run_id = payload.run_id.into_inner(),
-        //         job_id = payload.job_id.into_inner(),
-        //         name = payload.name
-        //     );
-        //     handle_workflow_job_completed(&ctx, repo, payload)
-        //         .instrument(span)
-        //         .await?;
-        // }
         BorsRepositoryEvent::PullRequestEdited(payload) => {
             let span =
                 tracing::info_span!("Pull request edited", repo = payload.repository.to_string());
@@ -258,7 +214,7 @@ pub async fn handle_bors_repository_event(
                 name = %payload.name,
             );
 
-            handle_check_run_created(repo, db, payload)
+            handle_check_run_created(repo, db, ctx, payload)
                 .instrument(span)
                 .await?;
         }
@@ -270,7 +226,7 @@ pub async fn handle_bors_repository_event(
                 name = %payload.name,
             );
 
-            handle_check_run_completed(repo, db, payload, senders.build_queue())
+            handle_check_run_completed(repo, db, ctx, payload, senders.build_queue())
                 .instrument(span)
                 .await?;
         }

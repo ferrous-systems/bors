@@ -17,8 +17,8 @@ use anyhow::Context;
 use axum::Router;
 use http::header::{COOKIE, SET_COOKIE};
 use http::{HeaderMap, Method, Request, StatusCode};
-use octocrab::models::RunId;
 use octocrab::models::workflows::Conclusion;
+use octocrab::models::{AppId, RunId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -237,6 +237,7 @@ impl BorsTester {
             "https://bors-test.com",
             Some(mock.zulip_client()),
             None,
+            AppId(1),
         ));
 
         let BorsProcess {

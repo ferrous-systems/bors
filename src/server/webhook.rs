@@ -11,7 +11,7 @@ use octocrab::models::events::payload::{
 };
 use octocrab::models::pulls::{PullRequest, Review};
 use octocrab::models::webhook_events::payload::PullRequestWebhookEventAction;
-use octocrab::models::{App, AppId, Author, CheckRunId, Repository, RunId};
+use octocrab::models::{App, Author, CheckRunId, Repository};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
 
@@ -24,8 +24,6 @@ use crate::bors::event::{
 use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
 use crate::server::ServerStateRef;
-
-const GITHUB_ACTIONS_APP_ID: AppId = AppId(15368);
 
 /// Wrapper for a secret which is zeroed on drop and can be exposed only through the
 /// [`WebhookSecret::expose`] method.
@@ -57,27 +55,6 @@ struct WebhookRepository {
 }
 
 #[derive(serde::Deserialize, Debug)]
-struct WebhookWorkflowJob<'a> {
-    action: &'a str,
-    workflow_job: WorkflowJobInner<'a>,
-    repository: Repository,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct WorkflowJobInner<'a> {
-    id: CheckRunId,
-    run_id: RunId,
-    head_sha: String,
-    name: String,
-    #[allow(unused)] // TODO
-    labels: Vec<String>,
-    html_url: String,
-    started_at: chrono::DateTime<chrono::Utc>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    conclusion: Option<&'a str>,
-}
-
-#[derive(serde::Deserialize, Debug)]
 struct WebhookCheckRun<'a> {
     action: &'a str,
     check_run: CheckRunInner<'a>,
@@ -86,7 +63,7 @@ struct WebhookCheckRun<'a> {
 
 #[derive(serde::Deserialize, Debug)]
 struct CheckRunInner<'a> {
-    app: App,
+    app: Option<App>,
     id: CheckRunId,
     name: String,
     conclusion: Option<&'a str>,
@@ -189,8 +166,6 @@ fn parse_webhook_event(request: Parts, body: &[u8]) -> anyhow::Result<Option<Bor
         b"installation_repositories" | b"installation" => Ok(Some(BorsEvent::Global(
             BorsGlobalEvent::InstallationsChanged,
         ))),
-        // b"workflow_run" => parse_workflow_run_events(body),
-        b"workflow_job" => parse_workflow_job_events(body),
         b"check_run" => parse_check_run_events(body),
         _ => {
             tracing::debug!(
@@ -343,106 +318,11 @@ fn parse_pull_request_review_comment_events(body: &[u8]) -> anyhow::Result<Optio
     }
 }
 
-// fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
-//     let payload: WebhookWorkflowRun = serde_json::from_slice(body)?;
-//     let repository_name = parse_repository_name(&payload.repository)?;
-
-//     // As a security precaution, we eagerly prefilter all workflow runs other than "push" here,
-//     // to ensure that only workflows from privileged pushes to branches in the repository are
-//     // registered by bors.
-//     if payload.workflow_run.run.event != "push" {
-//         return Ok(None);
-//     }
-
-//     let result = match payload.action {
-//         "requested" => Some(BorsEvent::Repository(BorsRepositoryEvent::WorkflowStarted(
-//             WorkflowRunStarted {
-//                 repository: repository_name,
-//                 name: payload.workflow_run.run.name,
-//                 branch: payload.workflow_run.run.head_branch,
-//                 commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-//                 run_id: payload.workflow_run.run.id,
-//                 workflow_type: WorkflowType::Github,
-//                 url: payload.workflow_run.run.html_url.into(),
-//             },
-//         ))),
-//         "completed" => {
-//             let running_time = if let (Some(started_at), Some(completed_at)) = (
-//                 Some(payload.workflow_run.run.created_at),
-//                 Some(payload.workflow_run.run.updated_at),
-//             ) {
-//                 Some(completed_at - started_at)
-//             } else {
-//                 None
-//             };
-//             Some(BorsEvent::Repository(
-//                 BorsRepositoryEvent::WorkflowCompleted(WorkflowRunCompleted {
-//                     repository: repository_name,
-//                     branch: payload.workflow_run.run.head_branch,
-//                     commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-//                     run_id: payload.workflow_run.run.id,
-//                     check_suite_id: payload.workflow_run.check_suite_id,
-//                     running_time,
-//                     status: match payload
-//                         .workflow_run
-//                         .run
-//                         .conclusion
-//                         .unwrap_or_default()
-//                         .as_str()
-//                     {
-//                         "success" => WorkflowStatus::Success,
-//                         _ => WorkflowStatus::Failure,
-//                     },
-//                 }),
-//             ))
-//         }
-//         _ => None,
-//     };
-//     Ok(result)
-// }
-
-fn parse_workflow_job_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
-    let payload: WebhookWorkflowJob = serde_json::from_slice(body)?;
-    let repository_name = parse_repository_name(&payload.repository)?;
-    let result = match payload.action {
-        "in_progress" => Some(BorsEvent::Repository(BorsRepositoryEvent::CheckRunCreated(
-            CheckRunCreated {
-                repository: repository_name,
-                id: payload.workflow_job.id,
-                name: payload.workflow_job.name,
-                commit_sha: payload.workflow_job.head_sha.into(),
-                html_url: payload.workflow_job.html_url,
-                started_at: payload.workflow_job.started_at,
-                github_workflow_run_id: Some(payload.workflow_job.run_id),
-            },
-        ))),
-        "completed" => Some(BorsEvent::Repository(
-            BorsRepositoryEvent::CheckRunCompleted(CheckRunCompleted {
-                repository: repository_name,
-                id: payload.workflow_job.id,
-                name: payload.workflow_job.name,
-                commit_sha: payload.workflow_job.head_sha.into(),
-                running_time: payload
-                    .workflow_job
-                    .completed_at
-                    .map(|completed| completed - payload.workflow_job.started_at),
-                status: match payload.workflow_job.conclusion {
-                    Some("success") => WorkflowStatus::Success,
-                    _ => WorkflowStatus::Failure,
-                },
-            }),
-        )),
-        _ => None,
-    };
-    Ok(result)
-}
-
 fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
     let payload: WebhookCheckRun = serde_json::from_slice(body)?;
     let repository = parse_repository_name(&payload.repository)?;
+    let github_app_id = payload.check_run.app.map(|app| app.id);
     let result = match payload.action {
-        // handle github-actions check-runs via workflow_run webhook
-        _ if payload.check_run.app.id == GITHUB_ACTIONS_APP_ID => None,
         "created" => Some(BorsEvent::Repository(BorsRepositoryEvent::CheckRunCreated(
             CheckRunCreated {
                 repository,
@@ -452,6 +332,7 @@ fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                 html_url: payload.check_run.html_url,
                 github_workflow_run_id: None,
                 started_at: payload.check_run.started_at,
+                github_app_id,
             },
         ))),
         "completed" => Some(BorsEvent::Repository(
@@ -468,6 +349,7 @@ fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                     Some("success") => WorkflowStatus::Success,
                     _ => WorkflowStatus::Failure,
                 },
+                github_app_id,
             }),
         )),
         _ => None,
@@ -563,6 +445,7 @@ mod tests {
 
     use axum::extract::FromRequest;
     use hyper::StatusCode;
+    use octocrab::models::AppId;
     use sqlx::PgPool;
     use tokio::sync::mpsc;
 
@@ -1780,6 +1663,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_run_created() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/check-run-created.json", "check_run").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    CheckRunCreated(
+                        CheckRunCreated {
+                            repository: kobzol/bors-kindergarten,
+                            id: CheckRunId(
+                                110323203685,
+                            ),
+                            name: "init",
+                            commit_sha: CommitSha(
+                                "c9abcadf285659684c0975cead8bf982fa84e123",
+                            ),
+                            html_url: "https://github.com/Kobzol/bors-kindergarten/actions/runs/89214823120/job/110323203685",
+                            started_at: 2023-05-06T09:57:29Z,
+                            github_workflow_run_id: None,
+                            github_app_id: Some(
+                                AppId(
+                                    15368,
+                                ),
+                            ),
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
+        );
+    }
+
+    #[tokio::test]
     async fn workflow_run_completed() {
         insta::assert_debug_snapshot!(
             check_webhook("webhook/workflow-run-completed.json", "workflow_run").await,
@@ -1788,6 +1706,45 @@ mod tests {
             200,
         )
         "
+        );
+    }
+
+    #[tokio::test]
+    async fn check_run_completed() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/check-run-completed.json", "check_run").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    CheckRunCompleted(
+                        CheckRunCompleted {
+                            repository: kobzol/bors-kindergarten,
+                            id: CheckRunId(
+                                110323203685,
+                            ),
+                            name: "init",
+                            commit_sha: CommitSha(
+                                "c9abcadf285659684c0975cead8bf982fa84e123",
+                            ),
+                            status: Success,
+                            running_time: Some(
+                                TimeDelta {
+                                    secs: 61,
+                                    nanos: 0,
+                                },
+                            ),
+                            github_app_id: Some(
+                                AppId(
+                                    15368,
+                                ),
+                            ),
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
         );
     }
 
@@ -1807,33 +1764,11 @@ mod tests {
     async fn workflow_job_completed() {
         insta::assert_debug_snapshot!(
             check_webhook("webhook/workflow-job-completed.json", "workflow_job").await,
-            @r#"
-        Ok(
-            GitHubWebhook(
-                Repository(
-                    CheckRunCompleted(
-                        CheckRunCompleted {
-                            repository: kobzol/bors-kindergarten2,
-                            id: CheckRunId(
-                                91138434504,
-                            ),
-                            name: "init",
-                            commit_sha: CommitSha(
-                                "a0455bb1ebc7d836b1d0d7acb60700787725ea4e",
-                            ),
-                            status: Success,
-                            running_time: Some(
-                                TimeDelta {
-                                    secs: 2,
-                                    nanos: 0,
-                                },
-                            ),
-                        },
-                    ),
-                ),
-            ),
+            @"
+        Err(
+            200,
         )
-        "#
+        "
         );
     }
 
@@ -1873,6 +1808,7 @@ mod tests {
                 "",
                 None,
                 None,
+                AppId(69),
             )),
         )));
         GitHubWebhook::from_request(request, &server_ref).await

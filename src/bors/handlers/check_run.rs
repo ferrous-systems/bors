@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use octocrab::models::CheckRunId;
 
+use crate::BorsContext;
 use crate::PgDbClient;
 use crate::bors::BuildKind;
 use crate::bors::RepositoryState;
@@ -25,21 +26,7 @@ async fn get_build(
 ) -> anyhow::Result<Option<BuildModel>> {
     let mut builds = db.find_builds_by_commit_sha(repo, commit).await?;
 
-    // there *shouldn't* be multiple builds associated with a commit_sha:
-    // - each merge commit is only attempted once
-    // - each try commit is only attempted once
-    // - if someone tries to merge a try commit, the merge commit will be after
-    //      the try commit
-    // - if someone tries to try a merge commit, the try commit will be after the
-    //      merge commit
-    // this should never happen, but it's worth checking for.
-    // there shouldn't be any harm in handling this case anyways, but i'd rather
-    // keep this assumption than handle an extremely unlikely case.
-    if builds.len() > 1 {
-        tracing::error!("Found multiple builds for commit, ignoring");
-        return Ok(None);
-    }
-
+    // use the most recent build, in case there's multiple builds
     let Some(build) = builds.pop() else {
         // instead of calling `is_bors_observed_branch`, which is what the
         // workflow_run handler does, ignore the check_run if it's not a tracked
@@ -63,9 +50,17 @@ async fn get_build(
 pub async fn handle_check_run_created(
     repo: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
+    ctx: Arc<BorsContext>,
     payload: CheckRunCreated,
 ) -> anyhow::Result<()> {
     tracing::info!("Handling check run created");
+
+    // ignore check-runs published by bors
+    if let Some(gh_app_id) = payload.github_app_id
+        && gh_app_id == ctx.github_app_id()
+    {
+        return Ok(());
+    }
 
     let Some(build) = get_build(&db, payload.id, &payload.repository, &payload.commit_sha).await?
     else {
@@ -86,6 +81,7 @@ pub async fn handle_check_run_created(
         &payload.html_url,
         payload.started_at,
         payload.github_workflow_run_id,
+        payload.github_app_id,
     )
     .await?;
 
@@ -149,10 +145,18 @@ async fn add_check_run_links_to_build_start_comment(
 pub async fn handle_check_run_completed(
     repo: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
+    ctx: Arc<BorsContext>,
     mut payload: CheckRunCompleted,
     build_queue_tx: &BuildQueueSender,
 ) -> anyhow::Result<()> {
     tracing::info!("Handling check run completed");
+
+    // ignore check-runs published by bors
+    if let Some(gh_app_id) = payload.github_app_id
+        && gh_app_id == ctx.github_app_id()
+    {
+        return Ok(());
+    }
 
     let Some(build) = get_build(&db, payload.id, &payload.repository, &payload.commit_sha).await?
     else {

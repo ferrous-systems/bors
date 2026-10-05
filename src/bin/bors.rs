@@ -243,6 +243,7 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         &web_url,
         zulip_client,
         ec2_ctx,
+        app_id.into(),
     ));
     let BorsProcess {
         repository_tx,

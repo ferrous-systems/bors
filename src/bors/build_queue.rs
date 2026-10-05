@@ -117,6 +117,7 @@ pub async fn handle_build_queue_event(
                         // Because if the bot was offline for some time, we want to first attempt to
                         // actually finish the build, otherwise it might get instantly timeouted.
                         if !maybe_complete_build(
+                            &ctx,
                             &repo,
                             db,
                             &build,
@@ -170,6 +171,7 @@ pub async fn handle_build_queue_event(
                 };
                 let repo = ctx.get_repo(&event.repository)?;
                 maybe_complete_build(
+                    &ctx,
                     &repo,
                     db,
                     &build,
@@ -252,6 +254,7 @@ struct CompletionTrigger {
 ///
 /// Returns true if the build was completed.
 async fn maybe_complete_build(
+    ctx: &BorsContext,
     repo: &RepositoryState,
     db: &PgDbClient,
     build: &BuildModel,
@@ -266,9 +269,13 @@ async fn maybe_complete_build(
         "Attempting to complete a non-pending build"
     );
 
+    let bors_github_app_id = ctx.github_app_id();
     let check_runs = load_check_runs(repo, db, build)
         .await
-        .context("Cannot load workflow runs")?;
+        .context("Cannot load workflow runs")?
+        .into_iter()
+        .filter(|check_run| check_run.github_app_id == Some(bors_github_app_id))
+        .collect::<Vec<_>>();
 
     // If we check build completion after a workflow run completion trigger,
     // there really should be at least a single workflow run returned from the call above.

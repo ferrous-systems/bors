@@ -342,6 +342,7 @@ impl PgDbClient {
         url: &str,
         started_at: DateTime<Utc>,
         github_workflow_run_id: Option<octocrab::models::RunId>,
+        github_app_id: Option<octocrab::models::AppId>,
     ) -> anyhow::Result<()> {
         create_check_run(
             &self.pool,
@@ -351,6 +352,7 @@ impl PgDbClient {
             url,
             started_at,
             github_workflow_run_id,
+            github_app_id,
         )
         .await
     }

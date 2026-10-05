@@ -829,6 +829,7 @@ pub(crate) async fn find_builds_by_commit_sha(
                 FROM build
                 WHERE repository = $1
                     AND commit_sha = $2
+                ORDER BY id ASC
             "#,
             repo as _,
             commit_sha as _,
@@ -880,6 +881,7 @@ pub(crate) async fn create_check_run(
     url: &str,
     started_at: DateTime<Utc>,
     github_workflow_run_id: Option<octocrab::models::RunId>,
+    github_app_id: Option<octocrab::models::AppId>,
 ) -> anyhow::Result<()> {
     measure_db_query("create_check_run", async || {
         sqlx::query!(
@@ -891,9 +893,10 @@ pub(crate) async fn create_check_run(
                     url,
                     status,
                     started_at,
-                    github_workflow_run_id
+                    github_workflow_run_id,
+                    github_app_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
             build.id,
             id.into_inner() as i64,
@@ -902,6 +905,7 @@ pub(crate) async fn create_check_run(
             WorkflowStatus::Pending as _,
             started_at,
             github_workflow_run_id.map(|id| id.into_inner() as i64),
+            github_app_id.map(|id| id.into_inner() as i64),
         )
         .execute(executor)
         .await?;
@@ -1016,7 +1020,8 @@ pub(crate) async fn get_check_runs_for_build(
                     check_run.url,
                     check_run.status as "status: _",
                     check_run.started_at,
-                    check_run.github_workflow_run_id
+                    check_run.github_workflow_run_id,
+                    check_run.github_app_id
                 FROM check_run
                 LEFT JOIN build ON check_run.build_id = build.id
                 WHERE build.id = $1
@@ -1046,7 +1051,8 @@ pub(crate) async fn get_check_runs_with_status_for_build(
                     check_run.url,
                     check_run.status as "status: WorkflowStatus",
                     check_run.started_at,
-                    check_run.github_workflow_run_id
+                    check_run.github_workflow_run_id,
+                    check_run.github_app_id
                 FROM check_run
                 LEFT JOIN build ON check_run.build_id = build.id
                 WHERE check_run.build_id = $1
@@ -1098,7 +1104,8 @@ pub(crate) async fn get_all_check_runs(
                     check_run.url,
                     check_run.status as "status: _",
                     check_run.started_at,
-                    check_run.github_workflow_run_id
+                    check_run.github_workflow_run_id,
+                    check_run.github_app_id
                 FROM check_run
                 LEFT JOIN build ON check_run.build_id = build.id
             "#

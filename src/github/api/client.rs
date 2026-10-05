@@ -503,19 +503,39 @@ impl GithubRepositoryClient {
         &self,
         commit_sha: &CommitSha,
     ) -> anyhow::Result<Vec<CheckRun>> {
+        #[derive(Serialize)]
+        struct ListCheckRunsForGitRef {
+            per_page: u8,
+            page: u32,
+        }
+
+        #[derive(Deserialize)]
+        struct ListCheckRunsReponse {
+            pub total_count: u64,
+            pub check_runs: Vec<crate::github::models::CheckRun>,
+        }
+
         let runs = perform_retryable(
             "get_check_runs_for_commit_sha",
             RetryMethod::default(),
             async || -> anyhow::Result<_> {
                 let mut runs = vec![];
+                let target = format!(
+                    "/repos/{owner}/{repo}/commits/{ref}/check-runs",
+                    owner = self.repo_name.owner(),
+                    repo = self.repo_name.name(),
+                    ref = commit_sha,
+                );
                 for page in 0u32.. {
-                    let response = self
-                        .client
-                        .checks(self.repo_name.name(), self.repo_name.name())
-                        .list_check_runs_for_git_ref(commit_sha.0.clone().into())
-                        .per_page(100)
-                        .page(page)
-                        .send()
+                    let response: ListCheckRunsReponse = self
+                        .client()
+                        .get(
+                            &target,
+                            Some(&ListCheckRunsForGitRef {
+                                per_page: 100,
+                                page,
+                            }),
+                        )
                         .await?;
                     let remaining = (response.total_count as usize) - runs.len();
                     runs.reserve_exact(remaining);

@@ -1,7 +1,7 @@
 //! Contains definitions of common types (pull request, user, repository name) needed
 //! for working with (GitHub) repositories.
-use octocrab::models::UserId;
 use octocrab::models::pulls::MergeableState;
+use octocrab::models::{AppId, UserId};
 use octocrab::service::middleware::retry::RetryConfig;
 use octocrab::{
     DefaultOctocrabBuilderConfig, NoAuth, NoSvc, NotLayerReady, Octocrab, OctocrabBuilder,
@@ -14,6 +14,7 @@ use url::Url;
 pub mod api;
 mod error;
 mod labels;
+pub mod models;
 mod oauth;
 pub mod rollup;
 
@@ -28,6 +29,11 @@ pub use labels::{LabelModification, LabelTrigger};
 pub use rollup::tests::{make_rollup, rollup_state};
 
 use crate::bors::PullRequestStatus;
+
+#[allow(unused)]
+pub const GITHUB_ACTIONS_APP_ID: AppId = AppId(15368);
+#[allow(unused)]
+pub const CIRCLECI_CHECKS_APP_ID: AppId = AppId(18001);
 
 /// Unique identifier of a GitHub repository
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]

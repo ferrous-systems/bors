@@ -656,7 +656,7 @@ pub struct CheckRunModel {
     /// The name of the check-run (e.g., "CI", "Tests").
     pub name: String,
     /// GitHub-assigned check-run ID.
-    check_run_id: i64,
+    pub check_run_id: i64,
     /// URL to view this check-run on GitHub.
     pub url: String,
     /// Current status of the check-run.
@@ -664,7 +664,9 @@ pub struct CheckRunModel {
     /// When the check-run was started.
     pub started_at: DateTime<Utc>,
     /// If this check-run is a GitHub Actions Workflow run, then the ID of the run.
-    github_workflow_run_id: Option<i64>,
+    pub github_workflow_run_id: Option<i64>,
+    /// The GitHub app id of the app that created this check-run.
+    pub github_app_id: Option<i64>,
 }
 
 impl CheckRunModel {

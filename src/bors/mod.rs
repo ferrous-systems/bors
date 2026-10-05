@@ -13,7 +13,7 @@ pub use context::BorsContext;
 pub use handlers::{handle_bors_global_event, handle_bors_repository_event};
 use itertools::Itertools;
 use octocrab::models::workflows::Job;
-use octocrab::models::{CheckRunId, RunId};
+use octocrab::models::{AppId, CheckRunId, RunId};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -246,10 +246,11 @@ pub struct CheckRun {
     pub started_at: DateTime<Utc>,
     pub duration: Option<Duration>,
     pub github_workflow_run_id: Option<octocrab::models::RunId>,
+    pub github_app_id: Option<AppId>,
 }
 
-impl From<octocrab::models::checks::CheckRun> for CheckRun {
-    fn from(value: octocrab::models::checks::CheckRun) -> Self {
+impl From<crate::github::models::CheckRun> for CheckRun {
+    fn from(value: crate::github::models::CheckRun) -> Self {
         Self {
             id: value.id,
             name: value.name,
@@ -268,6 +269,7 @@ impl From<octocrab::models::checks::CheckRun> for CheckRun {
                 }
                 _ => None,
             },
+            github_app_id: value.app.map(|app| app.id),
         }
     }
 }
@@ -284,6 +286,7 @@ impl From<crate::database::CheckRunModel> for CheckRun {
             duration: None,
             started_at: value.started_at,
             status: value.status,
+            github_app_id: value.github_app_id.map(|id| AppId(id as _)),
         }
     }
 }
@@ -292,28 +295,6 @@ pub struct FailedCheckRun {
     pub check_run: CheckRun,
     pub failed_github_jobs: Vec<Job>,
 }
-
-// impl From<octocrab::models::workflows::Job> for CheckRun {
-//     fn from(value: octocrab::models::workflows::Job) -> Self {
-//         Self {
-//             id: value.id.0.into(), // github reuses check-run id for workflow jobs
-//             name: value.name,
-//             url: value.html_url.to_string(),
-//             commit_sha: value.head_sha.into(),
-//             github_workflow_run_id: Some(value.run_id),
-//             started_at: value.started_at,
-//             status: match value.conclusion.as_deref() {
-//                 Some("success") => WorkflowStatus::Success,
-//                 Some(_) => WorkflowStatus::Failure,
-//                 None => WorkflowStatus::Pending,
-//             },
-//             duration: value
-//                 .completed_at
-//                 .map(|completed| (completed - value.started_at).to_std().ok())
-//                 .flatten(),
-//         }
-//     }
-// }
 
 /// An access point to a single repository.
 /// Can be used to query permissions for the repository, and also to perform various

@@ -1,7 +1,7 @@
 use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestNumber};
 use chrono::Duration;
-use octocrab::models::{CheckRunId, RunId};
+use octocrab::models::{AppId, CheckRunId, RunId};
 
 #[derive(Debug)]
 pub enum BorsRepositoryEvent {
@@ -187,6 +187,7 @@ pub struct CheckRunCreated {
     pub html_url: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub github_workflow_run_id: Option<RunId>,
+    pub github_app_id: Option<AppId>,
 }
 
 #[derive(Debug)]
@@ -197,4 +198,5 @@ pub struct CheckRunCompleted {
     pub commit_sha: CommitSha,
     pub status: WorkflowStatus,
     pub running_time: Option<Duration>,
+    pub github_app_id: Option<AppId>,
 }
