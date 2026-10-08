@@ -4,6 +4,7 @@ use axum::body::Bytes;
 use axum::extract::FromRequest;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use octocrab::models::events::payload::{
     IssueCommentEventAction, IssueCommentEventPayload, PullRequestEventChangesFrom,
@@ -11,8 +12,9 @@ use octocrab::models::events::payload::{
 };
 use octocrab::models::pulls::{PullRequest, Review};
 use octocrab::models::webhook_events::payload::PullRequestWebhookEventAction;
-use octocrab::models::{Author, CheckSuiteId, JobId, Repository, RunId, workflows};
+use octocrab::models::{App, AppId, Author, CheckSuiteId, JobId, Repository, RunId, workflows};
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use sha2::Sha256;
 
 use crate::bors::event::{
@@ -25,6 +27,8 @@ use crate::bors::event::{
 use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
 use crate::server::ServerStateRef;
+
+const CIRCLECI_APP_ID: AppId = AppId(18001);
 
 /// Wrapper for a secret which is zeroed on drop and can be exposed only through the
 /// [`WebhookSecret::expose`] method.
@@ -67,6 +71,31 @@ struct WorkflowRunInner {
     check_suite_id: CheckSuiteId,
     #[serde(flatten)]
     run: workflows::Run,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct WebhookCheckRun<'a> {
+    action: &'a str,
+    check_run: CheckRunInner,
+    repository: Repository,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct CheckSuiteInner {
+    id: CheckSuiteId,
+    head_branch: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct CheckRunInner {
+    name: String,
+    head_sha: String,
+    external_id: Option<String>,
+    conclusion: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    check_suite: CheckSuiteInner,
+    app: App,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -181,6 +210,7 @@ fn parse_webhook_event(request: Parts, body: &[u8]) -> anyhow::Result<Option<Bor
         ))),
         b"workflow_run" => parse_workflow_run_events(body),
         b"workflow_job" => parse_workflow_job_events(body),
+        b"check_run" => parse_check_run_events(body),
         _ => {
             tracing::debug!(
                 "Ignoring unknown webhook event type {:?}",
@@ -387,6 +417,67 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
         _ => None,
     };
     Ok(result)
+}
+
+fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
+    let payload: WebhookCheckRun = serde_json::from_slice(body)?;
+
+    // We only care about check-runs from circleci; all other check-runs are ignored
+    if payload.check_run.app.id != CIRCLECI_APP_ID {
+        return Ok(None);
+    }
+
+    let repository = parse_repository_name(&payload.repository)?;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct CircleCiExternalId {
+        workflow_id: String,
+    }
+
+    let external_id: CircleCiExternalId =
+        serde_json::from_str(&payload.check_run.external_id.unwrap_or_default())?;
+    let url = format!(
+        "https://app.circleci.com/workflow/{}",
+        external_id.workflow_id
+    );
+
+    let event = match payload.action {
+        "created" => BorsRepositoryEvent::WorkflowStarted(WorkflowRunStarted {
+            repository,
+            name: payload.check_run.name,
+            branch: payload
+                .check_run
+                .check_suite
+                .head_branch
+                .unwrap_or_default(),
+            commit_sha: payload.check_run.head_sha.into(),
+            platform: WorkflowPlatformData::CircleCi(external_id.workflow_id),
+            url,
+        }),
+        "completed" => BorsRepositoryEvent::WorkflowCompleted(WorkflowRunCompleted {
+            repository,
+            branch: payload
+                .check_run
+                .check_suite
+                .head_branch
+                .unwrap_or_default(),
+            commit_sha: payload.check_run.head_sha.into(),
+            platform: WorkflowPlatformData::CircleCi(external_id.workflow_id),
+            status: match payload.check_run.conclusion.as_deref() {
+                Some("success") => WorkflowStatus::Success,
+                _ => WorkflowStatus::Failure,
+            },
+            running_time: match (payload.check_run.started_at, payload.check_run.completed_at) {
+                (Some(started_at), Some(completed_at)) => Some(completed_at - started_at),
+                _ => None,
+            },
+            check_suite_id: payload.check_run.check_suite.id,
+        }),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(BorsEvent::Repository(event)))
 }
 
 fn parse_workflow_job_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
@@ -1844,6 +1935,72 @@ mod tests {
         )
         "#
         );
+    }
+
+    #[tokio::test]
+    async fn circleci_check_run_created() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/circleci-check-run-created.json", "check_run").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    WorkflowStarted(
+                        WorkflowRunStarted {
+                            repository: ferrous-systems-test/test,
+                            name: "a - e0125647",
+                            branch: "automation/bors/auto",
+                            commit_sha: CommitSha(
+                                "aa494bc0e9017d68437de2dc434217c8270d33f7",
+                            ),
+                            platform: CircleCi(
+                                "31250ea2-caeb-4068-9290-42e511a0582c",
+                            ),
+                            url: "https://app.circleci.com/workflow/31250ea2-caeb-4068-9290-42e511a0582c",
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
+        )
+    }
+
+    #[tokio::test]
+    async fn circleci_check_run_completed() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/circleci-check-run-completed.json", "check_run").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    WorkflowCompleted(
+                        WorkflowRunCompleted {
+                            repository: ferrous-systems-test/test,
+                            branch: "automation/bors/auto",
+                            commit_sha: CommitSha(
+                                "aa494bc0e9017d68437de2dc434217c8270d33f7",
+                            ),
+                            platform: CircleCi(
+                                "31250ea2-caeb-4068-9290-42e511a0582c",
+                            ),
+                            status: Success,
+                            running_time: Some(
+                                TimeDelta {
+                                    secs: 7,
+                                    nanos: 0,
+                                },
+                            ),
+                            check_suite_id: CheckSuiteId(
+                                91516128170,
+                            ),
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
+        )
     }
 
     #[tokio::test]
