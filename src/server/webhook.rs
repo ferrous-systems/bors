@@ -20,9 +20,9 @@ use crate::bors::event::{
     PullRequestComment, PullRequestConvertedToDraft, PullRequestEdited, PullRequestMerged,
     PullRequestOpened, PullRequestPushed, PullRequestReadyForReview, PullRequestReopened,
     PullRequestUnassigned, PushToBranch, WorkflowJobCompleted, WorkflowJobStarted,
-    WorkflowRunCompleted, WorkflowRunStarted,
+    WorkflowPlatformData, WorkflowRunCompleted, WorkflowRunStarted,
 };
-use crate::database::{WorkflowStatus, WorkflowType};
+use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
 use crate::server::ServerStateRef;
 
@@ -350,8 +350,7 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                 name: payload.workflow_run.run.name,
                 branch: payload.workflow_run.run.head_branch,
                 commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-                run_id: payload.workflow_run.run.id,
-                workflow_type: WorkflowType::Github,
+                platform: WorkflowPlatformData::GitHub(payload.workflow_run.run.id),
                 url: payload.workflow_run.run.html_url.into(),
             },
         ))),
@@ -369,7 +368,7 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                     repository: repository_name,
                     branch: payload.workflow_run.run.head_branch,
                     commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-                    run_id: payload.workflow_run.run.id,
+                    platform: WorkflowPlatformData::GitHub(payload.workflow_run.run.id),
                     check_suite_id: payload.workflow_run.check_suite_id,
                     running_time,
                     status: match payload
@@ -1728,10 +1727,11 @@ mod tests {
                             commit_sha: CommitSha(
                                 "c9abcadf285659684c0975cead8bf982fa84e123",
                             ),
-                            run_id: RunId(
-                                4900979074,
+                            platform: GitHub(
+                                RunId(
+                                    4900979074,
+                                ),
                             ),
-                            workflow_type: Github,
                             url: "https://github.com/Kobzol/bors-kindergarten/actions/runs/4900979074",
                         },
                     ),
@@ -1757,8 +1757,10 @@ mod tests {
                             commit_sha: CommitSha(
                                 "c9abcadf285659684c0975cead8bf982fa84e123",
                             ),
-                            run_id: RunId(
-                                4900979072,
+                            platform: GitHub(
+                                RunId(
+                                    4900979072,
+                                ),
                             ),
                             status: Failure,
                             running_time: Some(

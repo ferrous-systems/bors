@@ -3,7 +3,8 @@ use crate::bors::build::{CancelBuildConclusion, CancelBuildError};
 use crate::bors::build_queue::BuildQueueSender;
 use crate::bors::comment::{CommentTag, append_workflow_links_to_comment};
 use crate::bors::event::{
-    WorkflowJobCompleted, WorkflowJobStarted, WorkflowRunCompleted, WorkflowRunStarted,
+    WorkflowJobCompleted, WorkflowJobStarted, WorkflowPlatformData, WorkflowRunCompleted,
+    WorkflowRunStarted,
 };
 use crate::bors::handlers::{get_build_kind_from_branch, is_bors_observed_branch};
 use crate::bors::{BuildKind, build};
@@ -52,15 +53,28 @@ pub(super) async fn handle_workflow_started(
     }
 
     tracing::info!("Storing workflow started into DB");
-    db.create_workflow(
-        &build,
-        payload.name.clone(),
-        payload.url.clone(),
-        payload.run_id.into(),
-        payload.workflow_type.clone(),
-        WorkflowStatus::Pending,
-    )
-    .await?;
+    match &payload.platform {
+        WorkflowPlatformData::CircleCi(workflow_id) => {
+            db.create_circleci_workflow(
+                &build,
+                &payload.name,
+                &payload.url,
+                &workflow_id,
+                WorkflowStatus::Pending,
+            )
+            .await?
+        }
+        WorkflowPlatformData::GitHub(run_id) => {
+            db.create_github_workflow(
+                &build,
+                &payload.name,
+                &payload.url,
+                *run_id,
+                WorkflowStatus::Pending,
+            )
+            .await?
+        }
+    }
 
     add_workflow_links_to_build_start_comment(repo, db, &build, payload).await?;
 
@@ -143,8 +157,12 @@ pub(super) async fn handle_workflow_completed(
     }
 
     tracing::info!("Updating status of workflow to {:?}", payload.status);
-    db.update_workflow_status(*payload.run_id, payload.status)
-        .await?;
+    let run_id = match &payload.platform {
+        WorkflowPlatformData::CircleCi(workflow_id) => workflow_id.clone(),
+        WorkflowPlatformData::GitHub(run_id) => run_id.into_inner().to_string(),
+    };
+
+    db.update_workflow_status(&run_id, payload.status).await?;
 
     build_queue_tx
         .on_workflow_completed(payload, error_context)

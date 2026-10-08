@@ -5,8 +5,8 @@ use crate::ec2::{Ec2Instance, Ec2InstanceStatus, get_aws_credentials, get_ec2_in
 use crate::github::{GitHubSession, GithubRepoName, OAuthExchangeCode, PullRequestNumber, rollup};
 use crate::server::cached::Cached;
 use crate::templates::{
-    EC2Template, HelpTemplate, HtmlTemplate, NotFoundTemplate, PendingBuild, PendingWorkflow,
-    PullRequestStats, QueueTemplate, RepositoryView, RollupsInfo,
+    EC2Template, HelpTemplate, HtmlTemplate, NotFoundTemplate, PendingBuild, PullRequestStats,
+    QueueTemplate, RepositoryView, RollupsInfo,
 };
 use crate::utils::sort_queue::sort_queue_prs;
 use crate::{
@@ -479,28 +479,30 @@ pub async fn queue_handler(
             QueueStatus::Pending(_, build) => Some((pr.number, build)),
             _ => None,
         });
-        let mut pending = HashMap::new();
+        let mut pending = HashMap::<PullRequestNumber, PendingBuild>::new();
         for (pr, build_model) in builds {
             let workflow = db
                 .get_workflows_for_build(build_model)
                 .await?
                 .into_iter()
                 .next();
-            let workflow = workflow.map(|workflow| {
-                let jobs = state
-                    .ctx
-                    .get_job_cache()
-                    .get_jobs(&repo.name, workflow.run_id.into());
-                PendingWorkflow { workflow, jobs }
-            });
+            _ = (&mut pending, pr, workflow);
+            unreachable!("Ferrous Systems does not use EC2 instances");
+            // let workflow = workflow.map(|workflow| {
+            //     let jobs = state
+            //         .ctx
+            //         .get_job_cache()
+            //         .get_jobs(&repo.name, workflow.run_id.into());
+            //     PendingWorkflow { workflow, jobs }
+            // });
 
-            pending.insert(
-                pr,
-                PendingBuild {
-                    build: build_model.clone(),
-                    workflow,
-                },
-            );
+            // pending.insert(
+            //     pr,
+            //     PendingBuild {
+            //         build: build_model.clone(),
+            //         workflow,
+            //     },
+            // );
         }
         pending
     };

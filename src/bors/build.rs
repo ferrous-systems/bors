@@ -1,13 +1,14 @@
 use crate::PgDbClient;
 use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
 use crate::database::{
-    BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams, WorkflowModel,
+    BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams,
+    WorkflowModel, WorkflowPlatform,
 };
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::api::operations::{CommitAuthor, ForcePush};
 use crate::github::{CommitSha, MergeResult, attempt_merge};
-use octocrab::models::CheckRunId;
 use octocrab::models::workflows::{Conclusion, Job, Status};
+use octocrab::models::{CheckRunId, RunId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 
 /// We want to distinguish between a critical failure (a build was not marked as cancelled, in which
@@ -61,14 +62,17 @@ pub async fn cancel_build(
         .get_pending_workflows_for_build(build)
         .await
         .map_err(CancelBuildError::FailedToCancelWorkflows)?;
-    let pending_workflow_ids: Vec<octocrab::models::RunId> = pending_workflows
-        .iter()
-        .map(|workflow| octocrab::models::RunId(workflow.run_id.0))
-        .collect();
 
-    tracing::info!("Cancelling workflows {:?}", pending_workflow_ids);
+    let pending_github_workflow_ids: Vec<octocrab::models::RunId> = pending_workflows
+        .iter()
+        .filter(|workflow| workflow.platform == WorkflowPlatform::Github)
+        // if a run_id fails to parse, that's fine - cancelling the workflows is a courtesy
+        .filter_map(|workflow| Some(octocrab::models::RunId(workflow.run_id.parse().ok()?)))
+        .collect::<Vec<_>>();
+
+    tracing::info!("Cancelling workflows {:?}", pending_github_workflow_ids);
     client
-        .cancel_workflows(&pending_workflow_ids)
+        .cancel_workflows(&pending_github_workflow_ids)
         .await
         .map_err(CancelBuildError::FailedToCancelWorkflows)?;
 
@@ -119,7 +123,12 @@ pub async fn load_workflow_runs(
 ) -> anyhow::Result<Vec<WorkflowRun>> {
     // Load the workflow runs that we know about from the DB. We know about workflow runs for
     // which we have received a started or a completed event.
-    let db_workflow_runs = db.get_workflows_for_build(build).await?;
+    let db_workflow_runs = db
+        .get_workflows_for_build(build)
+        .await?
+        .into_iter()
+        .filter(|w| w.platform == WorkflowPlatform::Github)
+        .collect::<Vec<_>>();
     tracing::debug!("Workflow runs from DB: {db_workflow_runs:?}");
 
     // Ask GitHub about all workflow runs attached to the build commit.
@@ -136,9 +145,18 @@ pub async fn load_workflow_runs(
     // propagated to the DB yet.
     // Here we reconcile the two world views.
     for db_run in db_workflow_runs {
+        let Ok(db_run_id) = db_run.run_id.parse::<u64>() else {
+            tracing::error!(
+                run_id = %db_run.run_id,
+                "Found GitHub workflow in DB with invalid run_id",
+            );
+            continue;
+        };
+        let db_run_id = RunId(db_run_id);
+
         if let Some(gh_run) = workflow_runs
             .iter_mut()
-            .find(|gh_run| gh_run.id == db_run.run_id.into())
+            .find(|gh_run| gh_run.id == db_run_id)
         {
             if gh_run.status != db_run.status && !db_run.status.is_pending() {
                 // If our DB has a conclusion for the workflow that does not match GH state, we
@@ -155,7 +173,7 @@ pub async fn load_workflow_runs(
                 db_run.status
             );
             workflow_runs.push(WorkflowRun {
-                id: db_run.run_id.into(),
+                id: db_run_id,
                 name: db_run.name,
                 url: db_run.url,
                 status: db_run.status,

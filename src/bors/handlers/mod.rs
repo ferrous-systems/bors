@@ -115,7 +115,7 @@ pub async fn handle_bors_repository_event(
             let span = tracing::info_span!(
                 "Workflow started",
                 repo = payload.repository.to_string(),
-                id = payload.run_id.into_inner()
+                platform = ?payload.platform,
             );
             handle_workflow_started(repo, db, payload)
                 .instrument(span.clone())
@@ -125,7 +125,7 @@ pub async fn handle_bors_repository_event(
             let span = tracing::info_span!(
                 "Workflow completed",
                 repo = payload.repository.to_string(),
-                id = payload.run_id.into_inner()
+                platform = ?payload.platform,
             );
             handle_workflow_completed(repo, db, payload, senders.build_queue())
                 .instrument(span)

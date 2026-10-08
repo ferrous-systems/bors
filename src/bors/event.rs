@@ -1,4 +1,4 @@
-use crate::database::{WorkflowStatus, WorkflowType};
+use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestNumber};
 use chrono::Duration;
 use octocrab::models::{CheckSuiteId, JobId, RunId};
@@ -177,13 +177,18 @@ pub struct PushToBranch {
 }
 
 #[derive(Debug)]
+pub enum WorkflowPlatformData {
+    CircleCi(String),
+    GitHub(RunId),
+}
+
+#[derive(Debug)]
 pub struct WorkflowRunStarted {
     pub repository: GithubRepoName,
     pub name: String,
     pub branch: String,
     pub commit_sha: CommitSha,
-    pub run_id: RunId,
-    pub workflow_type: WorkflowType,
+    pub platform: WorkflowPlatformData,
     pub url: String,
 }
 
@@ -192,7 +197,7 @@ pub struct WorkflowRunCompleted {
     pub repository: GithubRepoName,
     pub branch: String,
     pub commit_sha: CommitSha,
-    pub run_id: RunId,
+    pub platform: WorkflowPlatformData,
     pub status: WorkflowStatus,
     pub running_time: Option<Duration>,
     /// Check suite to which this workflow is attached.

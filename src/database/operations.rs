@@ -6,11 +6,10 @@ use std::collections::{HashMap, HashSet};
 use super::DelegatedPermission;
 use super::MergeableState;
 use super::PullRequestModel;
-use super::RunId;
 use super::TreeState;
 use super::UpsertPullRequestParams;
+use super::WorkflowPlatform;
 use super::WorkflowStatus;
-use super::WorkflowType;
 use super::{ApprovalInfo, PrimaryKey, UpdateBuildParams};
 use super::{ApprovalStatus, RollupMember};
 use super::{Assignees, RegisterRollupMemberParams};
@@ -844,20 +843,20 @@ pub(crate) async fn create_workflow(
     build_id: i32,
     name: &str,
     url: &str,
-    run_id: RunId,
-    workflow_type: WorkflowType,
+    run_id: &str,
+    workflow_type: WorkflowPlatform,
     status: WorkflowStatus,
 ) -> anyhow::Result<()> {
     measure_db_query("create_workflow", || async {
         sqlx::query!(
             r#"
-INSERT INTO workflow (build_id, name, url, run_id, type, status)
+INSERT INTO workflow (build_id, name, url, run_id, platform, status)
 VALUES ($1, $2, $3, $4, $5, $6)
 "#,
             build_id,
             name,
             url,
-            run_id.0 as i64,
+            run_id,
             workflow_type as _,
             status as _
         )
@@ -870,14 +869,14 @@ VALUES ($1, $2, $3, $4, $5, $6)
 
 pub(crate) async fn update_workflow_status(
     executor: impl PgExecutor<'_>,
-    run_id: u64,
+    run_id: &str,
     status: WorkflowStatus,
 ) -> anyhow::Result<()> {
     measure_db_query("update_workflow_status", || async {
         sqlx::query!(
             "UPDATE workflow SET status = $1 WHERE run_id = $2",
             status as _,
-            run_id as i64
+            run_id
         )
         .execute(executor)
         .await?;
@@ -967,7 +966,7 @@ SELECT
     workflow.name,
     workflow.url,
     workflow.run_id,
-    workflow.type as "workflow_type: WorkflowType",
+    workflow.platform as "platform: WorkflowPlatform",
     workflow.status as "status: WorkflowStatus",
     workflow.created_at as "created_at: DateTime<Utc>",
     build AS "build!: BuildModel"
@@ -1018,7 +1017,7 @@ SELECT
     workflow.name,
     workflow.url,
     workflow.run_id,
-    workflow.type as "workflow_type: WorkflowType",
+    workflow.platform as "platform: WorkflowPlatform",
     workflow.status as "status: WorkflowStatus",
     workflow.created_at as "created_at: DateTime<Utc>",
     build AS "build!: BuildModel"
