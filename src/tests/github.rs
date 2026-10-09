@@ -2,7 +2,7 @@ use crate::OAuthConfig;
 use crate::bors::PullRequestStatus;
 use crate::database::WorkflowStatus;
 use crate::github::api::client::HideCommentReason;
-use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
+use crate::github::{CIRCLECI_CHECKS_APP_ID, CommitSha, GithubRepoName, PullRequestNumber};
 use crate::permissions::PermissionType;
 use crate::tests::COMMENT_RECEIVE_TIMEOUT;
 use chrono::{DateTime, Utc};
@@ -10,13 +10,17 @@ use http::StatusCode;
 use itertools::Itertools;
 use octocrab::models::pulls::MergeableState;
 use octocrab::models::workflows::Conclusion;
-use octocrab::models::{CheckSuiteId, JobId, RunId};
+use octocrab::models::{AppId, CheckRunId, CheckSuiteId, JobId, RunId};
+use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::{Receiver, Sender};
+use uuid::Uuid;
+
+pub const BORS_APP_ID: AppId = AppId(0x4361726D656E);
 
 /// Represents the state of GitHub.
 pub struct GitHub {
@@ -26,6 +30,8 @@ pub struct GitHub {
     teams: HashSet<String>,
     pub oauth_config: OAuthConfig,
     workflow_run_id_counter: u64,
+    // circleci_workflows: HashMap<Uuid, WorkflowStatus>,
+    check_run_id_counter: u64,
 }
 
 impl GitHub {
@@ -106,6 +112,14 @@ impl GitHub {
     pub fn with_repo(mut self, repo: Repo) -> Self {
         self.add_repo(repo);
         self
+    }
+
+    pub fn get_repo_by_check_run_id(&self, check_run_id: CheckRunId) -> Arc<Mutex<Repo>> {
+        self.repos
+            .values()
+            .find(|repo| repo.lock().check_runs.iter().any(|c| c.id == check_run_id))
+            .unwrap()
+            .clone()
     }
 
     pub fn get_repo_by_run_id(&self, run_id: RunId) -> Arc<Mutex<Repo>> {
@@ -257,6 +271,45 @@ impl GitHub {
         repo.workflow_runs.push(workflow);
         run_id
     }
+
+    pub fn next_check_run_id(&mut self) -> CheckRunId {
+        self.check_run_id_counter += 1;
+        CheckRunId(self.check_run_id_counter)
+    }
+
+    pub fn new_circleci_workflow(&mut self, repo: &GithubRepoName, branch: &str) -> CheckRunId {
+        let repo = self.get_repo(repo);
+        let mut repo = repo.lock();
+
+        let check_run_id = self.next_check_run_id();
+        let workflow_id = Uuid::new_v4();
+        let check_run = CheckRunData {
+            github_app_id: CIRCLECI_CHECKS_APP_ID,
+            id: check_run_id,
+            name: "CircleCI workflow".to_string(),
+            head_branch: Some(branch.to_string()),
+            head_sha: repo
+                .get_branch_by_name(branch)
+                .expect("Branch not found")
+                .sha(),
+            status: CheckRunStatus::InProgress, // circleci check-runs start with "in_progress"
+            conclusion: None,
+            title: "Some CircleCI workflow".to_string(),
+            summary: "This is a CircleCI workflow!".to_string(),
+            text: "This workflow is executing on CircleCI! Wowee! Here's a link!".to_string(),
+            external_id: serde_json::to_string(&serde_json::json!({
+                "actor-id": Uuid::new_v4().to_string(),
+                "source": "notifications",
+                "workflow-id": workflow_id.to_string(),
+            }))
+            .unwrap(),
+            started_at: Utc::now(),
+            completed_at: None,
+        };
+
+        repo.add_check_run(check_run);
+        check_run_id
+    }
 }
 
 /// Represents the default GitHub state for tests.
@@ -273,6 +326,7 @@ impl Default for GitHub {
             teams: Default::default(),
             oauth_config: default_oauth_config(),
             workflow_run_id_counter: 0,
+            check_run_id_counter: 0,
         };
 
         let config = r#"
@@ -487,6 +541,12 @@ impl Repo {
         }
     }
 
+    pub fn get_branch_by_sha(&self, sha: &str) -> Option<&Branch> {
+        self.branches
+            .iter()
+            .find(|b| b.get_commit().commit_sha().0 == sha)
+    }
+
     pub fn push_commit(&mut self, branch_name: &str, commit: Commit, force: bool) {
         self.create_commit(commit.clone());
         self.get_branch_by_name(branch_name)
@@ -526,13 +586,27 @@ impl Repo {
 
     pub fn update_check_run(
         &mut self,
-        check_run_id: u64,
-        status: String,
-        conclusion: Option<String>,
+        check_run_id: CheckRunId,
+        status: CheckRunStatus,
+        conclusion: Option<CheckRunConclusion>,
     ) {
-        let check_run = self.check_runs.get_mut(check_run_id as usize).unwrap();
+        let check_run = self.get_check_run_mut(check_run_id);
         check_run.status = status;
         check_run.conclusion = conclusion;
+    }
+
+    pub fn get_check_run(&self, check_run_id: CheckRunId) -> &CheckRunData {
+        self.check_runs
+            .iter()
+            .find(|c| c.id == check_run_id)
+            .unwrap()
+    }
+
+    pub fn get_check_run_mut(&mut self, check_run_id: CheckRunId) -> &mut CheckRunData {
+        self.check_runs
+            .iter_mut()
+            .find(|c| c.id == check_run_id)
+            .unwrap()
     }
 
     pub fn get_workflow_mut(&mut self, run_id: RunId) -> &mut WorkflowRun {
@@ -1065,6 +1139,45 @@ impl Permissions {
 }
 
 #[derive(Clone)]
+pub struct CheckRunEvent {
+    pub event: CheckRunEventKind,
+    pub check_run_id: CheckRunId,
+}
+
+impl CheckRunEvent {
+    pub fn started(check_run_id: CheckRunId) -> CheckRunEvent {
+        Self {
+            event: CheckRunEventKind::Started,
+            check_run_id,
+        }
+    }
+
+    pub fn success(check_run_id: CheckRunId) -> CheckRunEvent {
+        Self {
+            event: CheckRunEventKind::Completed {
+                conclusion: CheckRunConclusion::Success,
+            },
+            check_run_id,
+        }
+    }
+
+    pub fn failure(check_run_id: CheckRunId) -> CheckRunEvent {
+        Self {
+            event: CheckRunEventKind::Completed {
+                conclusion: CheckRunConclusion::Failure,
+            },
+            check_run_id,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum CheckRunEventKind {
+    Started,
+    Completed { conclusion: CheckRunConclusion },
+}
+
+#[derive(Clone)]
 pub struct WorkflowEvent {
     pub event: WorkflowEventKind,
     pub run_id: RunId,
@@ -1115,14 +1228,19 @@ pub enum TestWorkflowStatus {
 
 #[derive(Clone, Debug)]
 pub struct CheckRunData {
+    pub id: CheckRunId,
     pub name: String,
+    pub head_branch: Option<String>,
     pub head_sha: String,
-    pub status: String,
-    pub conclusion: Option<String>,
+    pub status: CheckRunStatus,
+    pub conclusion: Option<CheckRunConclusion>,
     pub title: String,
     pub summary: String,
     pub text: String,
     pub external_id: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub github_app_id: AppId,
 }
 
 #[derive(Clone)]

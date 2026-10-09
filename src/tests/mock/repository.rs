@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::database::WorkflowStatus;
 use crate::github::CommitSha;
 use crate::tests::BranchPushError;
-use crate::tests::github::{CheckRunData, Commit, GitUser, WorkflowRun};
+use crate::tests::github::{BORS_APP_ID, CheckRunData, Commit, GitUser, WorkflowRun};
 use crate::tests::mock::pull_request::mock_pull_requests;
 use crate::tests::mock::workflow::GitHubWorkflowRun;
 use crate::tests::mock::{GitHubUser, dynamic_mock_req};
@@ -13,7 +13,8 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use octocrab::models::repos::Object;
 use octocrab::models::workflows::{Conclusion, Status, Step};
-use octocrab::models::{JobId, RunId};
+use octocrab::models::{AppId, CheckRunId, JobId, RunId};
+use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -64,10 +65,10 @@ pub async fn mock_repo(
             .await;
     }
 
-    mock_pull_requests(repo.clone(), github, mock_server).await;
+    mock_pull_requests(repo.clone(), github.clone(), mock_server).await;
     mock_branches_and_commits(repo.clone(), mock_server).await;
     mock_cancel_workflow(repo.clone(), mock_server).await;
-    mock_check_runs(repo.clone(), mock_server).await;
+    mock_check_runs(github.clone(), repo.clone(), mock_server).await;
     mock_workflow_runs(repo.clone(), mock_server).await;
     mock_workflow_jobs(repo.clone(), mock_server).await;
     mock_contents(repo.clone(), mock_server).await;
@@ -522,20 +523,21 @@ struct CheckRunRequestOutput {
 
 #[derive(serde::Serialize)]
 struct CheckRunResponse {
-    id: u64,
+    id: CheckRunId,
     node_id: String,
     name: String,
     head_sha: String,
     url: String,
     html_url: String,
     details_url: Option<String>,
-    status: String,
-    conclusion: Option<String>,
-    started_at: String,
-    completed_at: Option<String>,
+    status: CheckRunStatus,
+    conclusion: Option<CheckRunConclusion>,
+    started_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
     external_id: String,
     output: CheckRunResponseOutput,
     pull_requests: Vec<serde_json::Value>,
+    app: AppResponse,
 }
 
 #[derive(serde::Serialize)]
@@ -547,7 +549,17 @@ struct CheckRunResponseOutput {
     annotations_url: String,
 }
 
-async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
+#[derive(serde::Serialize)]
+struct AppResponse {
+    // bors only checks for the app id, everything else is ignored
+    id: AppId,
+}
+
+async fn mock_check_runs(
+    github: Arc<Mutex<GitHub>>,
+    repo: Arc<Mutex<Repo>>,
+    mock_server: &MockServer,
+) {
     let repo_name = repo.lock().full_name();
     Mock::given(method("POST"))
         .and(path(format!("/repos/{repo_name}/check-runs")))
@@ -564,24 +576,41 @@ async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                     external_id: String,
                 }
 
+                let check_run_id = {
+                    let mut github = github.lock();
+                    github.next_check_run_id()
+                };
+
                 let data: CheckRunRequest = request.body_json().unwrap();
-                let time = Utc::now().to_rfc3339();
+                let started_at = Utc::now();
+
+                let status = match data.status.as_str() {
+                    "queued" => CheckRunStatus::Queued,
+                    "in_progress" => CheckRunStatus::InProgress,
+                    "completed" => CheckRunStatus::Completed,
+                    _ => return ResponseTemplate::new(400).set_body_string(format!("invalid status: {}", data.status)),
+                };
+
+                let mut repo = repo.lock();
+                let head_branch = repo.get_branch_by_sha(&data.head_sha);
 
                 let check_run = CheckRunData {
+                    github_app_id: BORS_APP_ID,
+                    id: check_run_id,
                     name: data.name.clone(),
+                    head_branch: head_branch.map(|b| b.name().to_string()),
                     head_sha: data.head_sha.clone(),
-                    status: data.status.clone(),
+                    status: status.clone(),
                     conclusion: None,
                     title: data.output.title.clone(),
                     summary: data.output.summary.clone(),
                     text: data.output.text.clone().unwrap_or_default(),
                     external_id: data.external_id.clone(),
+                    started_at,
+                    completed_at: None,
                 };
 
-                let mut repo = repo.lock();
                 repo.add_check_run(check_run);
-
-                let check_run_id = (repo.check_runs().len() - 1) as u64;
 
                 let response = CheckRunResponse {
                     id: check_run_id,
@@ -593,9 +622,9 @@ async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                     ),
                     html_url: format!("https://github.com/{repo_name}/runs/{check_run_id}"),
                     details_url: None,
-                    status: data.status,
+                    status,
                     conclusion: None,
-                    started_at: time,
+                    started_at,
                     completed_at: None,
                     external_id: data.external_id,
                     output: CheckRunResponseOutput {
@@ -608,6 +637,7 @@ async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                         ),
                     },
                     pull_requests: vec![],
+                    app: AppResponse { id: BORS_APP_ID }
                 };
 
                 ResponseTemplate::new(201).set_body_json(response)
@@ -631,19 +661,41 @@ async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                 }
 
                 let path = request.url.path();
-                let check_run_id = path
+                let check_run_id = CheckRunId(path
                     .split('/')
                     .next_back()
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap();
+                    .unwrap());
 
                 let data: UpdateCheckRunRequest = request.body_json().unwrap();
-                let time = Utc::now().to_rfc3339();
+
+                let status = match data.status.as_str() {
+                    "queued" => CheckRunStatus::Queued,
+                    "in_progress" => CheckRunStatus::InProgress,
+                    "completed" => CheckRunStatus::Completed,
+                    _ => return ResponseTemplate::new(400).set_body_string(format!("invalid status: {}", data.status))
+                };
+
+                let conclusion = data.conclusion.map(|conclusion| Ok(match conclusion.as_str() {
+                    "success" => CheckRunConclusion::Success,
+                    "failure" => CheckRunConclusion::Failure,
+                    "neutral" => CheckRunConclusion::Neutral,
+                    "cancelled" => CheckRunConclusion::Cancelled,
+                    "timed_out" => CheckRunConclusion::TimedOut,
+                    "skipped" => CheckRunConclusion::Skipped,
+                    "stale" => CheckRunConclusion::Stale,
+                    "action_required" => CheckRunConclusion::ActionRequired,
+                    _ => return Err(format!("invalid conclusion: {conclusion}"))
+                })).transpose();
+                let conclusion = match conclusion {
+                    Ok(c) => c,
+                    Err(err) => return ResponseTemplate::new(400).set_body_string(err),
+                };
 
                 let mut repo = repo.lock();
-                repo.update_check_run(check_run_id, data.status.clone(), data.conclusion.clone());
+                repo.update_check_run(check_run_id, status, conclusion);
 
-                let check_run = &repo.check_runs()[check_run_id as usize];
+                let check_run = repo.get_check_run(check_run_id);
 
                 let response = CheckRunResponse {
                     id: check_run_id,
@@ -657,12 +709,8 @@ async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                     details_url: None,
                     status: check_run.status.clone(),
                     conclusion: check_run.conclusion.clone(),
-                    started_at: time.clone(),
-                    completed_at: if check_run.status == "completed" {
-                        Some(time)
-                    } else {
-                        None
-                    },
+                    started_at: check_run.started_at.clone(),
+                    completed_at: check_run.completed_at.clone(),
                     external_id: check_run.external_id.clone(),
                     output: CheckRunResponseOutput {
                         title: check_run.title.clone(),
@@ -674,6 +722,7 @@ async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                         ),
                     },
                     pull_requests: vec![],
+                    app: AppResponse { id: check_run.github_app_id }
                 };
 
                 ResponseTemplate::new(200).set_body_json(response)

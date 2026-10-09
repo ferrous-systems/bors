@@ -12,7 +12,9 @@ use octocrab::models::events::payload::{
 };
 use octocrab::models::pulls::{PullRequest, Review};
 use octocrab::models::webhook_events::payload::PullRequestWebhookEventAction;
-use octocrab::models::{App, AppId, Author, CheckSuiteId, JobId, Repository, RunId, workflows};
+use octocrab::models::{
+    App, Author, CheckRunId, CheckSuiteId, JobId, Repository, RunId, workflows,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -25,10 +27,8 @@ use crate::bors::event::{
     WorkflowPlatformData, WorkflowRunCompleted, WorkflowRunStarted,
 };
 use crate::database::WorkflowStatus;
-use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
+use crate::github::{CIRCLECI_CHECKS_APP_ID, CommitSha, GithubRepoName, PullRequestNumber};
 use crate::server::ServerStateRef;
-
-const CIRCLECI_APP_ID: AppId = AppId(18001);
 
 /// Wrapper for a secret which is zeroed on drop and can be exposed only through the
 /// [`WebhookSecret::expose`] method.
@@ -88,6 +88,7 @@ struct CheckSuiteInner {
 
 #[derive(serde::Deserialize, Debug)]
 struct CheckRunInner {
+    id: CheckRunId,
     name: String,
     head_sha: String,
     external_id: Option<String>,
@@ -423,7 +424,7 @@ fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
     let payload: WebhookCheckRun = serde_json::from_slice(body)?;
 
     // We only care about check-runs from circleci; all other check-runs are ignored
-    if payload.check_run.app.id != CIRCLECI_APP_ID {
+    if payload.check_run.app.id != CIRCLECI_CHECKS_APP_ID {
         return Ok(None);
     }
 
@@ -432,11 +433,21 @@ fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
     #[derive(Deserialize)]
     #[serde(rename_all = "kebab-case")]
     struct CircleCiExternalId {
+        source: String,
         workflow_id: String,
     }
 
-    let external_id: CircleCiExternalId =
-        serde_json::from_str(&payload.check_run.external_id.unwrap_or_default())?;
+    let raw_external_id = payload.check_run.external_id.unwrap_or_default();
+    let external_id: CircleCiExternalId = serde_json::from_str(&raw_external_id)?;
+    if external_id.source != "notifications" {
+        tracing::warn!(
+            check_run_id = %payload.check_run.id,
+            external_id = raw_external_id,
+            "Ignoring CircleCI check-run that doesn't have source=notifications",
+        );
+        return Ok(None);
+    }
+
     let url = format!(
         "https://app.circleci.com/workflow/{}",
         external_id.workflow_id

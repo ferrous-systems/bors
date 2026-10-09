@@ -450,11 +450,35 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_workflow_started_unknown_build(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.create_branch("unknown");
+            let check_run_id = ctx.create_circleci_workflow((), "unknown");
+            ctx.circleci_workflow_started(check_run_id).await?;
+            Ok(())
+        })
+        .await;
+        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 0);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn workflow_completed_unknown_build(pool: sqlx::PgPool) {
         run_test(pool.clone(), async |ctx: &mut BorsTester| {
             ctx.create_branch("unknown");
             let run_id = ctx.create_workflow((), "unknown");
             ctx.workflow_event(WorkflowEvent::success(run_id)).await?;
+            Ok(())
+        })
+        .await;
+        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 0);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_workflow_completed_unknown_build(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.create_branch("unknown");
+            let check_run_id = ctx.create_circleci_workflow((), "unknown");
+            ctx.circleci_workflow_full_success(check_run_id).await?;
             Ok(())
         })
         .await;
@@ -476,6 +500,36 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_circleci_workflow_started(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.circleci_workflow_started(ctx.circleci_try_workflow())
+                .await?;
+            Ok(())
+        })
+        .await;
+        let suite = get_all_workflows(&pool).await.unwrap().pop().unwrap();
+        assert_eq!(suite.status, WorkflowStatus::Pending);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_workflow_started_full(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.workflow_start(ctx.try_workflow()).await?;
+            ctx.circleci_workflow_started(ctx.circleci_try_workflow())
+                .await?;
+            Ok(())
+        })
+        .await;
+        let all = get_all_workflows(&pool).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.into_iter().all(|w| w.status == WorkflowStatus::Pending));
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_workflow_start_twice(pool: sqlx::PgPool) {
         run_test(pool.clone(), async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
@@ -489,6 +543,24 @@ mod tests {
         })
         .await;
         assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 2);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_workflow_start_twice_and_circleci(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.workflow_event(WorkflowEvent::started(ctx.try_workflow()))
+                .await?;
+            ctx.workflow_event(WorkflowEvent::started(ctx.try_workflow()))
+                .await?;
+            ctx.circleci_workflow_started(ctx.circleci_try_workflow())
+                .await?;
+            Ok(())
+        })
+        .await;
+        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 3);
     }
 
     // First start both workflows, then finish both of them.

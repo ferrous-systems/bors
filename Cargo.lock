@@ -491,6 +491,7 @@ dependencies = [
  "tracing-test",
  "url",
  "urlencoding",
+ "uuid",
  "which",
  "wiremock",
 ]
