@@ -3,6 +3,7 @@ use crate::bors::{
     WAIT_FOR_MERGE_QUEUE, WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT, WAIT_FOR_MERGEABILITY_STATUS_REFRESH,
     WAIT_FOR_PR_STATUS_REFRESH, WAIT_FOR_WEBHOOK_COMPLETED,
 };
+use crate::circleci::{CircleCiExternalGitHubCheckRunId, CircleCiWorkflowId};
 use crate::database::{
     BuildModel, BuildStatus, DelegatedPermission, DelegationStatus, MergeableState,
     OctocrabMergeableState, PullRequestModel, RollupMemberForUnrolling, UnrollState,
@@ -15,10 +16,11 @@ use crate::{
 };
 use anyhow::Context;
 use axum::Router;
+use chrono::Utc;
 use http::header::{COOKIE, SET_COOKIE};
 use http::{HeaderMap, Method, Request, StatusCode};
-use octocrab::models::RunId;
 use octocrab::models::workflows::Conclusion;
+use octocrab::models::{CheckRunId, RunId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -46,13 +48,15 @@ use crate::bors::unroll_queue::{UnrollQueueEvent, UnrollQueueReceiver, handle_un
 use crate::github::api::client::HideCommentReason;
 use crate::server::{ServerState, create_app};
 use crate::tests::github::{
-    RepoIdentifier, TestWorkflowStatus, WorkflowEventKind, WorkflowRun, default_oauth_config,
+    CheckRunData, CheckRunEventKind, RepoIdentifier, TestWorkflowStatus, WorkflowEventKind,
+    WorkflowRun, default_oauth_config,
 };
 use crate::tests::mock::{
-    GitHubIssueCommentEventPayload, GitHubPullRequestEventPayload, GitHubPushEventPayload,
-    GitHubWorkflowEventPayload, PullRequestChangeEvent,
+    GitHubCheckRunEventPayload, GitHubIssueCommentEventPayload, GitHubPullRequestEventPayload,
+    GitHubPushEventPayload, GitHubWorkflowEventPayload, PullRequestChangeEvent,
 };
 pub use github::Branch;
+pub use github::CheckRunEvent;
 pub use github::Comment;
 pub use github::Commit;
 pub use github::GitHub;
@@ -204,6 +208,7 @@ pub struct BorsTester {
     ctx: Arc<BorsContext>,
     current_session: Option<String>,
     wait_for_markers: bool,
+    stable_circleci_workflow_ids: Mutex<Vec<CircleCiWorkflowId>>,
 }
 
 impl BorsTester {
@@ -237,7 +242,7 @@ impl BorsTester {
             "https://bors-test.com",
             Some(mock.zulip_client()),
             None,
-            None,
+            Some(mock.circleci_client()),
         ));
 
         let BorsProcess {
@@ -281,6 +286,20 @@ impl BorsTester {
                 ctx,
                 current_session: None,
                 wait_for_markers: true,
+                stable_circleci_workflow_ids: Mutex::new(
+                    // allows up to 5 CircleCI workflow ids to be used per test (if you need more in a test, add more here)
+                    [
+                        "C8CC1C6E-F7E6-48AD-8C57-F5EA065F5C6A",
+                        "11925393-266D-494C-AD37-9C71428E81E1",
+                        "FE87E745-F759-4724-903B-48BDC6FB090F",
+                        "33581884-12F7-4BEB-9FE0-9BCE96258D3C",
+                        "14039835-E1C1-4BD6-A10D-DF2FB738F2A0",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .map(CircleCiWorkflowId::from)
+                    .collect(),
+                ),
             },
             bors,
         )
@@ -314,8 +333,16 @@ impl BorsTester {
         self.create_workflow(default_repo_name(), TRY_BRANCH)
     }
 
+    pub fn circleci_try_workflow(&self) -> CheckRunId {
+        self.create_circleci_workflow(default_repo_name(), TRY_BRANCH)
+    }
+
     pub fn auto_workflow(&self) -> RunId {
         self.create_workflow(default_repo_name(), AUTO_BRANCH)
+    }
+
+    pub fn circleci_auto_workflow(&self) -> CheckRunId {
+        self.create_circleci_workflow(default_repo_name(), AUTO_BRANCH)
     }
 
     /// Creates N unrolled workflows, for the past N commits pushed to the unrolled branch.
@@ -346,9 +373,32 @@ impl BorsTester {
         workflows
     }
 
+    pub fn create_circleci_workflow<Id: Into<RepoIdentifier>>(
+        &self,
+        id: Id,
+        branch: &str,
+    ) -> CheckRunId {
+        let workflow_id = self.stable_circleci_workflow_ids.lock().pop().unwrap();
+        let mut gh = self.github.lock();
+        let check_run_id = gh.new_circleci_workflow(workflow_id.clone(), &id.into().0, branch);
+        self.http_mock
+            .add_circleci_workflow(workflow_id, check_run_id);
+        check_run_id
+    }
+
     pub fn create_workflow<Id: Into<RepoIdentifier>>(&self, id: Id, branch: &str) -> RunId {
         let mut gh = self.github.lock();
         gh.new_workflow(&id.into().0, branch)
+    }
+
+    pub fn modify_check_run<Ret, F: FnOnce(&mut CheckRunData) -> Ret>(
+        &mut self,
+        check_run_id: CheckRunId,
+        func: F,
+    ) -> Ret {
+        let repo = self.github.lock().get_repo_by_check_run_id(check_run_id);
+        let mut repo = repo.lock();
+        func(repo.get_check_run_mut(check_run_id))
     }
 
     pub fn modify_workflow<F: FnOnce(&mut WorkflowRun)>(&mut self, run_id: RunId, func: F) {
@@ -747,6 +797,61 @@ impl BorsTester {
         }
     }
 
+    pub async fn circleci_workflow_event(&mut self, event: CheckRunEvent) -> anyhow::Result<()> {
+        let payload = {
+            let repo = self
+                .github
+                .lock()
+                .get_repo_by_check_run_id(event.check_run_id);
+            let mut repo = repo.lock();
+
+            let check_run = repo.get_check_run_mut(event.check_run_id);
+            match &event.event {
+                CheckRunEventKind::Started => {
+                    check_run.status = CheckRunStatus::InProgress;
+                }
+                CheckRunEventKind::Completed { conclusion } => {
+                    check_run.status = CheckRunStatus::Completed;
+                    check_run.completed_at.get_or_insert_with(Utc::now);
+                    check_run.conclusion = Some(*conclusion);
+                }
+            }
+
+            let check_run = check_run.clone();
+            Box::new(GitHubCheckRunEventPayload::new(
+                &repo,
+                check_run,
+                event.event,
+            ))
+        };
+
+        self.send_webhook("check_run", payload).await
+    }
+
+    pub async fn circleci_workflow_start(
+        &mut self,
+        check_run_id: CheckRunId,
+    ) -> anyhow::Result<()> {
+        self.circleci_workflow_event(CheckRunEvent::started(check_run_id))
+            .await
+    }
+
+    pub async fn circleci_workflow_full_success(
+        &mut self,
+        check_run_id: CheckRunId,
+    ) -> anyhow::Result<()> {
+        self.circleci_workflow_full(check_run_id, TestWorkflowStatus::Success)
+            .await
+    }
+
+    pub async fn circleci_workflow_full_failure(
+        &mut self,
+        check_run_id: CheckRunId,
+    ) -> anyhow::Result<()> {
+        self.circleci_workflow_full(check_run_id, TestWorkflowStatus::Failure)
+            .await
+    }
+
     /// Performs a single started/success/failure workflow event.
     pub async fn workflow_event(&mut self, event: WorkflowEvent) -> anyhow::Result<()> {
         // Update the status of the workflow in the GitHub state mock
@@ -1092,6 +1197,25 @@ impl BorsTester {
             .check_cancelled_workflows(id.into().0, ids);
     }
 
+    /// Assert that (exactly) these CircleCI workflows have been cancelled.
+    pub fn expect_cancelled_circleci_workflows<Id: Into<RepoIdentifier>>(
+        &self,
+        id: Id,
+        ids: &[CheckRunId],
+    ) {
+        let repo = self.get_repo(id);
+        let repo = repo.lock();
+        for check_run_id in ids {
+            let check_run = repo.get_check_run(*check_run_id);
+            let external_id: CircleCiExternalGitHubCheckRunId =
+                serde_json::from_str(&check_run.external_id).unwrap();
+            assert!(
+                self.http_mock
+                    .is_circleci_workflow_cancelled(&external_id.workflow_id)
+            );
+        }
+    }
+
     /// Assert that the given comment has been hidden.
     pub fn expect_hidden_comment(&self, comment: &Comment, reason: HideCommentReason) {
         self.github
@@ -1128,7 +1252,23 @@ impl BorsTester {
             CheckRunStatus::InProgress => "in_progress",
             CheckRunStatus::Completed => "completed",
         };
+        let actual_status = match check_run.status {
+            CheckRunStatus::Queued => "queued",
+            CheckRunStatus::InProgress => "in_progress",
+            CheckRunStatus::Completed => "completed",
+        };
+
         let expected_conclusion = conclusion.map(|c| match c {
+            CheckRunConclusion::Success => "success",
+            CheckRunConclusion::Failure => "failure",
+            CheckRunConclusion::Neutral => "neutral",
+            CheckRunConclusion::Cancelled => "cancelled",
+            CheckRunConclusion::TimedOut => "timed_out",
+            CheckRunConclusion::ActionRequired => "action_required",
+            CheckRunConclusion::Stale => "stale",
+            CheckRunConclusion::Skipped => "skipped",
+        });
+        let actual_conclusion = check_run.conclusion.map(|c| match c {
             CheckRunConclusion::Success => "success",
             CheckRunConclusion::Failure => "failure",
             CheckRunConclusion::Neutral => "neutral",
@@ -1143,9 +1283,9 @@ impl BorsTester {
             (
                 check_run.name.as_str(),
                 check_run.head_sha.as_str(),
-                check_run.status.as_str(),
+                actual_status,
                 check_run.title.as_str(),
-                check_run.conclusion.as_deref(),
+                actual_conclusion,
                 check_run.external_id.parse::<u64>().is_ok()
             ),
             (
@@ -1237,6 +1377,20 @@ impl BorsTester {
         tokio::time::timeout(TEST_CONDITION_TIMEOUT, wait_fut)
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("Timed out waiting for condition")))
+    }
+
+    async fn circleci_workflow_full(
+        &mut self,
+        check_run_id: CheckRunId,
+        status: TestWorkflowStatus,
+    ) -> anyhow::Result<()> {
+        self.circleci_workflow_event(CheckRunEvent::started(check_run_id))
+            .await?;
+        let event = match status {
+            TestWorkflowStatus::Success => CheckRunEvent::success(check_run_id),
+            TestWorkflowStatus::Failure => CheckRunEvent::failure(check_run_id),
+        };
+        self.circleci_workflow_event(event).await
     }
 
     /// Performs all necessary events to complete a single workflow (start, success/fail).
