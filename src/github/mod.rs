@@ -1,7 +1,7 @@
 //! Contains definitions of common types (pull request, user, repository name) needed
 //! for working with (GitHub) repositories.
-use octocrab::models::UserId;
 use octocrab::models::pulls::MergeableState;
+use octocrab::models::{AppId, UserId};
 use octocrab::service::middleware::retry::RetryConfig;
 use octocrab::{
     DefaultOctocrabBuilderConfig, NoAuth, NoSvc, NotLayerReady, Octocrab, OctocrabBuilder,
@@ -28,6 +28,9 @@ pub use labels::{LabelModification, LabelTrigger};
 pub use rollup::tests::{make_rollup, rollup_state};
 
 use crate::bors::PullRequestStatus;
+
+/// GitHub app id for the circleci-checks app.
+pub const CIRCLECI_CHECKS_APP_ID: AppId = AppId(18001);
 
 /// Unique identifier of a GitHub repository
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
@@ -276,6 +279,14 @@ impl Display for PullRequestNumber {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         <u64 as Display>::fmt(&self.0, f)
     }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ExtendedCheckRun {
+    pub name: String, // seriously octocrab???
+    #[serde(flatten)]
+    pub check_run: octocrab::models::CheckRun,
+    pub app: octocrab::models::App,
 }
 
 /// Creates a new Octocrab client with the proper shared defaults configured.

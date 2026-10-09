@@ -1,9 +1,9 @@
-use crate::PgDbClient;
 use crate::bors::event::{
     PullRequestAssigned, PullRequestClosed, PullRequestComment, PullRequestConvertedToDraft,
     PullRequestEdited, PullRequestMerged, PullRequestOpened, PullRequestPushed,
     PullRequestReadyForReview, PullRequestReopened, PullRequestUnassigned, PushToBranch,
 };
+use crate::{CircleCiClient, PgDbClient};
 
 use crate::bors::comment::CommentTag;
 use crate::bors::handlers::{InvalidationComment, InvalidationInfo, invalidate_pr};
@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 pub(super) async fn handle_pull_request_edited(
     repo_state: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     mergeability_queue: &MergeabilityQueueSender,
     payload: PullRequestEdited,
@@ -38,6 +39,7 @@ pub(super) async fn handle_pull_request_edited(
 
     invalidate_pr(
         &repo_state,
+        circleci,
         &db,
         &pr_model,
         pr,
@@ -53,6 +55,7 @@ pub(super) async fn handle_pull_request_edited(
 
 pub(super) async fn handle_push_to_pull_request(
     repo_state: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     mergeability_queue: &MergeabilityQueueSender,
     payload: PullRequestPushed,
@@ -68,6 +71,7 @@ pub(super) async fn handle_push_to_pull_request(
 
     invalidate_pr(
         &repo_state,
+        circleci,
         &db,
         &pr_model,
         pr,
@@ -124,6 +128,7 @@ pub(super) async fn handle_pull_request_opened(
 
 pub(super) async fn handle_pull_request_closed(
     repo_state: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     payload: PullRequestClosed,
 ) -> anyhow::Result<()> {
@@ -133,6 +138,7 @@ pub(super) async fn handle_pull_request_closed(
         .await?;
     invalidate_pr(
         &repo_state,
+        circleci,
         &db,
         &pr_model,
         &payload.pull_request,

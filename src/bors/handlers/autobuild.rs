@@ -1,7 +1,6 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use crate::PgDbClient;
 use crate::bors::comment::no_auto_build_in_progress_comment;
 use crate::bors::handlers::workflow::{AutoBuildCancelReason, maybe_cancel_auto_build};
 use crate::bors::handlers::{PullRequestData, deny_request, has_permission};
@@ -11,6 +10,7 @@ use crate::bors::{CommandPrefix, Comment, RepositoryState};
 use crate::database::{BuildStatus, QueueStatus};
 use crate::github::{GithubUser, LabelTrigger, PullRequestNumber};
 use crate::permissions::PermissionType;
+use crate::{CircleCiClient, PgDbClient};
 
 pub(super) async fn command_retry(
     repo_state: Arc<RepositoryState>,
@@ -65,6 +65,7 @@ pub(super) async fn command_retry(
 
 pub(super) async fn command_cancel(
     repo_state: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -85,6 +86,7 @@ pub(super) async fn command_cancel(
 
     let auto_build_cancel_message = maybe_cancel_auto_build(
         &repo_state.client,
+        circleci,
         &db,
         pr.db,
         AutoBuildCancelReason::Cancel,

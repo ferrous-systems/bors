@@ -1,11 +1,14 @@
-use crate::PgDbClient;
 use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
+use crate::circleci::CircleCiWorkflowId;
 use crate::database::{
-    BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams, WorkflowModel,
+    BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams,
+    WorkflowModel, WorkflowPlatform,
 };
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::api::operations::{CommitAuthor, ForcePush};
 use crate::github::{CommitSha, MergeResult, attempt_merge};
+use crate::{CircleCiClient, PgDbClient};
+use anyhow::Context;
 use octocrab::models::CheckRunId;
 use octocrab::models::workflows::{Conclusion, Job, Status};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
@@ -36,7 +39,8 @@ pub enum CancelBuildConclusion {
 /// It also tries to cancel its pending workflows and check run status, but that has a lesser
 /// priority.
 pub async fn cancel_build(
-    client: &GithubRepositoryClient,
+    github: &GithubRepositoryClient,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     build: &BuildModel,
     conclusion: CancelBuildConclusion,
@@ -61,23 +65,42 @@ pub async fn cancel_build(
         .get_pending_workflows_for_build(build)
         .await
         .map_err(CancelBuildError::FailedToCancelWorkflows)?;
-    let pending_workflow_ids: Vec<octocrab::models::RunId> = pending_workflows
-        .iter()
-        .map(|workflow| octocrab::models::RunId(workflow.run_id.0))
-        .collect();
 
-    tracing::info!("Cancelling workflows {:?}", pending_workflow_ids);
-    client
-        .cancel_workflows(&pending_workflow_ids)
+    let pending_github_workflow_ids: Vec<octocrab::models::RunId> = pending_workflows
+        .iter()
+        .filter(|workflow| workflow.platform == WorkflowPlatform::Github)
+        // if a run_id fails to parse, that's fine - cancelling the workflows is a courtesy
+        .filter_map(|workflow| Some(octocrab::models::RunId(workflow.run_id.parse().ok()?)))
+        .collect::<Vec<_>>();
+
+    tracing::info!(
+        "Cancelling GitHub workflows {:?}",
+        pending_github_workflow_ids
+    );
+    github
+        .cancel_workflows(&pending_github_workflow_ids)
         .await
         .map_err(CancelBuildError::FailedToCancelWorkflows)?;
 
+    if let Some(circleci) = circleci {
+        let pending_circleci_workflow_ids = pending_workflows
+            .iter()
+            .filter(|workflow| workflow.platform == WorkflowPlatform::CircleCi)
+            .map(|workflow| workflow.run_id.clone())
+            .map(CircleCiWorkflowId::from);
+        for workflow_id in pending_circleci_workflow_ids {
+            circleci
+                .cancel_workflow(workflow_id)
+                .await
+                .map_err(CancelBuildError::FailedToCancelWorkflows)?;
+        }
+    }
     let check_run_conclusion = match conclusion {
         CancelBuildConclusion::Timeout => CheckRunConclusion::TimedOut,
         CancelBuildConclusion::Cancel => CheckRunConclusion::Cancelled,
     };
     if let Some(check_run_id) = build.check_run_id
-        && let Err(error) = client
+        && let Err(error) = github
             .update_check_run(
                 CheckRunId(check_run_id as u64),
                 CheckRunStatus::Completed,
@@ -126,8 +149,9 @@ pub async fn load_workflow_runs(
     // This tells us for how many workflow runs we should wait.
     let mut workflow_runs: Vec<WorkflowRun> = repo
         .client
-        .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
-        .await?;
+        .get_all_workflow_runs_for_commit_sha(&CommitSha(build.commit_sha.clone()))
+        .await
+        .context("Loading workflow runs from GitHub")?;
     tracing::debug!("Workflow runs from GitHub: {workflow_runs:?}");
 
     // It is possible that the GitHub state is not fully up-to-date, or that we have overridden
@@ -136,9 +160,19 @@ pub async fn load_workflow_runs(
     // propagated to the DB yet.
     // Here we reconcile the two world views.
     for db_run in db_workflow_runs {
+        let Ok(db_run_id) = db_run.workflow_run_id() else {
+            tracing::error!(
+                id = db_run.id,
+                run_id = %db_run.run_id,
+                platform = ?db_run.platform,
+                "DB has invalid workflow run_id - ignoring",
+            );
+            continue;
+        };
+
         if let Some(gh_run) = workflow_runs
             .iter_mut()
-            .find(|gh_run| gh_run.id == db_run.run_id.into())
+            .find(|gh_run| gh_run.id == db_run_id)
         {
             if gh_run.status != db_run.status && !db_run.status.is_pending() {
                 // If our DB has a conclusion for the workflow that does not match GH state, we
@@ -150,12 +184,13 @@ pub async fn load_workflow_runs(
             // For some reason, we have a workflow in the DB that is not on GitHub. This shouldn't
             // really happen, but in any case we backfill it.
             tracing::warn!(
-                "Found DB workflow {} with status {:?} that was not on GitHub",
-                db_run.run_id,
-                db_run.status
+                id = db_run.id,
+                run_id = ?db_run_id,
+                status = ?db_run.status,
+                "Found DB workflow that was not on GitHub",
             );
             workflow_runs.push(WorkflowRun {
-                id: db_run.run_id.into(),
+                id: db_run_id,
                 name: db_run.name,
                 url: db_run.url,
                 status: db_run.status,

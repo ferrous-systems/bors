@@ -6,6 +6,16 @@ use serde::Deserialize;
 
 use crate::utils::timing::{RetryMethod, perform_retryable};
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "kebab-case")]
+pub struct CircleCiExternalGitHubCheckRunId {
+    #[allow(unused)]
+    pub actor_id: Option<String>,
+    pub source: String,
+    pub workflow_id: CircleCiWorkflowId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(transparent)]

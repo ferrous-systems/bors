@@ -1,17 +1,19 @@
-use crate::bors::RepositoryState;
 use crate::bors::build::{CancelBuildConclusion, CancelBuildError};
 use crate::bors::build_queue::BuildQueueSender;
 use crate::bors::comment::{CommentTag, append_workflow_links_to_comment};
 use crate::bors::event::{
-    WorkflowJobCompleted, WorkflowJobStarted, WorkflowRunCompleted, WorkflowRunStarted,
+    WorkflowJobCompleted, WorkflowJobStarted, WorkflowPlatformData, WorkflowRunCompleted,
+    WorkflowRunStarted,
 };
 use crate::bors::handlers::{get_build_kind_from_branch, is_bors_observed_branch};
 use crate::bors::{BuildKind, build};
+use crate::bors::{RepositoryState, WorkflowRunId};
 use crate::database::{BuildModel, BuildStatus, PullRequestModel, WorkflowStatus};
 use crate::ec2::{Ec2InstanceStartData, ParsedLabel, start_ec2_github_runner};
 use crate::github::CommitSha;
 use crate::github::api::client::GithubRepositoryClient;
-use crate::{BorsContext, PgDbClient};
+use crate::{BorsContext, CircleCiClient, PgDbClient};
+use itertools::Itertools;
 use octocrab::models::workflows::Status;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,15 +54,28 @@ pub(super) async fn handle_workflow_started(
     }
 
     tracing::info!("Storing workflow started into DB");
-    db.create_workflow(
-        &build,
-        payload.name.clone(),
-        payload.url.clone(),
-        payload.run_id.into(),
-        payload.workflow_type.clone(),
-        WorkflowStatus::Pending,
-    )
-    .await?;
+    match &payload.platform {
+        WorkflowPlatformData::CircleCi(workflow_id) => {
+            db.create_circleci_workflow(
+                &build,
+                &payload.name,
+                &payload.url,
+                workflow_id,
+                WorkflowStatus::Pending,
+            )
+            .await?
+        }
+        WorkflowPlatformData::GitHub(run_id) => {
+            db.create_github_workflow(
+                &build,
+                &payload.name,
+                &payload.url,
+                *run_id,
+                WorkflowStatus::Pending,
+            )
+            .await?
+        }
+    }
 
     add_workflow_links_to_build_start_comment(repo, db, &build, payload).await?;
 
@@ -99,6 +114,10 @@ async fn add_workflow_links_to_build_start_comment(
             .get_comment_content(&build_started_comment.node_id)
             .await?;
 
+        comment_content = comment_content
+            .lines()
+            .take_while(|line| !line.starts_with("**Workflow"))
+            .join("\n");
         append_workflow_links_to_comment(&mut comment_content, workflows);
 
         repo.client
@@ -143,8 +162,12 @@ pub(super) async fn handle_workflow_completed(
     }
 
     tracing::info!("Updating status of workflow to {:?}", payload.status);
-    db.update_workflow_status(*payload.run_id, payload.status)
-        .await?;
+    let run_id = match &payload.platform {
+        WorkflowPlatformData::CircleCi(workflow_id) => workflow_id.to_string(),
+        WorkflowPlatformData::GitHub(run_id) => run_id.into_inner().to_string(),
+    };
+
+    db.update_workflow_status(&run_id, payload.status).await?;
 
     build_queue_tx
         .on_workflow_completed(payload, error_context)
@@ -284,7 +307,7 @@ pub(super) async fn reload_workflow_job_cache(
 
         let Ok(workflows) = repo
             .client
-            .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+            .get_gha_workflow_runs_for_commit_sha(&CommitSha(build.commit_sha.clone()))
             .await
         else {
             continue;
@@ -296,21 +319,26 @@ pub(super) async fn reload_workflow_job_cache(
                     continue;
                 }
             }
-            let Ok(workflow_jobs) = repo.client.get_jobs_for_workflow_run(workflow.id).await else {
+            let WorkflowRunId::GitHub(workflow_id) = workflow.id else {
+                tracing::error!("unexpected CircleCI workflow from GHA workflow response");
+                continue;
+            };
+
+            let Ok(workflow_jobs) = repo.client.get_jobs_for_workflow_run(workflow_id).await else {
                 continue;
             };
 
             tracing::info!(
                 "Reloading {} job(s) of workflow run {}",
                 workflow_jobs.len(),
-                workflow.id
+                workflow_id
             );
             for job in workflow_jobs {
                 match job.status {
                     Status::Completed | Status::Failed => {
                         job_cache.auto_job_completed(
                             repo.repository(),
-                            workflow.id,
+                            workflow_id,
                             job.id,
                             &job.name,
                         );
@@ -318,7 +346,7 @@ pub(super) async fn reload_workflow_job_cache(
                     _ => {
                         job_cache.auto_job_started(
                             repo.repository(),
-                            workflow.id,
+                            workflow_id,
                             job.id,
                             &job.name,
                         );
@@ -350,6 +378,7 @@ pub enum AutoBuildCancelReason {
 /// If the function returns `None`, there was no pending build happening on the PR.
 pub async fn maybe_cancel_auto_build(
     client: &GithubRepositoryClient,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     pr: &PullRequestModel,
     reason: AutoBuildCancelReason,
@@ -365,7 +394,15 @@ pub async fn maybe_cancel_auto_build(
 
     tracing::info!("Cancelling auto build {auto_build:?}");
 
-    match build::cancel_build(client, db, auto_build, CancelBuildConclusion::Cancel).await {
+    match build::cancel_build(
+        client,
+        circleci,
+        db,
+        auto_build,
+        CancelBuildConclusion::Cancel,
+    )
+    .await
+    {
         Ok(workflows) => {
             tracing::info!("Auto build cancelled");
             let workflow_urls = workflows.into_iter().map(|w| w.url).collect();

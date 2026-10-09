@@ -1,3 +1,4 @@
+use crate::circleci::CircleCiWorkflowId;
 use crate::config::RepositoryConfig;
 use crate::github::GithubRepoName;
 use crate::github::api::client::{GithubRepositoryClient, HideCommentReason};
@@ -229,12 +230,48 @@ fn elapsed_time_since(date: DateTime<Utc>) -> Duration {
 /// Corresponds to a single execution of a workflow.
 #[derive(Clone, Debug)]
 pub struct WorkflowRun {
-    pub id: RunId,
+    pub id: WorkflowRunId,
     pub name: String,
     pub url: String,
     pub status: WorkflowStatus,
     pub created_at: DateTime<Utc>,
     pub duration: Option<Duration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowRunId {
+    GitHub(RunId),
+    CircleCi(CircleCiWorkflowId),
+}
+
+impl From<RunId> for WorkflowRunId {
+    fn from(value: RunId) -> Self {
+        Self::GitHub(value)
+    }
+}
+
+impl PartialEq<RunId> for WorkflowRunId {
+    fn eq(&self, other: &RunId) -> bool {
+        let Self::GitHub(github_run_id) = self else {
+            return false;
+        };
+        github_run_id == other
+    }
+}
+
+impl From<CircleCiWorkflowId> for WorkflowRunId {
+    fn from(value: CircleCiWorkflowId) -> Self {
+        Self::CircleCi(value)
+    }
+}
+
+impl PartialEq<CircleCiWorkflowId> for WorkflowRunId {
+    fn eq(&self, other: &CircleCiWorkflowId) -> bool {
+        let Self::CircleCi(circleci_workflow_id) = self else {
+            return false;
+        };
+        circleci_workflow_id == other
+    }
 }
 
 pub struct FailedWorkflowRun {

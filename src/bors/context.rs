@@ -20,6 +20,7 @@ pub struct BorsContext {
 }
 
 impl BorsContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parser: CommandParser,
         db: Arc<PgDbClient>,

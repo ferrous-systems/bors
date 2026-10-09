@@ -20,13 +20,14 @@ use crate::bors::labels::handle_label_trigger;
 use crate::bors::merge_queue::MergeQueueSender;
 use crate::bors::unroll_queue::UnrollQueueSender;
 use crate::bors::{
-    BuildKind, FailedWorkflowRun, RepositoryState, elapsed_time_since, hide_tagged_comments,
+    BuildKind, FailedWorkflowRun, RepositoryState, WorkflowRunId, elapsed_time_since,
+    hide_tagged_comments,
 };
 use crate::database::{
     BuildModel, BuildStatus, PullRequestModel, UpdateBuildParams, WorkflowStatus,
 };
 use crate::github::{CommitSha, GithubRepoName, LabelTrigger};
-use crate::{BorsContext, PgDbClient};
+use crate::{BorsContext, CircleCiClient, PgDbClient};
 use anyhow::Context;
 use octocrab::models::CheckRunId;
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
@@ -124,7 +125,15 @@ pub async fn handle_build_queue_event(
                         )
                         .await?
                         {
-                            maybe_timeout_build(&repo, db, &build, &pr, timeout).await?;
+                            maybe_timeout_build(
+                                &repo,
+                                ctx.get_circleci_api(),
+                                db,
+                                &build,
+                                &pr,
+                                timeout,
+                            )
+                            .await?;
                         }
                     } else {
                         // This is an orphaned build. It should never be created, unless we have some bug or
@@ -198,6 +207,7 @@ pub async fn handle_build_queue_event(
 
 async fn maybe_timeout_build(
     repo: &RepositoryState,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     build: &BuildModel,
     pr: &PullRequestModel,
@@ -205,7 +215,15 @@ async fn maybe_timeout_build(
 ) -> anyhow::Result<()> {
     if elapsed_time_since(build.created_at) >= timeout {
         tracing::info!("Cancelling build {build:?}");
-        match cancel_build(&repo.client, db, build, CancelBuildConclusion::Timeout).await {
+        match cancel_build(
+            &repo.client,
+            circleci,
+            db,
+            build,
+            CancelBuildConclusion::Timeout,
+        )
+        .await
+        {
             Ok(_) => {}
             Err(
                 CancelBuildError::FailedToMarkBuildAsCancelled(error)
@@ -418,16 +436,22 @@ async fn maybe_complete_build(
         // Download failed jobs
         let mut failed_workflow_runs: Vec<FailedWorkflowRun> = vec![];
         for workflow_run in workflow_runs {
-            let failed_jobs = match get_failed_jobs(repo, workflow_run.id).await {
-                Ok(jobs) => jobs,
-                Err(error) => {
-                    tracing::error!(
-                        "Cannot download jobs for workflow run {}: {error:?}",
-                        workflow_run.id
-                    );
+            let failed_jobs = match &workflow_run.id {
+                WorkflowRunId::GitHub(run_id) => match get_failed_jobs(repo, *run_id).await {
+                    Ok(jobs) => jobs,
+                    Err(error) => {
+                        tracing::error!(
+                            "Cannot download jobs for workflow run {run_id}: {error:?}",
+                        );
+                        vec![]
+                    }
+                },
+                WorkflowRunId::CircleCi(workflow_id) => {
+                    tracing::warn!(%workflow_id, "TODO: fetch failed jobs from CircleCI");
                     vec![]
                 }
             };
+
             failed_workflow_runs.push(FailedWorkflowRun {
                 workflow_run,
                 failed_jobs,

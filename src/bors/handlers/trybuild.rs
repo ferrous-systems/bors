@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use super::has_permission;
 use super::{PullRequestData, deny_request};
-use crate::PgDbClient;
 use crate::bors::build::{CancelBuildConclusion, CancelBuildError, cancel_build};
 use crate::bors::build::{
     StartBuildCheckRun, StartBuildCommit, StartBuildContext, StartBuildError, StartBuildOutcome,
@@ -22,6 +21,7 @@ use crate::bors::{
 use crate::database::{BuildModel, BuildStatus, ExclusiveOperationOutcome, PullRequestModel};
 use crate::github::{CommitSha, GithubUser, PullRequestNumber};
 use crate::permissions::PermissionType;
+use crate::{CircleCiClient, PgDbClient};
 use anyhow::Context;
 
 // This branch serves for preparing the final commit.
@@ -44,6 +44,7 @@ const MAX_TRY_JOBS_COUNT: usize = 20;
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn command_try_build(
     repo: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -91,7 +92,7 @@ pub(super) async fn command_try_build(
         .ensure_not_concurrent(BuildKind::Try, repo.repository(), async |proof| {
             // Try to cancel any previously running try build workflows
             let cancelled_workflow_urls = if let Some(build) = get_pending_try_build(pr.db) {
-                let res = cancel_previous_try_build(repo, &db, build).await?;
+                let res = cancel_previous_try_build(repo, circleci, &db, build).await?;
                 // Also try to hide previous "Try build started" comments that weren't hidden yet
                 if let Err(error) =
                     hide_tagged_comments(repo, &db, pr.db, CommentTag::TryBuildStarted).await
@@ -183,12 +184,21 @@ pub(super) async fn command_try_build(
 /// Cancels a previously running try build and returns a list of cancelled workflow URLs.
 async fn cancel_previous_try_build(
     repo: &RepositoryState,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     build: &BuildModel,
 ) -> anyhow::Result<Vec<String>> {
     assert_eq!(build.status, BuildStatus::Pending);
 
-    match cancel_build(&repo.client, db, build, CancelBuildConclusion::Cancel).await {
+    match cancel_build(
+        &repo.client,
+        circleci,
+        db,
+        build,
+        CancelBuildConclusion::Cancel,
+    )
+    .await
+    {
         Ok(workflows) => {
             tracing::info!("Try build cancelled");
             Ok(workflows.into_iter().map(|w| w.url).collect())
@@ -221,6 +231,7 @@ fn get_base_sha(pr_model: &PullRequestModel, parent: Option<Parent>) -> Option<C
 
 pub(super) async fn command_try_cancel(
     repo: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -242,6 +253,7 @@ pub(super) async fn command_try_cancel(
 
     match cancel_build(
         &repo.client,
+        circleci,
         db.as_ref(),
         build,
         CancelBuildConclusion::Cancel,

@@ -17,7 +17,7 @@ use crate::database::{MergeableState, TreeState};
 use crate::github::{CommitSha, LabelTrigger, PullRequest};
 use crate::github::{GithubUser, PullRequestNumber};
 use crate::permissions::PermissionType;
-use crate::{BorsContext, PgDbClient, ZulipClient};
+use crate::{BorsContext, CircleCiClient, PgDbClient, ZulipClient};
 use std::sync::Arc;
 use tracing::log;
 
@@ -219,6 +219,7 @@ async fn check_pr_approval_validity(
 /// Pull request's author can also unapprove the pull request.
 pub(super) async fn command_unapprove(
     repo_state: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -255,6 +256,7 @@ pub(super) async fn command_unapprove(
 
     invalidate_pr(
         &repo_state,
+        circleci,
         &db,
         pr.db,
         pr.github,

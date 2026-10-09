@@ -462,6 +462,7 @@ async fn handle_start_auto_build(
             // the PR). Let's unapprove it here instead to unblock the queue.
             invalidate_pr(
                 repo,
+                ctx.get_circleci_api(),
                 &ctx.db,
                 pr,
                 &gh_pr,
