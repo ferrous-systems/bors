@@ -2,13 +2,13 @@ use crate::PgDbClient;
 use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
 use crate::database::{
     BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams,
-    WorkflowModel, WorkflowPlatform,
+    WorkflowModel, WorkflowPlatform, WorkflowStatus,
 };
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::api::operations::{CommitAuthor, ForcePush};
 use crate::github::{CommitSha, MergeResult, attempt_merge};
+use octocrab::models::CheckRunId;
 use octocrab::models::workflows::{Conclusion, Job, Status};
-use octocrab::models::{CheckRunId, RunId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 
 /// We want to distinguish between a critical failure (a build was not marked as cancelled, in which
@@ -115,6 +115,10 @@ pub async fn get_failed_jobs(
         .collect())
 }
 
+pub struct Workflow {
+    pub status: WorkflowStatus,
+}
+
 /// Load workflows for the given build both from the DB and GitHub, and consolidate their state.
 pub async fn load_workflow_runs(
     repo: &RepositoryState,
@@ -123,19 +127,14 @@ pub async fn load_workflow_runs(
 ) -> anyhow::Result<Vec<WorkflowRun>> {
     // Load the workflow runs that we know about from the DB. We know about workflow runs for
     // which we have received a started or a completed event.
-    let db_workflow_runs = db
-        .get_workflows_for_build(build)
-        .await?
-        .into_iter()
-        .filter(|w| w.platform == WorkflowPlatform::Github)
-        .collect::<Vec<_>>();
+    let db_workflow_runs = db.get_workflows_for_build(build).await?;
     tracing::debug!("Workflow runs from DB: {db_workflow_runs:?}");
 
     // Ask GitHub about all workflow runs attached to the build commit.
     // This tells us for how many workflow runs we should wait.
     let mut workflow_runs: Vec<WorkflowRun> = repo
         .client
-        .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+        .get_all_workflow_runs_for_commit_sha(&CommitSha(build.commit_sha.clone()))
         .await?;
     tracing::debug!("Workflow runs from GitHub: {workflow_runs:?}");
 
@@ -145,14 +144,15 @@ pub async fn load_workflow_runs(
     // propagated to the DB yet.
     // Here we reconcile the two world views.
     for db_run in db_workflow_runs {
-        let Ok(db_run_id) = db_run.run_id.parse::<u64>() else {
+        let Ok(db_run_id) = db_run.workflow_run_id() else {
             tracing::error!(
+                id = db_run.id,
                 run_id = %db_run.run_id,
-                "Found GitHub workflow in DB with invalid run_id",
+                platform = ?db_run.platform,
+                "DB has invalid workflow run_id - ignoring",
             );
             continue;
         };
-        let db_run_id = RunId(db_run_id);
 
         if let Some(gh_run) = workflow_runs
             .iter_mut()
@@ -168,9 +168,10 @@ pub async fn load_workflow_runs(
             // For some reason, we have a workflow in the DB that is not on GitHub. This shouldn't
             // really happen, but in any case we backfill it.
             tracing::warn!(
-                "Found DB workflow {} with status {:?} that was not on GitHub",
-                db_run.run_id,
-                db_run.status
+                id = db_run.id,
+                run_id = ?db_run_id,
+                status = ?db_run.status,
+                "Found DB workflow that was not on GitHub",
             );
             workflow_runs.push(WorkflowRun {
                 id: db_run_id,

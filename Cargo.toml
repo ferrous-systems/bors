@@ -83,7 +83,6 @@ thread_local = "1"
 sqlparser = { version = "0.62", features = ["visitor"] }
 graphql-parser = "0.4"
 urlencoding = "2"
-uuid = { version = "1.26", features = ["v4"] }
 
 [profile.release]
 debug = 1

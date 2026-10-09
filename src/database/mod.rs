@@ -4,8 +4,8 @@ use std::{
     str::FromStr,
 };
 
-use crate::bors::BuildKind;
 use crate::bors::comment::CommentTag;
+use crate::bors::{BuildKind, WorkflowRunId};
 use crate::{
     bors::{PullRequestStatus, RollupMode},
     github::{CommitSha, GithubRepoName, PullRequest, PullRequestNumber},
@@ -669,6 +669,18 @@ pub struct WorkflowModel {
     /// Current status of the workflow (pending, success, failure).
     pub status: WorkflowStatus,
     pub created_at: DateTime<Utc>,
+}
+
+impl WorkflowModel {
+    pub fn workflow_run_id(&self) -> anyhow::Result<WorkflowRunId> {
+        match self.platform {
+            WorkflowPlatform::CircleCi => Ok(WorkflowRunId::CircleCi(self.run_id.clone().into())),
+            WorkflowPlatform::Github => {
+                let parsed = self.run_id.parse::<u64>()?;
+                Ok(WorkflowRunId::GitHub(parsed.into()))
+            }
+        }
+    }
 }
 
 /// Represents the state of a repository's tree.

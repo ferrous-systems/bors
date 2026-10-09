@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::database::WorkflowStatus;
-use crate::github::CommitSha;
+use crate::github::{CommitSha, GithubRepoName};
 use crate::tests::BranchPushError;
 use crate::tests::github::{BORS_APP_ID, CheckRunData, Commit, GitUser, WorkflowRun};
 use crate::tests::mock::pull_request::mock_pull_requests;
@@ -335,6 +336,76 @@ async fn mock_merge_branch(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
 
 async fn mock_get_commit(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
     let repo_name = repo.lock().full_name();
+
+    dynamic_mock_req(
+        {
+            let repo = repo.clone();
+            let repo_name = repo_name.clone();
+            move |req: &Request, [sha]| {
+                #[derive(Serialize)]
+                struct CheckRunsResponse<'a> {
+                    total_count: u64,
+                    check_runs: &'a [CheckRunResponse],
+                }
+
+                #[derive(Serialize)]
+                struct CheckRunItem {
+                    #[serde(flatten)]
+                    check_run: octocrab::models::CheckRun,
+                    app: octocrab::models::App,
+                }
+
+                println!("REQUESTED");
+
+                let query = req
+                    .url
+                    .query_pairs()
+                    .map(|(lhs, rhs)| (lhs.to_string(), rhs.to_string()))
+                    .collect::<HashMap<String, String>>();
+                let page: usize = query.get("page").unwrap().parse().unwrap();
+                let per_page: usize = query.get("per_page").unwrap().parse().unwrap();
+
+                let repo = repo.lock();
+                let check_runs = repo
+                    .check_runs()
+                    .into_iter()
+                    .filter(|data| data.head_sha == sha)
+                    .map(|data| CheckRunResponse::new(repo_name.clone(), data))
+                    .collect::<anyhow::Result<Box<[_]>>>();
+                let check_runs = match check_runs {
+                    Ok(check_runs) => check_runs,
+                    Err(err) => {
+                        println!("ERROR: {err}");
+                        return ResponseTemplate::new(500).set_body_string(format!("{err}"));
+                    }
+                };
+
+                let mut response = CheckRunsResponse {
+                    total_count: check_runs.len() as _,
+                    check_runs: &[],
+                };
+
+                let offset = page * per_page;
+                if offset < check_runs.len() {
+                    response.check_runs = &check_runs[offset..];
+                    if response.check_runs.len() > per_page {
+                        response.check_runs = &response.check_runs[..per_page];
+                    }
+                }
+
+                println!(
+                    "check-runs response {response}",
+                    response = serde_json::to_string(&response).unwrap(),
+                );
+                ResponseTemplate::new(200).set_body_json(response)
+            }
+        },
+        "GET",
+        format!("^/repos/{repo_name}/commits/([^/]*)/check-runs"),
+    )
+    .mount(mock_server)
+    .await;
+
     dynamic_mock_req(
         move |_: &Request, [sha]| {
             let repo = repo.lock();
@@ -350,7 +421,7 @@ async fn mock_get_commit(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
             ResponseTemplate::new(200).set_body_json(response)
         },
         "GET",
-        format!("^/repos/{repo_name}/commits/(.*)"),
+        format!("^/repos/{repo_name}/commits/([^/]*)"),
     )
     .mount(mock_server)
     .await;
@@ -537,7 +608,70 @@ struct CheckRunResponse {
     external_id: String,
     output: CheckRunResponseOutput,
     pull_requests: Vec<serde_json::Value>,
-    app: AppResponse,
+    app: octocrab::models::App,
+}
+
+impl CheckRunResponse {
+    fn new(repo_name: GithubRepoName, data: &CheckRunData) -> anyhow::Result<Self> {
+        let app = serde_json::from_value(serde_json::json!({
+            "id": data.github_app_id,
+            "node_id": "",
+            "owner": {
+                "login": "fake",
+                "id": 010101,
+                "type": "User",
+                "site_admin": false,
+                "node_id": "FAKE BOT OWNER",
+                "avatar_url": "https://example.com/avatar.png",
+                "gravatar_id": "",
+                "url": "https://example.com/owner",
+                "html_url": "https://example.com/owner",
+                "followers_url": "https://example.com/followers",
+                "following_url": "https://example.com/following",
+                "gists_url": "https://example.com/gists",
+                "starred_url": "https://example.com/starred",
+                "subscriptions_url": "https://example.com/subscriptions",
+                "organizations_url": "https://example.com/organizations",
+                "repos_url": "https://example.com/repos",
+                "events_url": "https://example.com/events",
+                "received_events_url": "https://example.com/received_events",
+                "patch_url": null,
+            },
+            "name": format!("App {} - whatever that is", data.github_app_id),
+            "external_url": format!("https://example.com/apps/{}", data.github_app_id),
+            "html_url": format!("https://example.com/apps/{}", data.github_app_id),
+            "permissions": {},
+            "events": [],
+        }))?;
+
+        let check_run_id = data.id;
+        Ok(Self {
+            id: data.id,
+            node_id: "".to_string(),
+            name: data.name.clone(),
+            head_sha: data.head_sha.clone(),
+            url: format!("https://api.github.com/repos/{repo_name}/check-runs/{check_run_id}"),
+            html_url: format!("https://github.com/{repo_name}/runs/{check_run_id}"),
+            details_url: None,
+            status: data.status.clone(),
+            conclusion: data.conclusion.clone(),
+            started_at: data.started_at,
+            completed_at: data.completed_at,
+            external_id: data.external_id.clone(),
+            output: CheckRunResponseOutput {
+                title: data.title.clone(),
+                summary: data.summary.clone(),
+                text: data.text.clone(),
+                annotations_count: 0,
+                annotations_url: format!(
+                    "https://api.github.com/repos/{repo_name}/check-runs/{check_run_id}/annotations"
+                ),
+            },
+            pull_requests: vec![],
+            // app: AppResponse { id: BORS_APP_ID },
+            app,
+        })
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -547,12 +681,6 @@ struct CheckRunResponseOutput {
     text: Option<String>,
     annotations_count: u64,
     annotations_url: String,
-}
-
-#[derive(serde::Serialize)]
-struct AppResponse {
-    // bors only checks for the app id, everything else is ignored
-    id: AppId,
 }
 
 async fn mock_check_runs(
@@ -588,7 +716,10 @@ async fn mock_check_runs(
                     "queued" => CheckRunStatus::Queued,
                     "in_progress" => CheckRunStatus::InProgress,
                     "completed" => CheckRunStatus::Completed,
-                    _ => return ResponseTemplate::new(400).set_body_string(format!("invalid status: {}", data.status)),
+                    _ => {
+                        return ResponseTemplate::new(400)
+                            .set_body_string(format!("invalid status: {}", data.status));
+                    }
                 };
 
                 let mut repo = repo.lock();
@@ -604,43 +735,19 @@ async fn mock_check_runs(
                     conclusion: None,
                     title: data.output.title.clone(),
                     summary: data.output.summary.clone(),
-                    text: data.output.text.clone().unwrap_or_default(),
+                    text: data.output.text.clone(),
                     external_id: data.external_id.clone(),
                     started_at,
                     completed_at: None,
                 };
 
                 repo.add_check_run(check_run);
+                let check_run = repo.get_check_run(check_run_id);
 
-                let response = CheckRunResponse {
-                    id: check_run_id,
-                    node_id: "1234".to_string(),
-                    name: data.name,
-                    head_sha: data.head_sha,
-                    url: format!(
-                        "https://api.github.com/repos/{repo_name}/check-runs/{check_run_id}"
-                    ),
-                    html_url: format!("https://github.com/{repo_name}/runs/{check_run_id}"),
-                    details_url: None,
-                    status,
-                    conclusion: None,
-                    started_at,
-                    completed_at: None,
-                    external_id: data.external_id,
-                    output: CheckRunResponseOutput {
-                        title: data.output.title,
-                        summary: data.output.summary,
-                        text: data.output.text,
-                        annotations_count: 0,
-                        annotations_url: format!(
-                            "https://api.github.com/repos/{repo_name}/check-runs/{check_run_id}/annotations"
-                        ),
-                    },
-                    pull_requests: vec![],
-                    app: AppResponse { id: BORS_APP_ID }
-                };
-
-                ResponseTemplate::new(201).set_body_json(response)
+                match CheckRunResponse::new(repo.full_name(), check_run) {
+                    Ok(response) => ResponseTemplate::new(201).set_body_json(response),
+                    Err(err) => ResponseTemplate::new(500).set_body_string(format!("{err}")),
+                }
             }
         })
         .mount(mock_server)
@@ -661,11 +768,12 @@ async fn mock_check_runs(
                 }
 
                 let path = request.url.path();
-                let check_run_id = CheckRunId(path
-                    .split('/')
-                    .next_back()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap());
+                let check_run_id = CheckRunId(
+                    path.split('/')
+                        .next_back()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap(),
+                );
 
                 let data: UpdateCheckRunRequest = request.body_json().unwrap();
 
@@ -673,20 +781,28 @@ async fn mock_check_runs(
                     "queued" => CheckRunStatus::Queued,
                     "in_progress" => CheckRunStatus::InProgress,
                     "completed" => CheckRunStatus::Completed,
-                    _ => return ResponseTemplate::new(400).set_body_string(format!("invalid status: {}", data.status))
+                    _ => {
+                        return ResponseTemplate::new(400)
+                            .set_body_string(format!("invalid status: {}", data.status));
+                    }
                 };
 
-                let conclusion = data.conclusion.map(|conclusion| Ok(match conclusion.as_str() {
-                    "success" => CheckRunConclusion::Success,
-                    "failure" => CheckRunConclusion::Failure,
-                    "neutral" => CheckRunConclusion::Neutral,
-                    "cancelled" => CheckRunConclusion::Cancelled,
-                    "timed_out" => CheckRunConclusion::TimedOut,
-                    "skipped" => CheckRunConclusion::Skipped,
-                    "stale" => CheckRunConclusion::Stale,
-                    "action_required" => CheckRunConclusion::ActionRequired,
-                    _ => return Err(format!("invalid conclusion: {conclusion}"))
-                })).transpose();
+                let conclusion = data
+                    .conclusion
+                    .map(|conclusion| {
+                        Ok(match conclusion.as_str() {
+                            "success" => CheckRunConclusion::Success,
+                            "failure" => CheckRunConclusion::Failure,
+                            "neutral" => CheckRunConclusion::Neutral,
+                            "cancelled" => CheckRunConclusion::Cancelled,
+                            "timed_out" => CheckRunConclusion::TimedOut,
+                            "skipped" => CheckRunConclusion::Skipped,
+                            "stale" => CheckRunConclusion::Stale,
+                            "action_required" => CheckRunConclusion::ActionRequired,
+                            _ => return Err(format!("invalid conclusion: {conclusion}")),
+                        })
+                    })
+                    .transpose();
                 let conclusion = match conclusion {
                     Ok(c) => c,
                     Err(err) => return ResponseTemplate::new(400).set_body_string(err),
@@ -696,36 +812,10 @@ async fn mock_check_runs(
                 repo.update_check_run(check_run_id, status, conclusion);
 
                 let check_run = repo.get_check_run(check_run_id);
-
-                let response = CheckRunResponse {
-                    id: check_run_id,
-                    node_id: "1234".to_string(),
-                    name: check_run.name.clone(),
-                    head_sha: check_run.head_sha.clone(),
-                    url: format!(
-                        "https://api.github.com/repos/{repo_name}/check-runs/{check_run_id}"
-                    ),
-                    html_url: format!("https://github.com/{repo_name}/runs/{check_run_id}"),
-                    details_url: None,
-                    status: check_run.status.clone(),
-                    conclusion: check_run.conclusion.clone(),
-                    started_at: check_run.started_at.clone(),
-                    completed_at: check_run.completed_at.clone(),
-                    external_id: check_run.external_id.clone(),
-                    output: CheckRunResponseOutput {
-                        title: check_run.title.clone(),
-                        summary: check_run.summary.clone(),
-                        text: Some(check_run.text.clone()),
-                        annotations_count: 0,
-                        annotations_url: format!(
-                            "https://api.github.com/repos/{repo_name}/check-runs/{check_run_id}/annotations"
-                        ),
-                    },
-                    pull_requests: vec![],
-                    app: AppResponse { id: check_run.github_app_id }
-                };
-
-                ResponseTemplate::new(200).set_body_json(response)
+                match CheckRunResponse::new(repo_name.clone(), check_run) {
+                    Ok(response) => ResponseTemplate::new(200).set_body_json(response),
+                    Err(err) => ResponseTemplate::new(500).set_body_string(format!("{err}")),
+                }
             }
         })
         .mount(mock_server)

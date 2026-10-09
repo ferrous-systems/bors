@@ -18,7 +18,6 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::{Receiver, Sender};
-use uuid::Uuid;
 
 pub const BORS_APP_ID: AppId = AppId(0x4361726D656E);
 
@@ -277,12 +276,16 @@ impl GitHub {
         CheckRunId(self.check_run_id_counter)
     }
 
-    pub fn new_circleci_workflow(&mut self, repo: &GithubRepoName, branch: &str) -> CheckRunId {
+    pub fn new_circleci_workflow(
+        &mut self,
+        workflow_id: String,
+        repo: &GithubRepoName,
+        branch: &str,
+    ) -> CheckRunId {
         let repo = self.get_repo(repo);
         let mut repo = repo.lock();
 
         let check_run_id = self.next_check_run_id();
-        let workflow_id = Uuid::new_v4();
         let check_run = CheckRunData {
             github_app_id: CIRCLECI_CHECKS_APP_ID,
             id: check_run_id,
@@ -296,9 +299,9 @@ impl GitHub {
             conclusion: None,
             title: "Some CircleCI workflow".to_string(),
             summary: "This is a CircleCI workflow!".to_string(),
-            text: "This workflow is executing on CircleCI! Wowee! Here's a link!".to_string(),
+            text: None,
             external_id: serde_json::to_string(&serde_json::json!({
-                "actor-id": Uuid::new_v4().to_string(),
+                "actor-id": "427D9B2C-3AE9-4A53-A9D5-B0A1DF39B939".to_string(),
                 "source": "notifications",
                 "workflow-id": workflow_id.to_string(),
             }))
@@ -1236,7 +1239,7 @@ pub struct CheckRunData {
     pub conclusion: Option<CheckRunConclusion>,
     pub title: String,
     pub summary: String,
-    pub text: String,
+    pub text: Option<String>,
     pub external_id: String,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,

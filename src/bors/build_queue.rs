@@ -20,7 +20,8 @@ use crate::bors::labels::handle_label_trigger;
 use crate::bors::merge_queue::MergeQueueSender;
 use crate::bors::unroll_queue::UnrollQueueSender;
 use crate::bors::{
-    BuildKind, FailedWorkflowRun, RepositoryState, elapsed_time_since, hide_tagged_comments,
+    BuildKind, FailedWorkflowRun, RepositoryState, WorkflowRunId, elapsed_time_since,
+    hide_tagged_comments,
 };
 use crate::database::{
     BuildModel, BuildStatus, PullRequestModel, UpdateBuildParams, WorkflowStatus,
@@ -418,16 +419,22 @@ async fn maybe_complete_build(
         // Download failed jobs
         let mut failed_workflow_runs: Vec<FailedWorkflowRun> = vec![];
         for workflow_run in workflow_runs {
-            let failed_jobs = match get_failed_jobs(repo, workflow_run.id).await {
-                Ok(jobs) => jobs,
-                Err(error) => {
-                    tracing::error!(
-                        "Cannot download jobs for workflow run {}: {error:?}",
-                        workflow_run.id
-                    );
+            let failed_jobs = match &workflow_run.id {
+                WorkflowRunId::GitHub(run_id) => match get_failed_jobs(repo, *run_id).await {
+                    Ok(jobs) => jobs,
+                    Err(error) => {
+                        tracing::error!(
+                            "Cannot download jobs for workflow run {run_id}: {error:?}",
+                        );
+                        vec![]
+                    }
+                },
+                WorkflowRunId::CircleCi(workflow_id) => {
+                    tracing::warn!(%workflow_id, "TODO: fetch failed jobs from CircleCI");
                     vec![]
                 }
             };
+
             failed_workflow_runs.push(FailedWorkflowRun {
                 workflow_run,
                 failed_jobs,

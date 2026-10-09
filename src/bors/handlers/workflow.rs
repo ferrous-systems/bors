@@ -1,4 +1,3 @@
-use crate::bors::RepositoryState;
 use crate::bors::build::{CancelBuildConclusion, CancelBuildError};
 use crate::bors::build_queue::BuildQueueSender;
 use crate::bors::comment::{CommentTag, append_workflow_links_to_comment};
@@ -8,6 +7,7 @@ use crate::bors::event::{
 };
 use crate::bors::handlers::{get_build_kind_from_branch, is_bors_observed_branch};
 use crate::bors::{BuildKind, build};
+use crate::bors::{RepositoryState, WorkflowRunId};
 use crate::database::{BuildModel, BuildStatus, PullRequestModel, WorkflowStatus};
 use crate::ec2::{Ec2InstanceStartData, ParsedLabel, start_ec2_github_runner};
 use crate::github::CommitSha;
@@ -302,7 +302,7 @@ pub(super) async fn reload_workflow_job_cache(
 
         let Ok(workflows) = repo
             .client
-            .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+            .get_gha_workflow_runs_for_commit_sha(&CommitSha(build.commit_sha.clone()))
             .await
         else {
             continue;
@@ -314,21 +314,26 @@ pub(super) async fn reload_workflow_job_cache(
                     continue;
                 }
             }
-            let Ok(workflow_jobs) = repo.client.get_jobs_for_workflow_run(workflow.id).await else {
+            let WorkflowRunId::GitHub(workflow_id) = workflow.id else {
+                tracing::error!("unexpected CircleCI workflow from GHA workflow response");
+                continue;
+            };
+
+            let Ok(workflow_jobs) = repo.client.get_jobs_for_workflow_run(workflow_id).await else {
                 continue;
             };
 
             tracing::info!(
                 "Reloading {} job(s) of workflow run {}",
                 workflow_jobs.len(),
-                workflow.id
+                workflow_id
             );
             for job in workflow_jobs {
                 match job.status {
                     Status::Completed | Status::Failed => {
                         job_cache.auto_job_completed(
                             repo.repository(),
-                            workflow.id,
+                            workflow_id,
                             job.id,
                             &job.name,
                         );
@@ -336,7 +341,7 @@ pub(super) async fn reload_workflow_job_cache(
                     _ => {
                         job_cache.auto_job_started(
                             repo.repository(),
-                            workflow.id,
+                            workflow_id,
                             job.id,
                             &job.name,
                         );
@@ -566,21 +571,28 @@ mod tests {
     // First start both workflows, then finish both of them.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_success_multiple_workflows_per_suite_1(pool: sqlx::PgPool) {
+        // tracing_subscriber::fmt()
+        //     // .with_max_level(tracing::Level::DEBUG)
+        //     .init();
+
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
             ctx.expect_comments((), 1).await;
 
             let w1 = ctx.try_workflow();
             let w2 = ctx.try_workflow();
+            let w3 = ctx.circleci_try_workflow();
 
             // Finish w1 while w2 is not yet in the DB
             ctx.workflow_full_success(w1).await?;
             ctx.workflow_full_success(w2).await?;
+            ctx.circleci_workflow_full_success(w3).await?;
 
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @r#"
             :sunny: Try build successful
+            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/2) :white_check_mark:
             Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)

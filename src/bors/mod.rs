@@ -15,7 +15,7 @@ use itertools::Itertools;
 use octocrab::models::RunId;
 use octocrab::models::workflows::Job;
 use regex::{Regex, RegexBuilder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -229,12 +229,70 @@ fn elapsed_time_since(date: DateTime<Utc>) -> Duration {
 /// Corresponds to a single execution of a workflow.
 #[derive(Clone, Debug)]
 pub struct WorkflowRun {
-    pub id: RunId,
+    pub id: WorkflowRunId,
     pub name: String,
     pub url: String,
     pub status: WorkflowStatus,
     pub created_at: DateTime<Utc>,
     pub duration: Option<Duration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct CircleCiWorkflowId(String);
+
+impl std::fmt::Display for CircleCiWorkflowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        String::fmt(&self.0, f)
+    }
+}
+
+impl From<String> for CircleCiWorkflowId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<CircleCiWorkflowId> for String {
+    fn from(value: CircleCiWorkflowId) -> Self {
+        value.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowRunId {
+    GitHub(RunId),
+    CircleCi(CircleCiWorkflowId),
+}
+
+impl From<RunId> for WorkflowRunId {
+    fn from(value: RunId) -> Self {
+        Self::GitHub(value)
+    }
+}
+
+impl PartialEq<RunId> for WorkflowRunId {
+    fn eq(&self, other: &RunId) -> bool {
+        let Self::GitHub(github_run_id) = self else {
+            return false;
+        };
+        github_run_id == other
+    }
+}
+
+impl From<CircleCiWorkflowId> for WorkflowRunId {
+    fn from(value: CircleCiWorkflowId) -> Self {
+        Self::CircleCi(value)
+    }
+}
+
+impl PartialEq<CircleCiWorkflowId> for WorkflowRunId {
+    fn eq(&self, other: &CircleCiWorkflowId) -> bool {
+        let Self::CircleCi(circleci_workflow_id) = self else {
+            return false;
+        };
+        circleci_workflow_id == other
+    }
 }
 
 pub struct FailedWorkflowRun {

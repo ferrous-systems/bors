@@ -206,6 +206,7 @@ pub struct BorsTester {
     ctx: Arc<BorsContext>,
     current_session: Option<String>,
     wait_for_markers: bool,
+    stable_circleci_workflow_ids: Mutex<Vec<String>>,
 }
 
 impl BorsTester {
@@ -282,6 +283,19 @@ impl BorsTester {
                 ctx,
                 current_session: None,
                 wait_for_markers: true,
+                stable_circleci_workflow_ids: Mutex::new(
+                    // allows up to 5 CircleCI workflow ids to be used per test (if you need more in a test, add more here)
+                    [
+                        "C8CC1C6E-F7E6-48AD-8C57-F5EA065F5C6A",
+                        "11925393-266D-494C-AD37-9C71428E81E1",
+                        "FE87E745-F759-4724-903B-48BDC6FB090F",
+                        "33581884-12F7-4BEB-9FE0-9BCE96258D3C",
+                        "14039835-E1C1-4BD6-A10D-DF2FB738F2A0",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ),
             },
             bors,
         )
@@ -361,7 +375,11 @@ impl BorsTester {
         branch: &str,
     ) -> CheckRunId {
         let mut gh = self.github.lock();
-        gh.new_circleci_workflow(&id.into().0, branch)
+        gh.new_circleci_workflow(
+            self.stable_circleci_workflow_ids.lock().pop().unwrap(),
+            &id.into().0,
+            branch,
+        )
     }
 
     pub fn create_workflow<Id: Into<RepoIdentifier>>(&self, id: Id, branch: &str) -> RunId {

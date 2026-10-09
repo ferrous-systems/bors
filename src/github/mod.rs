@@ -281,6 +281,14 @@ impl Display for PullRequestNumber {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CheckRun {
+    pub name: String, // seriously octocrab???
+    #[serde(flatten)]
+    pub check_run: octocrab::models::CheckRun,
+    pub app: octocrab::models::App,
+}
+
 /// Creates a new Octocrab client with the proper shared defaults configured.
 fn prepare_octocrab_client(
     base_uri: &str,
