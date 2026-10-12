@@ -435,6 +435,24 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn push_to_pr_do_nothing_when_circleci_build_failed(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.circleci_workflow_full_failure(ctx.circleci_auto_workflow())
+                .await?;
+            ctx.expect_comments((), 1).await;
+            ctx.push_to_pr((), Commit::from_sha("foo")).await?;
+
+            // No comment should be posted, but the PR should still be unapproved
+            ctx.wait_for_pr((), |pr| !pr.is_approved() && pr.auto_build.is_none())
+                .await?;
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn push_to_pr_do_not_send_mergeability_notification(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -950,6 +968,31 @@ conflict = ["+conflict"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn cancel_pending_circleci_auto_build_on_push_comment(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.pr(()).await.expect_auto_build(|_| true);
+
+            let run_id = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(run_id).await?;
+            ctx.push_to_pr((), Commit::from_sha("foo")).await?;
+            assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :warning: A new commit `foo` was pushed.
+
+            This pull request was unapproved.
+
+            Auto build was cancelled due to push. Cancelled workflows:
+
+            - https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
+            ");
+            ctx.expect_cancelled_circleci_workflows((), &[run_id]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_pending_auto_build_on_push_error_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_repo((), |repo| {
@@ -960,6 +1003,31 @@ conflict = ["+conflict"]
             ctx.pr(()).await.expect_auto_build(|_| true);
 
             ctx.workflow_start(ctx.auto_workflow()).await?;
+            ctx.push_to_pr((), Commit::from_sha("foo")).await?;
+            assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :warning: A new commit `foo` was pushed.
+
+            This pull request was unapproved.
+
+            Auto build was cancelled due to push. It was not possible to cancel some workflows.
+            ");
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn cancel_pending_circleci_auto_build_on_push_error_comment(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.modify_repo((), |repo| {
+                repo.workflow_cancel_error = true;
+            });
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.pr(()).await.expect_auto_build(|_| true);
+
+            ctx.circleci_workflow_start(ctx.circleci_auto_workflow())
+                .await?;
             ctx.push_to_pr((), Commit::from_sha("foo")).await?;
             assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             :warning: A new commit `foo` was pushed.

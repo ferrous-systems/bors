@@ -453,7 +453,7 @@ mod tests {
     use crate::database::operations::get_all_workflows;
     use crate::database::{PgDuration, WorkflowStatus};
     use crate::github::CommitSha;
-    use crate::tests::{BorsBuilder, BorsTester, GitHub, default_repo_name};
+    use crate::tests::{BorsBuilder, BorsTester, CheckRunEvent, GitHub, default_repo_name};
     use crate::tests::{WorkflowEvent, run_test};
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -469,11 +469,37 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_workflow_started_unknown_build(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.create_branch("unknown");
+            let run_id = ctx.create_circleci_workflow((), "unknown");
+            ctx.circleci_workflow_event(CheckRunEvent::started(run_id))
+                .await?;
+            Ok(())
+        })
+        .await;
+        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 0);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn workflow_completed_unknown_build(pool: sqlx::PgPool) {
         run_test(pool.clone(), async |ctx: &mut BorsTester| {
             ctx.create_branch("unknown");
             let run_id = ctx.create_workflow((), "unknown");
             ctx.workflow_event(WorkflowEvent::success(run_id)).await?;
+            Ok(())
+        })
+        .await;
+        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 0);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_workflow_completed_unknown_build(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.create_branch("unknown");
+            let run_id = ctx.create_circleci_workflow((), "unknown");
+            ctx.circleci_workflow_event(CheckRunEvent::success(run_id))
+                .await?;
             Ok(())
         })
         .await;
@@ -495,6 +521,38 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_try_workflow_started(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.circleci_workflow_event(CheckRunEvent::started(ctx.circleci_try_workflow()))
+                .await?;
+            Ok(())
+        })
+        .await;
+        let suite = get_all_workflows(&pool).await.unwrap().pop().unwrap();
+        assert_eq!(suite.status, WorkflowStatus::Pending);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_workflows_started(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.workflow_event(WorkflowEvent::started(ctx.try_workflow()))
+                .await?;
+            ctx.circleci_workflow_event(CheckRunEvent::started(ctx.circleci_try_workflow()))
+                .await?;
+            Ok(())
+        })
+        .await;
+        let suites = get_all_workflows(&pool).await.unwrap();
+        assert_eq!(2, suites.len());
+        assert_eq!(suites[0].status, WorkflowStatus::Pending);
+        assert_eq!(suites[1].status, WorkflowStatus::Pending);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_workflow_start_twice(pool: sqlx::PgPool) {
         run_test(pool.clone(), async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
@@ -503,6 +561,22 @@ mod tests {
             ctx.workflow_event(WorkflowEvent::started(ctx.try_workflow()))
                 .await?;
             ctx.workflow_event(WorkflowEvent::started(ctx.try_workflow()))
+                .await?;
+            Ok(())
+        })
+        .await;
+        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 2);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_try_workflow_start_twice(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.circleci_workflow_event(CheckRunEvent::started(ctx.circleci_try_workflow()))
+                .await?;
+            ctx.circleci_workflow_event(CheckRunEvent::started(ctx.circleci_try_workflow()))
                 .await?;
             Ok(())
         })
@@ -528,6 +602,72 @@ mod tests {
                 ctx.get_next_comment_text(()).await?,
                 @r#"
             :sunny: Try build successful
+            - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1) :white_check_mark:
+            - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/2) :white_check_mark:
+            Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
+            Base parent: main-sha1 (`main-sha1`)
+
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_success_multiple_circleci_workflows_per_suite_1(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.circleci_try_workflow();
+            let w2 = ctx.circleci_try_workflow();
+
+            // Finish w1 while w2 is not yet in the DB
+            ctx.circleci_workflow_full_success(w1).await?;
+            ctx.circleci_workflow_full_success(w2).await?;
+
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @r#"
+            :sunny: Try build successful
+            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
+            Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
+            Base parent: main-sha1 (`main-sha1`)
+
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_success_multiple_workflows_per_suite_1_with_both(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.try_workflow();
+            let w2 = ctx.try_workflow();
+            let w3 = ctx.circleci_try_workflow();
+            let w4 = ctx.circleci_try_workflow();
+
+            // Finish w1 while w2 is not yet in the DB
+            ctx.workflow_full_success(w1).await?;
+            ctx.workflow_full_success(w2).await?;
+            ctx.circleci_workflow_full_success(w3).await?;
+            ctx.circleci_workflow_full_success(w4).await?;
+
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @r#"
+            :sunny: Try build successful
+            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/2) :white_check_mark:
             Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
@@ -572,6 +712,75 @@ mod tests {
         .await;
     }
 
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_success_multiple_circleci_workflows_per_suite_2(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.circleci_try_workflow();
+            let w2 = ctx.circleci_try_workflow();
+            ctx.circleci_workflow_start(w1).await?;
+            ctx.circleci_workflow_start(w2).await?;
+
+            ctx.circleci_workflow_event(CheckRunEvent::success(w1)).await?;
+            ctx.circleci_workflow_event(CheckRunEvent::success(w2)).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @r#"
+            :sunny: Try build successful
+            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
+            Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
+            Base parent: main-sha1 (`main-sha1`)
+
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_success_multiple_workflows_per_suite_2_with_both(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.try_workflow();
+            let w2 = ctx.try_workflow();
+            let w3 = ctx.circleci_try_workflow();
+            let w4 = ctx.circleci_try_workflow();
+
+            ctx.workflow_start(w1).await?;
+            ctx.workflow_start(w2).await?;
+            ctx.circleci_workflow_start(w3).await?;
+            ctx.circleci_workflow_start(w4).await?;
+
+            ctx.workflow_event(WorkflowEvent::success(w1)).await?;
+            ctx.workflow_event(WorkflowEvent::success(w2)).await?;
+            ctx.circleci_workflow_event(CheckRunEvent::success(w3)).await?;
+            ctx.circleci_workflow_event(CheckRunEvent::success(w4)).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @r#"
+            :sunny: Try build successful
+            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
+            - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1) :white_check_mark:
+            - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/2) :white_check_mark:
+            Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
+            Base parent: main-sha1 (`main-sha1`)
+
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+            );
+            Ok(())
+        })
+        .await;
+    }
+
     // Finish the build early when we encounter the first failure
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_failure_multiple_workflows_early(pool: sqlx::PgPool) {
@@ -588,6 +797,69 @@ mod tests {
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1), [Workflow1](https://github.com/rust-lang/borstest/actions/runs/2)"
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_failure_multiple_circleci_workflows_early(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.circleci_try_workflow();
+            let w2 = ctx.circleci_try_workflow();
+            ctx.circleci_workflow_start(w1).await?;
+            ctx.circleci_workflow_start(w2).await?;
+
+            ctx.circleci_workflow_event(CheckRunEvent::failure(w2)).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0), [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C)"
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_gha_failure_multiple_workflows_early(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.try_workflow();
+            let w2 = ctx.circleci_try_workflow();
+            ctx.workflow_start(w1).await?;
+            ctx.circleci_workflow_start(w2).await?;
+
+            ctx.workflow_event(WorkflowEvent::failure(w1)).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1), [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_circleci_failure_multiple_workflows_early(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.try_workflow();
+            let w2 = ctx.circleci_try_workflow();
+            ctx.workflow_start(w1).await?;
+            ctx.circleci_workflow_start(w2).await?;
+
+            ctx.circleci_workflow_event(CheckRunEvent::failure(w2)).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1), [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
             );
             Ok(())
         })
@@ -623,6 +895,34 @@ min_ci_time = 10
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn min_ci_time_mark_too_short_circleci_workflow_as_failed(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(GitHub::default().append_to_default_config(
+                r#"
+min_ci_time = 10
+"#,
+            ))
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment("@bors try").await?;
+                ctx.expect_comments((), 1).await;
+
+                let w1 = ctx.circleci_try_workflow();
+                ctx.modify_check_run(w1, |c| c.set_duration(Duration::from_secs(1)));
+
+                // Too short workflow, it should be marked as a failure
+                ctx
+                    .circleci_workflow_full_success(w1)
+                    .await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+                :broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+                A workflow was considered to be a failure because it took only `1s`. The minimum duration for CI workflows is configured to be `10s`.
+                ");
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn min_ci_time_ignore_failed_workflow(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::default().append_to_default_config(
@@ -648,6 +948,31 @@ min_ci_time = 10
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn min_ci_time_ignore_failed_circleci_workflow(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(GitHub::default().append_to_default_config(
+                r#"
+min_ci_time = 10
+"#,
+            ))
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment("@bors try").await?;
+                ctx.expect_comments((), 1).await;
+
+                let w1 = ctx.circleci_try_workflow();
+                ctx.modify_check_run(w1, |c| c.set_duration(Duration::from_secs(1)));
+
+                // Too short workflow that failed anyway
+                ctx
+                    .circleci_workflow_full_failure(w1)
+                    .await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)");
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn min_ci_time_ignore_long_enough_workflow(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(GitHub::default().append_to_default_config(
@@ -666,6 +991,35 @@ min_ci_time = 20
                     .await?;
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
                 :sunny: Try build successful ([Workflow1](https://github.com/rust-lang/borstest/actions/runs/1))
+                Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
+                Base parent: main-sha1 (`main-sha1`)
+
+                <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+                "#);
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn min_ci_time_ignore_long_enough_circleci_workflow(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(GitHub::default().append_to_default_config(
+                r#"
+min_ci_time = 20
+"#,
+            ))
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment("@bors try").await?;
+                ctx.expect_comments((), 1).await;
+
+                let w1 = ctx.circleci_try_workflow();
+                ctx.modify_check_run(w1, |c| c.set_duration(Duration::from_secs(100)));
+                ctx
+                    .circleci_workflow_full_success(w1)
+                    .await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
+                :sunny: Try build successful ([CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
                 Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
                 Base parent: main-sha1 (`main-sha1`)
 
@@ -704,6 +1058,33 @@ min_ci_time = 20
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_build_success_duration(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.circleci_try_workflow();
+            ctx.modify_check_run(w1, |c| c.set_duration(Duration::from_secs(100)));
+            ctx.circleci_workflow_full_success(w1).await?;
+            ctx.expect_comments((), 1).await;
+
+            let build = ctx
+                .db()
+                .find_build(
+                    &default_repo_name(),
+                    ctx.try_branch().name(),
+                    CommitSha(ctx.try_branch().sha()),
+                )
+                .await?
+                .expect("Build not found");
+            assert_eq!(build.duration, Some(PgDuration(Duration::from_secs(100))));
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn build_failed_duration(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
@@ -712,6 +1093,33 @@ min_ci_time = 20
             let w1 = ctx.try_workflow();
             ctx.modify_workflow(w1, |w| w.set_duration(Duration::from_secs(100)));
             ctx.workflow_full_failure(w1).await?;
+            ctx.expect_comments((), 1).await;
+
+            let build = ctx
+                .db()
+                .find_build(
+                    &default_repo_name(),
+                    ctx.try_branch().name(),
+                    CommitSha(ctx.try_branch().sha()),
+                )
+                .await?
+                .expect("Build not found");
+            assert_eq!(build.duration, Some(PgDuration(Duration::from_secs(100))));
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_build_failed_duration(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.circleci_try_workflow();
+            ctx.modify_check_run(w1, |c| c.set_duration(Duration::from_secs(100)));
+            ctx.circleci_workflow_full_failure(w1).await?;
             ctx.expect_comments((), 1).await;
 
             let build = ctx

@@ -2140,6 +2140,30 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn unapprove_running_auto_circleci_build_pr_comment(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.pr(()).await.expect_auto_build(|_| true);
+            let wf = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(wf).await?;
+            ctx.post_comment("@bors r-").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            This pull request was unapproved.
+
+            Auto build was cancelled due to unapproval. Cancelled workflows:
+
+            - https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
+
+            [View changes since this unapproval](https://triagebot.infra.rust-lang.org/gh-changes-since/rust-lang/borstest/1/main-sha1..pr-1-sha)
+            ");
+            ctx.expect_cancelled_circleci_workflows((), &[wf]);
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn unapprove_running_auto_build_pr_failed_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_repo((), |pr| pr.workflow_cancel_error = true);
@@ -2148,6 +2172,28 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             ctx.start_auto_build(()).await?;
             ctx.pr(()).await.expect_auto_build(|_| true);
             ctx.workflow_start(ctx.auto_workflow()).await?;
+            ctx.post_comment("@bors r-").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            This pull request was unapproved.
+
+            Auto build was cancelled due to unapproval. It was not possible to cancel some workflows.
+
+            [View changes since this unapproval](https://triagebot.infra.rust-lang.org/gh-changes-since/rust-lang/borstest/1/main-sha1..pr-1-sha)
+            ");
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn unapprove_running_auto_circleci_build_pr_failed_comment(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.modify_repo((), |pr| pr.workflow_cancel_error = true);
+
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.pr(()).await.expect_auto_build(|_| true);
+            ctx.circleci_workflow_start(ctx.circleci_auto_workflow()).await?;
             ctx.post_comment("@bors r-").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             This pull request was unapproved.
@@ -2171,6 +2217,30 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             ctx.workflow_start(ctx.auto_workflow()).await?;
             ctx.post_comment("@bors r-").await?;
             ctx.expect_comments((), 1).await;
+            ctx.expect_check_run(
+                &ctx.pr(()).await.get_gh_pr().head_sha(),
+                AUTO_BUILD_CHECK_RUN_NAME,
+                AUTO_BUILD_CHECK_RUN_NAME,
+                CheckRunStatus::Completed,
+                Some(CheckRunConclusion::Cancelled),
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn unapprove_running_auto_circleci_build_updates_check_run(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.pr(()).await.expect_auto_build(|_| true);
+
+            let wf = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(wf).await?;
+            ctx.post_comment("@bors r-").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_cancelled_circleci_workflows((), &[wf]);
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
                 AUTO_BUILD_CHECK_RUN_NAME,

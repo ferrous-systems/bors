@@ -227,6 +227,25 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_retry_auto_build(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.circleci_workflow_full_failure(ctx.circleci_auto_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+            ctx.post_comment("@bors retry").await?;
+            ctx.wait_for_pr((), |pr| pr.auto_build.is_none()).await?;
+            ctx.run_merge_queue_now().await;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":hourglass: Testing commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors..."
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn retry_apply_label(pool: sqlx::PgPool) {
         let gh = GitHub::default().with_default_config(
             r#"
@@ -241,6 +260,31 @@ auto_build_failed = ["-foo"]
             ctx.approve(()).await?;
             ctx.start_auto_build(()).await?;
             ctx.workflow_full_failure(ctx.auto_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.post_comment("@bors retry").await?;
+            ctx.pr(()).await.expect_labels(&["foo"]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn retry_circleci_apply_label(pool: sqlx::PgPool) {
+        let gh = GitHub::default().with_default_config(
+            r#"
+merge_queue_enabled = true
+
+[labels]
+approved = ["+foo"]
+auto_build_failed = ["-foo"]
+"#,
+        );
+        run_test((pool, gh), async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.circleci_workflow_full_failure(ctx.circleci_auto_workflow())
+                .await?;
             ctx.expect_comments((), 1).await;
 
             ctx.post_comment("@bors retry").await?;
@@ -304,6 +348,33 @@ auto_build_failed = ["-foo"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn cancel_cancel_circleci_workflows(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+
+            let w1 = ctx.circleci_auto_workflow();
+            let w2 = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(w1).await?;
+            ctx.circleci_workflow_start(w2).await?;
+            ctx.post_comment("@bors cancel").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Auto build was cancelled. Cancelled workflows:
+
+            - https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
+            - https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C
+
+            The next pull request likely to be tested is https://github.com/rust-lang/borstest/pull/1.
+            ");
+            ctx.expect_cancelled_circleci_workflows((), &[w1, w2]);
+            ctx.pr(()).await.expect_auto_build_cancelled();
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_error(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -311,6 +382,25 @@ auto_build_failed = ["-foo"]
 
             ctx.modify_repo((), |repo| repo.workflow_cancel_error = true);
             ctx.workflow_start(ctx.auto_workflow()).await?;
+            ctx.post_comment("@bors cancel").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Auto build was cancelled. It was not possible to cancel some workflows.
+
+            The next pull request likely to be tested is https://github.com/rust-lang/borstest/pull/1.
+            ");
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn cancel_circleci_error(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+
+            ctx.modify_repo((), |repo| repo.workflow_cancel_error = true);
+            ctx.circleci_workflow_start(ctx.circleci_auto_workflow()).await?;
             ctx.post_comment("@bors cancel").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             Auto build was cancelled. It was not possible to cancel some workflows.

@@ -373,6 +373,29 @@ impl BorsTester {
         workflows
     }
 
+    pub fn unrolled_circleci_workflows(&mut self, n: usize) -> Vec<CheckRunId> {
+        let repo_name = default_repo_name();
+        let branch = self
+            .get_repo(&repo_name)
+            .lock()
+            .get_branch_by_name(UNROLLED_BRANCH)
+            .unwrap()
+            .clone();
+
+        assert!(
+            branch.get_commit_history().len() >= n,
+            "Branch doesn't have enough commits in its history.\n{branch:?}"
+        );
+        let mut workflows = vec![];
+        for commit in branch.get_commit_history().into_iter().rev().take(n).rev() {
+            let workflow = self.create_circleci_workflow(&repo_name, UNROLLED_BRANCH);
+            // Overwrite the SHA of the workflow
+            self.modify_check_run(workflow, |w| w.head_sha = commit.sha().to_string());
+            workflows.push(workflow);
+        }
+        workflows
+    }
+
     pub fn create_circleci_workflow<Id: Into<RepoIdentifier>>(
         &self,
         id: Id,

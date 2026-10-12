@@ -1015,6 +1015,29 @@ merge_queue_enabled = false
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_success_comment(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.circleci_workflow_full_success(ctx.circleci_auto_workflow()).await?;
+            ctx.run_merge_queue_until_merge_attempt().await;
+
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @r#"
+            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            Approved by: `default-user`
+            Duration: `1h`
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+            );
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn auto_build_success_comment_duration_hours_minutes(pool: sqlx::PgPool) {
         // Test with hours and minutes (4800 seconds = 1h 20m)
         run_test(pool, async |ctx: &mut BorsTester| {
@@ -1029,6 +1052,32 @@ merge_queue_enabled = false
                   ctx.get_next_comment_text(()).await?,
                   @r#"
             :sunny: Test successful - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)
+            Approved by: `default-user`
+            Duration: `1h 20m`
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+              );
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_success_comment_duration_hours_minutes(pool: sqlx::PgPool) {
+        // Test with hours and minutes (4800 seconds = 1h 20m)
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            let w1 = ctx.circleci_auto_workflow();
+            ctx.modify_check_run(w1, |w| w.set_duration(Duration::from_secs(4800)));
+            ctx.circleci_workflow_full_success(w1).await?;
+            ctx.run_merge_queue_until_merge_attempt().await;
+
+            insta::assert_snapshot!(
+                  ctx.get_next_comment_text(()).await?,
+                  @r#"
+            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `1h 20m`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
@@ -1067,6 +1116,32 @@ merge_queue_enabled = false
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_success_comment_duration_all_units(pool: sqlx::PgPool) {
+        // Test with hours, minutes and seconds (12345 seconds = 3h 25m 45s)
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            let w1 = ctx.circleci_auto_workflow();
+            ctx.modify_check_run(w1, |w| w.set_duration(Duration::from_secs(12345)));
+            ctx.circleci_workflow_full_success(w1).await?;
+            ctx.run_merge_queue_until_merge_attempt().await;
+
+            insta::assert_snapshot!(
+                  ctx.get_next_comment_text(()).await?,
+                  @r#"
+            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            Approved by: `default-user`
+            Duration: `3h 25m 45s`
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+              );
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn auto_build_success_comment_duration_seconds_only(pool: sqlx::PgPool) {
         // Test with just seconds (45 seconds)
         run_test(pool, async |ctx: &mut BorsTester| {
@@ -1093,6 +1168,32 @@ merge_queue_enabled = false
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_success_comment_duration_seconds_only(pool: sqlx::PgPool) {
+        // Test with just seconds (45 seconds)
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            let w1 = ctx.circleci_auto_workflow();
+            ctx.modify_check_run(w1, |w| w.set_duration(Duration::from_secs(45)));
+            ctx.circleci_workflow_full_success(w1).await?;
+            ctx.run_merge_queue_until_merge_attempt().await;
+
+            insta::assert_snapshot!(
+                  ctx.get_next_comment_text(()).await?,
+                  @r#"
+            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            Approved by: `default-user`
+            Duration: `45s`
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+              );
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn auto_build_failure_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1102,6 +1203,22 @@ merge_queue_enabled = false
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)"
+            );
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_failure_comment(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.circleci_workflow_full_failure(ctx.circleci_auto_workflow()).await?;
+
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
             );
             Ok(())
         })
@@ -1305,6 +1422,26 @@ merge_queue_enabled = false
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_push_conflict(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx
+                .modify_repo((), |repo| {
+                    repo.push_behaviour = BranchPushBehaviour::always_fail(BranchPushError::Conflict)
+                });
+            ctx.circleci_workflow_full_success(ctx.circleci_auto_workflow()).await?;
+            ctx.run_merge_queue_until_merge_attempt().await;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":eyes: Test was successful, but fast-forwarding failed: this PR has conflicts with the `main` branch"
+            );
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn auto_build_push_validation_failed(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1325,6 +1462,26 @@ merge_queue_enabled = false
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_push_validation_failed(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx
+                .modify_repo((), |repo| {
+                    repo.push_behaviour = BranchPushBehaviour::always_fail(BranchPushError::ValidationFailed)
+                });
+            ctx.circleci_workflow_full_success(ctx.circleci_auto_workflow()).await?;
+            ctx.run_merge_queue_until_merge_attempt().await;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":eyes: Test was successful, but fast-forwarding failed: the tested commit was behind the `main` branch"
+            );
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn auto_build_push_error_transient_error(pool: sqlx::PgPool) {
         let gh = run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1334,6 +1491,25 @@ merge_queue_enabled = false
                     BranchPushBehaviour::always_fail(BranchPushError::InternalServerError)
             });
             ctx.workflow_full_success(ctx.auto_workflow()).await?;
+            ctx.run_merge_queue_until_merge_attempt().await;
+            // Not comment should be posted, PR should not be merged
+            Ok(())
+        })
+        .await;
+        insta::assert_snapshot!(gh.get_sha_history((), default_branch_name()), @"main-sha1");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_push_error_transient_error(pool: sqlx::PgPool) {
+        let gh = run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.modify_repo((), |repo| {
+                repo.push_behaviour =
+                    BranchPushBehaviour::always_fail(BranchPushError::InternalServerError)
+            });
+            ctx.circleci_workflow_full_success(ctx.circleci_auto_workflow())
+                .await?;
             ctx.run_merge_queue_until_merge_attempt().await;
             // Not comment should be posted, PR should not be merged
             Ok(())
@@ -1364,6 +1540,28 @@ merge_queue_enabled = false
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_push_error_fails_in_db(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.modify_repo((), |repo| {
+                repo.push_behaviour = BranchPushBehaviour::always_fail(BranchPushError::Conflict)
+            });
+            ctx.circleci_workflow_full_success(ctx.circleci_auto_workflow())
+                .await?;
+
+            ctx.run_merge_queue_until_merge_attempt().await;
+            ctx.expect_comments((), 1).await;
+
+            ctx.pr(())
+                .await
+                .expect_auto_build(|b| b.status == BuildStatus::Failure);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn auto_build_push_error_retry_recovers_and_merges(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1374,6 +1572,36 @@ merge_queue_enabled = false
             });
 
             ctx.workflow_full_success(ctx.auto_workflow()).await?;
+
+            // This should fail
+            ctx.run_merge_queue_until_merge_attempt().await;
+
+            ctx.modify_repo((), |repo| {
+                repo.push_behaviour = BranchPushBehaviour::success();
+            });
+
+            // Check that the merge queue retries the push request
+            ctx.run_merge_queue_now().await;
+            ctx.expect_comments((), 1).await;
+
+            ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_push_error_retry_recovers_and_merges(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.modify_repo((), |repo| {
+                repo.push_behaviour =
+                    BranchPushBehaviour::always_fail(BranchPushError::InternalServerError)
+            });
+
+            ctx.circleci_workflow_full_success(ctx.circleci_auto_workflow())
+                .await?;
 
             // This should fail
             ctx.run_merge_queue_until_merge_attempt().await;
@@ -1599,12 +1827,66 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_failed_labels(pool: sqlx::PgPool) {
+        let github = GitHub::default().append_to_default_config(
+            r#"
+[labels]
+auto_build_failed = ["+foo", "+bar", "-baz"]
+      "#,
+        );
+
+        BorsBuilder::new(pool)
+            .github(github)
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.edit_pr((), |pr| pr.labels.push("baz".to_string()))
+                    .await?;
+
+                ctx.approve(()).await?;
+                ctx.start_auto_build(()).await?;
+
+                ctx.pr(()).await.expect_added_labels(&[]);
+                ctx.circleci_workflow_full_failure(ctx.circleci_auto_workflow())
+                    .await?;
+                ctx.expect_comments((), 1).await;
+
+                ctx.pr(())
+                    .await
+                    .expect_added_labels(&["foo", "bar"])
+                    .expect_removed_labels(&["baz"]);
+
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn auto_build_failure_updates_check_run(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
             ctx.start_auto_build(()).await?;
 
             ctx.workflow_full_failure(ctx.auto_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_check_run(
+                &ctx.pr(()).await.get_gh_pr().head_sha(),
+                AUTO_BUILD_CHECK_RUN_NAME,
+                AUTO_BUILD_CHECK_RUN_NAME,
+                CheckRunStatus::Completed,
+                Some(CheckRunConclusion::Failure),
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn auto_circleci_build_failure_updates_check_run(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+
+            ctx.circleci_workflow_full_failure(ctx.circleci_auto_workflow())
+                .await?;
             ctx.expect_comments((), 1).await;
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
@@ -1720,6 +2002,34 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn finish_auto_circleci_build_while_tree_is_closed_2(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            // Start an auto build with the default priority (0)
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+
+            // Finish the auto build BEFORE the tree has been closed, then close the tree,
+            // and only then run the merge queue
+            ctx.circleci_workflow_full_success(ctx.circleci_auto_workflow())
+                .await?;
+
+            ctx.post_comment("@bors treeclosed=100").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_zulip_messages(1).await;
+            ctx.run_merge_queue_until_merge_attempt().await;
+            ctx.expect_comments((), 1).await;
+
+            // And ensure that the PR was indeed merged
+            ctx.pr(())
+                .await
+                .expect_status(PullRequestStatus::Merged)
+                .expect_auto_build(|b| b.status == BuildStatus::Success);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn tree_closed_merge_open(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors treeclosed=100").await?;
@@ -1798,6 +2108,30 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn update_auto_build_started_comment_after_circleci_workflow_starts(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.run_merge_queue_now().await;
+            let comment = ctx.get_next_comment(()).await?;
+
+            ctx.circleci_workflow_start(ctx.circleci_auto_workflow()).await?;
+
+            // Check that the comment text has been updated with a link to the started workflow
+            let updated_comment = ctx
+                .get_comment_by_node_id(&comment.node_id().unwrap())
+                .unwrap();
+            insta::assert_snapshot!(updated_comment.content(), @"
+            :hourglass: Testing commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors...
+
+            **Workflow**: https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
+            ");
+
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn hide_auto_build_started_comment_after_workflow_finish(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -1805,6 +2139,23 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
             let comment = ctx.get_next_comment(()).await?;
 
             ctx.workflow_full_failure(ctx.auto_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_hidden_comment(&comment, HideCommentReason::Outdated);
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn hide_auto_build_started_comment_after_circleci_workflow_finish(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.run_merge_queue_now().await;
+            let comment = ctx.get_next_comment(()).await?;
+
+            ctx.circleci_workflow_full_failure(ctx.circleci_auto_workflow())
+                .await?;
             ctx.expect_comments((), 1).await;
             ctx.expect_hidden_comment(&comment, HideCommentReason::Outdated);
 
@@ -1891,6 +2242,23 @@ auto_build_failed = ["+foo", "+bar", "-baz"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_build_while_circleci_auto_build_is_running(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.circleci_workflow_full_success(ctx.circleci_try_workflow())
+                .await?;
+            ctx.expect_comments((), 1).await;
+            ctx.finish_auto_build(()).await?;
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn commit_message_skip_ignore_block(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.edit_pr((), |pr| {
@@ -1957,6 +2325,30 @@ also include this pls"
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn cancel_circleci_try_again(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+
+            // Start a build
+            ctx.start_auto_build(()).await?;
+            let cancelled_wf = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(cancelled_wf).await?;
+
+            // Cancel it
+            ctx.post_comment("@bors cancel").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_cancelled_circleci_workflows((), &[cancelled_wf]);
+
+            // Start it again and finish it
+            ctx.start_and_finish_auto_build(()).await?;
+
+            ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn cancel_change_order(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -1995,6 +2387,46 @@ also include this pls"
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn cancel_circleci_change_order(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            ctx.approve(()).await?;
+            ctx.approve(pr2.id()).await?;
+
+            // Start a build
+            ctx.start_auto_build(()).await?;
+            let cancelled_wf = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(cancelled_wf).await?;
+
+            // Now increase the priority of the second PR
+            ctx.post_comment(Comment::new(pr2.id(), "@bors p=1"))
+                .await?;
+
+            // Cancel the running build
+            ctx.post_comment("@bors cancel").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Auto build was cancelled. Cancelled workflows:
+
+            - https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
+
+            The next pull request likely to be tested is https://github.com/rust-lang/borstest/pull/2.
+            ");
+            ctx.expect_cancelled_circleci_workflows((), &[cancelled_wf]);
+
+            // Now PR 2 should get priority
+            ctx.start_and_finish_auto_build(pr2.id()).await?;
+            ctx.start_and_finish_auto_build(()).await?;
+
+            ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+            ctx.pr(pr2.id())
+                .await
+                .expect_status(PullRequestStatus::Merged);
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn do_not_merge_timed_out_pr(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
@@ -2007,6 +2439,33 @@ also include this pls"
             with_mocked_time(Duration::from_secs(7200), async {
                 ctx.refresh_pending_builds().await;
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @":boom: Test timed out after `3600`s");
+                anyhow::Ok(())
+            })
+                .await?;
+            // Ensure that the PR does not receive any more comments and that it is not tested again
+            ctx.run_merge_queue_now().await;
+            ctx.pr(()).await.expect_auto_build(|build| build.status == BuildStatus::Timeouted);
+
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn do_not_merge_timed_out_pr_with_circleci(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+
+            // Start a build
+            ctx.start_auto_build(()).await?;
+            let cancelled_wf = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(cancelled_wf).await?;
+
+            // Let it be timed out
+            with_mocked_time(Duration::from_secs(7200), async {
+                ctx.refresh_pending_builds().await;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @":boom: Test timed out after `3600`s");
+                ctx.expect_cancelled_circleci_workflows((), &[cancelled_wf]);
                 anyhow::Ok(())
             })
                 .await?;

@@ -1958,7 +1958,9 @@ mod tests {
                                 "aa494bc0e9017d68437de2dc434217c8270d33f7",
                             ),
                             platform: CircleCi(
-                                "31250ea2-caeb-4068-9290-42e511a0582c",
+                                CircleCiWorkflowId(
+                                    "31250ea2-caeb-4068-9290-42e511a0582c",
+                                ),
                             ),
                             url: "https://app.circleci.com/workflow/31250ea2-caeb-4068-9290-42e511a0582c",
                         },
@@ -1986,7 +1988,9 @@ mod tests {
                                 "aa494bc0e9017d68437de2dc434217c8270d33f7",
                             ),
                             platform: CircleCi(
-                                "31250ea2-caeb-4068-9290-42e511a0582c",
+                                CircleCiWorkflowId(
+                                    "31250ea2-caeb-4068-9290-42e511a0582c",
+                                ),
                             ),
                             status: Success,
                             running_time: Some(

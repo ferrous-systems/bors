@@ -201,6 +201,38 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn info_for_pr_with_everything_including_circleci(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors r+ p=10").await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.workflow_event(WorkflowEvent::started(ctx.try_workflow()))
+                .await?;
+            ctx.circleci_workflow_start(ctx.circleci_try_workflow())
+                .await?;
+
+            ctx.post_comment("@bors info").await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @"
+            ## Status of PR `1`
+            - Approved by: `default-user`
+            - Priority: 10
+            - Mergeable: yes
+            - Try build is in progress
+            	- Workflow URL: https://github.com/rust-lang/borstest/actions/runs/1
+            	- Workflow URL: https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
+            "
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn info_cancelled_auto_build(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.approve(()).await?;
