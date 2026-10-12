@@ -4,6 +4,7 @@
 
 //! This is the library of the bors bot.
 mod bors;
+mod circleci;
 mod config;
 mod database;
 mod ec2;
@@ -19,6 +20,7 @@ pub use bors::{
     BorsContext, CommandParser, Git, RepositoryStore, event::BorsGlobalEvent,
     event::BorsRepositoryEvent,
 };
+pub use circleci::CircleCiClient;
 pub use database::{PgDbClient, TreeState};
 pub use ec2::Ec2Context;
 pub use github::{

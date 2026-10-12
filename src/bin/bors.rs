@@ -6,9 +6,9 @@ use std::time::Duration;
 use anyhow::Context;
 use bors::server::{ServerState, create_app};
 use bors::{
-    BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, Ec2Context, Git, OAuthClient,
-    OAuthConfig, PgDbClient, RepositoryStore, TeamApiClient, TreeState, WebhookSecret, ZulipClient,
-    create_bors_process, create_github_client, load_repositories,
+    BorsContext, BorsGlobalEvent, BorsProcess, CircleCiClient, CommandParser, Ec2Context, Git,
+    OAuthClient, OAuthConfig, PgDbClient, RepositoryStore, TeamApiClient, TreeState, WebhookSecret,
+    ZulipClient, create_bors_process, create_github_client, load_repositories,
 };
 use clap::Parser;
 use secrecy::{ExposeSecret, SecretString};
@@ -113,6 +113,9 @@ struct Opts {
     /// Setting this variable is required to enable the EC2 instance spawning functionality.
     #[arg(long, env = "CI_EC2_RUNNER_ROLE")]
     ec2_role: Option<String>,
+
+    #[arg(long, env = "CIRCLECI_TOKEN")]
+    circleci_token: Option<SecretString>,
 }
 
 /// Starts a server that receives GitHub webhooks and generates events into a queue
@@ -165,6 +168,7 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         permissions,
         insecure_cookies,
         ec2_role,
+        circleci_token,
     } = opts;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -195,6 +199,9 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
             ));
         }
     };
+    let circleci_client = circleci_token
+        .map(|token| CircleCiClient::new("https://circleci.com".to_string(), token))
+        .transpose()?;
 
     let repos = Arc::new(RepositoryStore::default());
     for (name, repo) in loaded_repos {
@@ -243,6 +250,7 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         &web_url,
         zulip_client,
         ec2_ctx,
+        circleci_client,
     ));
     let BorsProcess {
         repository_tx,

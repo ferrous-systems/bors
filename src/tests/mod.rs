@@ -237,6 +237,7 @@ impl BorsTester {
             "https://bors-test.com",
             Some(mock.zulip_client()),
             None,
+            None,
         ));
 
         let BorsProcess {
