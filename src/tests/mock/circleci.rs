@@ -54,7 +54,7 @@ impl CircleCiMockServer {
                 }
             },
             "POST",
-            "^/api/v3/([^/]*)/cancel$".to_string(),
+            "^/api/v3/workflows/([^/]*)/cancel$".to_string(),
         )
         .mount(&mock_server)
         .await;

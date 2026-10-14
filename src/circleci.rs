@@ -82,7 +82,7 @@ impl CircleCiClient {
     }
 
     pub async fn cancel_workflow(&self, workflow: CircleCiWorkflowId) -> anyhow::Result<()> {
-        let endpoint = format!("{}/api/v3/{}/cancel", self.0.url, workflow.0);
+        let endpoint = format!("{}/api/v3/workflows/{}/cancel", self.0.url, workflow.0);
         perform_retryable(
             "circleci_cancel_workflow",
             RetryMethod::default(),
