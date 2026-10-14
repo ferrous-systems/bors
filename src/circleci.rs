@@ -12,8 +12,17 @@ use crate::utils::timing::{RetryMethod, perform_retryable};
 pub struct CircleCiExternalGitHubCheckRunId {
     #[allow(unused)]
     pub actor_id: Option<String>,
-    pub source: String,
+    pub source: CircleCiGitHubCheckRunSource,
     pub workflow_id: CircleCiWorkflowId,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "kebab-case")]
+pub enum CircleCiGitHubCheckRunSource {
+    Notifications,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]

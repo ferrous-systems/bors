@@ -15,7 +15,7 @@ use tracing::log;
 use crate::PgDbClient;
 use crate::bors::event::PullRequestComment;
 use crate::bors::{Comment, PullRequestStatus, WorkflowRun, WorkflowRunId};
-use crate::circleci::CircleCiExternalGitHubCheckRunId;
+use crate::circleci::{CircleCiExternalGitHubCheckRunId, CircleCiGitHubCheckRunSource};
 use crate::config::{CONFIG_FILE_PATH, RepositoryConfig, deserialize_config};
 use crate::database::WorkflowStatus;
 use crate::github::api::CommitAuthor;
@@ -582,7 +582,11 @@ impl GithubRepositoryClient {
             if check_run.app.id != CIRCLECI_CHECKS_APP_ID {
                 continue;
             }
-            let CircleCiExternalGitHubCheckRunId { workflow_id, .. } = serde_json::from_str(
+            let CircleCiExternalGitHubCheckRunId {
+                workflow_id,
+                source,
+                ..
+            } = serde_json::from_str(
                 check_run
                     .check_run
                     .external_id
@@ -595,6 +599,10 @@ impl GithubRepositoryClient {
                     check_run.check_run.external_id.unwrap_or_default()
                 )
             })?;
+
+            if source != CircleCiGitHubCheckRunSource::Notifications {
+                tracing::warn!("")
+            }
 
             let status = match check_run.check_run.status {
                 Some(CheckStatus::Completed) => match check_run

@@ -25,7 +25,7 @@ use crate::bors::event::{
     PullRequestUnassigned, PushToBranch, WorkflowJobCompleted, WorkflowJobStarted,
     WorkflowPlatformData, WorkflowRunCompleted, WorkflowRunStarted,
 };
-use crate::circleci::CircleCiExternalGitHubCheckRunId;
+use crate::circleci::{CircleCiExternalGitHubCheckRunId, CircleCiGitHubCheckRunSource};
 use crate::database::WorkflowStatus;
 use crate::github::{CIRCLECI_CHECKS_APP_ID, CommitSha, GithubRepoName, PullRequestNumber};
 use crate::server::ServerStateRef;
@@ -432,7 +432,7 @@ fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
 
     let raw_external_id = payload.check_run.external_id.unwrap_or_default();
     let external_id: CircleCiExternalGitHubCheckRunId = serde_json::from_str(&raw_external_id)?;
-    if external_id.source != "notifications" {
+    if external_id.source != CircleCiGitHubCheckRunSource::Notifications {
         tracing::warn!(
             check_run_id = %payload.check_run.id,
             external_id = raw_external_id,
