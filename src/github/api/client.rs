@@ -545,7 +545,7 @@ impl GithubRepositoryClient {
                     ref = commit_sha,
                 );
                 let mut params = ListCheckRunsParameters {
-                    page: 0,
+                    page: 1,
                     per_page: 100,
                 };
 

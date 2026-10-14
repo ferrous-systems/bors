@@ -353,8 +353,8 @@ async fn mock_get_commit(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
                     .query_pairs()
                     .map(|(lhs, rhs)| (lhs.to_string(), rhs.to_string()))
                     .collect::<HashMap<String, String>>();
-                let page: usize = query.get("page").unwrap().parse().unwrap();
-                let per_page: usize = query.get("per_page").unwrap().parse().unwrap();
+                let page = query.get("page").unwrap().parse::<u32>().unwrap().min(1) as usize - 1;
+                let per_page = query.get("per_page").unwrap().parse::<u8>().unwrap() as usize;
 
                 let repo = repo.lock();
                 let check_runs = repo
