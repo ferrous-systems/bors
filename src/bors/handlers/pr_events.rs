@@ -1009,7 +1009,9 @@ conflict = ["+conflict"]
 
             This pull request was unapproved.
 
-            Auto build was cancelled due to push. It was not possible to cancel some workflows.
+            Auto build was cancelled due to push.
+
+            :warning: Unable to cancel GitHub Actions workflows
             ");
             Ok(())
         })
@@ -1034,7 +1036,9 @@ conflict = ["+conflict"]
 
             This pull request was unapproved.
 
-            Auto build was cancelled due to push. It was not possible to cancel some workflows.
+            Auto build was cancelled due to push.
+
+            :warning: Unable to cancel some CircleCI workflows
             ");
             Ok(())
         })

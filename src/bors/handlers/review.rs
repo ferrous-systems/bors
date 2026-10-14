@@ -2176,7 +2176,10 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             This pull request was unapproved.
 
-            Auto build was cancelled due to unapproval. It was not possible to cancel some workflows.
+            Auto build was cancelled due to unapproval.
+
+            :warning: Unable to cancel GitHub Actions workflows
+
 
             [View changes since this unapproval](https://triagebot.infra.rust-lang.org/gh-changes-since/rust-lang/borstest/1/main-sha1..pr-1-sha)
             ");
@@ -2198,7 +2201,10 @@ labels_blocking_approval = ["proposed-final-comment-period", "final-comment-peri
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             This pull request was unapproved.
 
-            Auto build was cancelled due to unapproval. It was not possible to cancel some workflows.
+            Auto build was cancelled due to unapproval.
+
+            :warning: Unable to cancel some CircleCI workflows
+
 
             [View changes since this unapproval](https://triagebot.infra.rust-lang.org/gh-changes-since/rust-lang/borstest/1/main-sha1..pr-1-sha)
             ");

@@ -1,8 +1,8 @@
-use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
-use crate::circleci::CircleCiWorkflowId;
+use std::collections::HashSet;
+
+use crate::bors::{BuildKind, RepositoryState, WorkflowRun, WorkflowRunId};
 use crate::database::{
-    BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams,
-    WorkflowModel, WorkflowPlatform,
+    BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams, WorkflowModel,
 };
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::api::operations::{CommitAuthor, ForcePush};
@@ -12,18 +12,6 @@ use anyhow::Context;
 use octocrab::models::CheckRunId;
 use octocrab::models::workflows::{Conclusion, Job, Status};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
-
-/// We want to distinguish between a critical failure (a build was not marked as cancelled, in which
-/// case bors should not continue with its normal logic), and a less important failure (could not
-/// cancel some workflow or finish check run).
-#[must_use]
-pub enum CancelBuildError {
-    /// It was not possible to mark the build as cancelled.
-    FailedToMarkBuildAsCancelled(anyhow::Error),
-    /// The build was marked as cancelled, but it was not possible to cancel external workflows
-    /// and/or mark the check run status as cancelled.
-    FailedToCancelWorkflows(anyhow::Error),
-}
 
 /// How should we treat the cancellation of a build.
 pub enum CancelBuildConclusion {
@@ -35,6 +23,19 @@ pub enum CancelBuildConclusion {
     Cancel,
 }
 
+#[derive(Default)]
+pub struct CancelBuildResult {
+    pub cancelled_workflows: Vec<WorkflowModel>,
+    pub not_cancelled_workflows: Vec<WorkflowModel>,
+    pub messages: HashSet<String>,
+}
+
+impl CancelBuildResult {
+    pub fn did_cancel(&self) -> bool {
+        !self.cancelled_workflows.is_empty() || !self.not_cancelled_workflows.is_empty()
+    }
+}
+
 /// Attempt to cancel a pending build.
 /// It also tries to cancel its pending workflows and check run status, but that has a lesser
 /// priority.
@@ -44,7 +45,7 @@ pub async fn cancel_build(
     db: &PgDbClient,
     build: &BuildModel,
     conclusion: CancelBuildConclusion,
-) -> Result<Vec<WorkflowModel>, CancelBuildError> {
+) -> anyhow::Result<CancelBuildResult> {
     assert_eq!(
         build.status,
         BuildStatus::Pending,
@@ -58,43 +59,66 @@ pub async fn cancel_build(
         CancelBuildConclusion::Cancel => BuildStatus::Cancelled,
     };
     db.update_build(build.id, UpdateBuildParams::default().status(status))
-        .await
-        .map_err(CancelBuildError::FailedToMarkBuildAsCancelled)?;
+        .await?;
 
-    let pending_workflows = db
-        .get_pending_workflows_for_build(build)
-        .await
-        .map_err(CancelBuildError::FailedToCancelWorkflows)?;
+    let pending_workflows = match db.get_pending_workflows_for_build(build).await {
+        Ok(workflows) => workflows,
+        Err(error) => {
+            tracing::error!("Unable to fetch workflows to cancel from DB: {error:?}");
+            return Ok(CancelBuildResult::default());
+        }
+    };
 
-    let pending_github_workflow_ids: Vec<octocrab::models::RunId> = pending_workflows
-        .iter()
-        .filter(|workflow| workflow.platform == WorkflowPlatform::Github)
-        // if a run_id fails to parse, that's fine - cancelling the workflows is a courtesy
-        .filter_map(|workflow| Some(octocrab::models::RunId(workflow.run_id.parse().ok()?)))
-        .collect::<Vec<_>>();
+    let mut result = CancelBuildResult::default();
+    let mut pending_github_workflows = Vec::with_capacity(pending_workflows.len());
+    for workflow in pending_workflows {
+        let run_id = match workflow.workflow_run_id() {
+            Ok(run_id) => run_id,
+            Err(err) => {
+                tracing::error!("Invalid run id in database: {err:?}");
+                continue;
+            }
+        };
 
-    tracing::info!(
-        "Cancelling GitHub workflows {:?}",
-        pending_github_workflow_ids
-    );
-    github
-        .cancel_workflows(&pending_github_workflow_ids)
-        .await
-        .map_err(CancelBuildError::FailedToCancelWorkflows)?;
-
-    if let Some(circleci) = circleci {
-        let pending_circleci_workflow_ids = pending_workflows
-            .iter()
-            .filter(|workflow| workflow.platform == WorkflowPlatform::CircleCi)
-            .map(|workflow| workflow.run_id.clone())
-            .map(CircleCiWorkflowId::from);
-        for workflow_id in pending_circleci_workflow_ids {
-            circleci
-                .cancel_workflow(workflow_id)
-                .await
-                .map_err(CancelBuildError::FailedToCancelWorkflows)?;
+        match run_id {
+            WorkflowRunId::GitHub(run_id) => pending_github_workflows.push((run_id, workflow)),
+            WorkflowRunId::CircleCi(workflow_id) => {
+                let Some(circleci) = circleci else {
+                    tracing::warn!(%workflow_id, "Unable to cancel CircleCI workflow - no token");
+                    result.not_cancelled_workflows.push(workflow);
+                    result.messages.insert(
+                        ":warning: Unable to cancel CircleCI workflows due to missing API token"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                tracing::info!(%workflow_id, "Cancelling CircleCI workflow");
+                if let Err(error) = circleci.cancel_workflow(&workflow_id).await {
+                    tracing::error!(%workflow_id, "Unable to cancel CircleCI workflow: {error:?}");
+                    result
+                        .messages
+                        .insert(":warning: Unable to cancel some CircleCI workflows".to_string());
+                    result.not_cancelled_workflows.push(workflow);
+                } else {
+                    result.cancelled_workflows.push(workflow);
+                }
+            }
         }
     }
+
+    if !pending_github_workflows.is_empty() {
+        let (ids, workflows): (Vec<_>, Vec<_>) = pending_github_workflows.into_iter().unzip();
+        tracing::info!(?ids, "Cancelling GitHub workflows");
+        if let Err(err) = github.cancel_workflows(&ids).await {
+            tracing::error!(?ids, "Unable to cancel GitHub workflows: {err:?}");
+            result
+                .messages
+                .insert(":warning: Unable to cancel GitHub Actions workflows".to_string());
+        } else {
+            result.cancelled_workflows.extend(workflows);
+        }
+    }
+
     let check_run_conclusion = match conclusion {
         CancelBuildConclusion::Timeout => CheckRunConclusion::TimedOut,
         CancelBuildConclusion::Cancel => CheckRunConclusion::Cancelled,
@@ -111,7 +135,7 @@ pub async fn cancel_build(
         tracing::error!("Could not update check run {check_run_id} for build {build:?}: {error:?}");
     }
 
-    Ok(pending_workflows)
+    Ok(result)
 }
 
 /// Return failed jobs from the given workflow run.

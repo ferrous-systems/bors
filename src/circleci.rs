@@ -81,7 +81,7 @@ impl CircleCiClient {
         Ok(Self(Arc::new(CircleCiClientInner { client, url })))
     }
 
-    pub async fn cancel_workflow(&self, workflow: CircleCiWorkflowId) -> anyhow::Result<()> {
+    pub async fn cancel_workflow(&self, workflow: &CircleCiWorkflowId) -> anyhow::Result<()> {
         let endpoint = format!("{}/api/v3/workflows/{}/cancel", self.0.url, workflow.0);
         perform_retryable(
             "circleci_cancel_workflow",

@@ -10,7 +10,7 @@
 //! other background sync processes. We want to finish builds as fast as possible.
 
 use crate::bors::build::{
-    CancelBuildConclusion, CancelBuildError, cancel_build, get_failed_jobs, load_workflow_runs,
+    CancelBuildConclusion, cancel_build, get_failed_jobs, load_workflow_runs,
 };
 use crate::bors::comment::{
     CommentTag, build_failed_comment, build_timed_out_comment, try_build_succeeded_comment,
@@ -34,6 +34,7 @@ use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 pub type BuildQueueReceiver = mpsc::Receiver<BuildQueueEvent>;
 
@@ -214,27 +215,16 @@ async fn maybe_timeout_build(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     if elapsed_time_since(build.created_at) >= timeout {
-        tracing::info!("Cancelling build {build:?}");
-        match cancel_build(
+        let span = tracing::info_span!("Cancelling build", ?build,);
+        let cancel_result = cancel_build(
             &repo.client,
             circleci,
             db,
             build,
             CancelBuildConclusion::Timeout,
         )
-        .await
-        {
-            Ok(_) => {}
-            Err(
-                CancelBuildError::FailedToMarkBuildAsCancelled(error)
-                | CancelBuildError::FailedToCancelWorkflows(error),
-            ) => {
-                tracing::error!(
-                    "Could not cancel workflows for SHA {}: {error:?}",
-                    build.commit_sha
-                );
-            }
-        }
+        .instrument(span)
+        .await?;
 
         // Also handle label triggers
         let trigger = match build.kind {
@@ -247,7 +237,11 @@ async fn maybe_timeout_build(
 
         if let Err(error) = repo
             .client
-            .post_comment(pr.number, build_timed_out_comment(timeout), db)
+            .post_comment(
+                pr.number,
+                build_timed_out_comment(timeout, cancel_result),
+                db,
+            )
             .await
         {
             tracing::error!("Could not send comment to PR {}: {error:?}", pr.number);

@@ -1,4 +1,4 @@
-use crate::bors::build::{CancelBuildConclusion, CancelBuildError};
+use crate::bors::build::{CancelBuildConclusion, CancelBuildResult};
 use crate::bors::build_queue::BuildQueueSender;
 use crate::bors::comment::{CommentTag, append_workflow_links_to_comment};
 use crate::bors::event::{
@@ -17,6 +17,7 @@ use itertools::Itertools;
 use octocrab::models::workflows::Status;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 pub(super) async fn handle_workflow_started(
     repo: Arc<RepositoryState>,
@@ -392,37 +393,25 @@ pub async fn maybe_cancel_auto_build(
         _ => return Ok(None),
     };
 
-    tracing::info!("Cancelling auto build {auto_build:?}");
-
-    match build::cancel_build(
+    let span = tracing::info_span!("Cancelling auto build", ?auto_build);
+    let result = build::cancel_build(
         client,
         circleci,
         db,
         auto_build,
         CancelBuildConclusion::Cancel,
     )
-    .await
-    {
-        Ok(workflows) => {
-            tracing::info!("Auto build cancelled");
-            let workflow_urls = workflows.into_iter().map(|w| w.url).collect();
-            Ok(Some(auto_build_cancelled_msg(reason, Some(workflow_urls))))
-        }
-        Err(CancelBuildError::FailedToMarkBuildAsCancelled(error)) => Err(error),
-        Err(CancelBuildError::FailedToCancelWorkflows(error)) => {
-            tracing::error!(
-                "Could not cancel workflows for auto build with SHA {}: {error:?}",
-                auto_build.commit_sha
-            );
-            Ok(Some(auto_build_cancelled_msg(reason, None)))
-        }
-    }
+    .instrument(span)
+    .await?;
+
+    tracing::info!(?auto_build, "Auto build cancelled");
+    Ok(Some(auto_build_cancelled_msg(reason, result)))
 }
 
 /// If `workflow_urls` is `None`, it was not possible to cancel workflows.
 fn auto_build_cancelled_msg(
     reason: AutoBuildCancelReason,
-    cancelled_workflow_urls: Option<Vec<String>>,
+    cancel_result: CancelBuildResult,
 ) -> String {
     use std::fmt::Write;
 
@@ -433,16 +422,20 @@ fn auto_build_cancelled_msg(
         AutoBuildCancelReason::Cancel => "",
     };
     let mut comment = format!("Auto build was cancelled{reason}.");
-    match cancelled_workflow_urls {
-        Some(workflow_urls) => {
-            comment.push_str(" Cancelled workflows:\n");
-            for url in workflow_urls {
-                write!(comment, "\n- {url}").unwrap();
-            }
+
+    if !cancel_result.cancelled_workflows.is_empty() {
+        comment.push_str(" Cancelled workflows:\n");
+        for workflow in cancel_result.cancelled_workflows {
+            write!(comment, "\n- {}", workflow.url).unwrap();
         }
-        None => comment.push_str(" It was not possible to cancel some workflows."),
     }
 
+    if !cancel_result.messages.is_empty() {
+        comment.push_str("\n\n");
+        for message in cancel_result.messages {
+            writeln!(comment, "{message}").unwrap();
+        }
+    }
     comment
 }
 

@@ -384,7 +384,10 @@ auto_build_failed = ["-foo"]
             ctx.workflow_start(ctx.auto_workflow()).await?;
             ctx.post_comment("@bors cancel").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            Auto build was cancelled. It was not possible to cancel some workflows.
+            Auto build was cancelled.
+
+            :warning: Unable to cancel GitHub Actions workflows
+
 
             The next pull request likely to be tested is https://github.com/rust-lang/borstest/pull/1.
             ");
@@ -403,7 +406,10 @@ auto_build_failed = ["-foo"]
             ctx.circleci_workflow_start(ctx.circleci_auto_workflow()).await?;
             ctx.post_comment("@bors cancel").await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            Auto build was cancelled. It was not possible to cancel some workflows.
+            Auto build was cancelled.
+
+            :warning: Unable to cancel some CircleCI workflows
+
 
             The next pull request likely to be tested is https://github.com/rust-lang/borstest/pull/1.
             ");

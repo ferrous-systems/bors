@@ -2,13 +2,12 @@ use std::sync::Arc;
 
 use super::has_permission;
 use super::{PullRequestData, deny_request};
-use crate::bors::build::{CancelBuildConclusion, CancelBuildError, cancel_build};
+use crate::bors::build::{CancelBuildConclusion, CancelBuildResult, cancel_build};
 use crate::bors::build::{
     StartBuildCheckRun, StartBuildCommit, StartBuildContext, StartBuildError, StartBuildOutcome,
     start_build,
 };
 use crate::bors::command::{CommandPrefix, Parent};
-use crate::bors::comment::try_build_cancelled_with_failed_workflow_cancel_comment;
 use crate::bors::comment::{CommentTag, no_try_build_in_progress_comment};
 use crate::bors::comment::{
     cant_find_last_parent_comment, merge_attempt_merge_conflict_comment, try_build_started_comment,
@@ -91,7 +90,7 @@ pub(super) async fn command_try_build(
     let res = db
         .ensure_not_concurrent(BuildKind::Try, repo.repository(), async |proof| {
             // Try to cancel any previously running try build workflows
-            let cancelled_workflow_urls = if let Some(build) = get_pending_try_build(pr.db) {
+            let cancel_result = if let Some(build) = get_pending_try_build(pr.db) {
                 let res = cancel_previous_try_build(repo, circleci, &db, build).await?;
                 // Also try to hide previous "Try build started" comments that weren't hidden yet
                 if let Err(error) =
@@ -104,7 +103,7 @@ pub(super) async fn command_try_build(
 
                 res
             } else {
-                vec![]
+                CancelBuildResult::default()
             };
 
             let build_commit_result = start_build(
@@ -153,7 +152,7 @@ pub(super) async fn command_try_build(
                                 &pr.github.head.sha,
                                 &build_commit_sha,
                                 bot_prefix,
-                                cancelled_workflow_urls,
+                                cancel_result,
                             ),
                             &db,
                         )
@@ -187,10 +186,10 @@ async fn cancel_previous_try_build(
     circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     build: &BuildModel,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<CancelBuildResult> {
     assert_eq!(build.status, BuildStatus::Pending);
 
-    match cancel_build(
+    cancel_build(
         &repo.client,
         circleci,
         db,
@@ -198,20 +197,6 @@ async fn cancel_previous_try_build(
         CancelBuildConclusion::Cancel,
     )
     .await
-    {
-        Ok(workflows) => {
-            tracing::info!("Try build cancelled");
-            Ok(workflows.into_iter().map(|w| w.url).collect())
-        }
-        Err(CancelBuildError::FailedToMarkBuildAsCancelled(error)) => Err(error),
-        Err(CancelBuildError::FailedToCancelWorkflows(error)) => {
-            tracing::error!(
-                "Could not cancel workflows for SHA {}: {error:?}",
-                build.commit_sha
-            );
-            Ok(vec![])
-        }
-    }
 }
 
 fn get_base_sha(pr_model: &PullRequestModel, parent: Option<Parent>) -> Option<CommitSha> {
@@ -251,43 +236,12 @@ pub(super) async fn command_try_cancel(
         return Ok(());
     };
 
-    match cancel_build(
-        &repo.client,
-        circleci,
-        db.as_ref(),
-        build,
-        CancelBuildConclusion::Cancel,
-    )
-    .await
-    {
-        Ok(workflows) => {
-            tracing::info!("Try build cancelled");
+    let result = cancel_previous_try_build(&repo, circleci, db.as_ref(), build).await?;
 
-            repo.client
-                .post_comment(
-                    pr_number,
-                    try_build_cancelled_comment(workflows.into_iter().map(|w| w.url)),
-                    &db,
-                )
-                .await?
-        }
-        Err(CancelBuildError::FailedToMarkBuildAsCancelled(error)) => {
-            return Err(error);
-        }
-        Err(CancelBuildError::FailedToCancelWorkflows(error)) => {
-            tracing::error!(
-                "Could not cancel workflows for try build with SHA {}: {error:?}",
-                build.commit_sha
-            );
-            repo.client
-                .post_comment(
-                    pr_number,
-                    try_build_cancelled_with_failed_workflow_cancel_comment(),
-                    &db,
-                )
-                .await?
-        }
-    };
+    tracing::info!("Try build cancelled");
+    repo.client
+        .post_comment(pr_number, try_build_cancelled_comment(result), &db)
+        .await?;
 
     Ok(())
 }
@@ -859,7 +813,7 @@ try-job: Bar
             To cancel the try build, run the command `@bors try cancel`.
             ");
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            Try build cancelled. Cancelled workflows:
+            Try build cancelled.
 
             **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
             ");
@@ -881,7 +835,7 @@ try-job: Bar
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
 
-            (The previously running try build was automatically cancelled.)
+            The previously running try build was automatically cancelled.
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
@@ -904,7 +858,7 @@ try-job: Bar
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
 
-            (The previously running try build was automatically cancelled.)
+            The previously running try build was automatically cancelled.
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
@@ -1046,7 +1000,13 @@ try-job: Bar
                 .workflow_event(WorkflowEvent::started(ctx.try_workflow()))
                 .await?;
             ctx.post_comment("@bors try cancel").await?;
-            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"Try build was cancelled. It was not possible to cancel some workflows.");
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Try build cancelled.
+
+            :warning: Unable to cancel GitHub Actions workflows
+
+            **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
+            ");
             ctx.pr(()).await.expect_try_build_cancelled();
 
             Ok(())
@@ -1064,7 +1024,13 @@ try-job: Bar
                 .circleci_workflow_event(CheckRunEvent::started(ctx.circleci_try_workflow()))
                 .await?;
             ctx.post_comment("@bors try cancel").await?;
-            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"Try build was cancelled. It was not possible to cancel some workflows.");
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Try build cancelled.
+
+            :warning: Unable to cancel some CircleCI workflows
+
+            **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
+            ");
             ctx.pr(()).await.expect_try_build_cancelled();
 
             Ok(())
