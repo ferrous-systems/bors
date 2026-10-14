@@ -236,7 +236,7 @@ pub(super) async fn command_try_cancel(
         return Ok(());
     };
 
-    let result = cancel_previous_try_build(&repo, circleci, db.as_ref(), build).await?;
+    let result = cancel_previous_try_build(repo, circleci, db.as_ref(), build).await?;
 
     tracing::info!("Try build cancelled");
     repo.client

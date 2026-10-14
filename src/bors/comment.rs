@@ -458,7 +458,7 @@ pub fn build_timed_out_comment(timeout: Duration, cancel_result: CancelBuildResu
     let mut comment = format!(":boom: Test timed out after `{}`s", timeout.as_secs());
 
     if !cancel_result.messages.is_empty() {
-        comment.push_str("\n");
+        comment.push('\n');
         // only add the messages - don't care about cancelled workflows
         for message in cancel_result.messages {
             writeln!(comment, "\n{message}").unwrap();
