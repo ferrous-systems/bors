@@ -91,19 +91,22 @@ impl CircleCiClient {
     }
 
     pub async fn cancel_workflow(&self, workflow: &CircleCiWorkflowId) -> anyhow::Result<()> {
-        let endpoint = format!("{}/api/v3/workflows/{}/cancel", self.0.url, workflow.0);
+        tracing::debug!("Cancelling CircleCI workflow {workflow}");
+        let endpoint = format!("{}/api/v3/workflows/{workflow}/cancel", self.0.url);
         perform_retryable(
             "circleci_cancel_workflow",
             RetryMethod::default(),
             async || -> reqwest::Result<()> {
                 // TODO: validate the result? CircleCI returns `{"data":{"id":"<workflow-id>"}}`
-                self.0
-                    .client
-                    .post(&endpoint)
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                Ok(())
+                let result = self.0.client.post(&endpoint).send().await?;
+                match result.error_for_status_ref() {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        let body: serde_json::Value = result.json().await?;
+                        tracing::error!(%body, "CircleCI reported error");
+                        Err(error)
+                    }
+                }
             },
         )
         .await?;
