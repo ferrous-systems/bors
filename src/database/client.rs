@@ -21,7 +21,7 @@ use super::{
 use std::collections::{HashMap, HashSet};
 
 use crate::bors::comment::CommentTag;
-use crate::bors::{BuildKind, PullRequestStatus, RollupMode};
+use crate::bors::{BuildKind, PullRequestStatus, RollupMode, WorkflowRunId};
 use crate::database::{
     BuildModel, CommentModel, PullRequestModel, RepoModel, TreeState, WorkflowModel,
     WorkflowPlatform, WorkflowStatus,
@@ -366,10 +366,17 @@ impl PgDbClient {
 
     pub async fn update_workflow_status(
         &self,
-        run_id: &str,
+        run_id: &WorkflowRunId,
         status: WorkflowStatus,
     ) -> anyhow::Result<()> {
-        update_workflow_status(&self.pool, run_id, status).await
+        match run_id {
+            WorkflowRunId::CircleCi(workflow_id) => {
+                update_workflow_status(&self.pool, workflow_id.as_str(), status).await
+            }
+            WorkflowRunId::GitHub(run_id) => {
+                update_workflow_status(&self.pool, &run_id.to_string(), status).await
+            }
+        }
     }
 
     pub async fn get_workflows_for_build(

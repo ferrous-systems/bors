@@ -1,7 +1,8 @@
 //! Contains definitions of common types (pull request, user, repository name) needed
 //! for working with (GitHub) repositories.
+use chrono::{DateTime, Utc};
 use octocrab::models::pulls::MergeableState;
-use octocrab::models::{AppId, UserId};
+use octocrab::models::{AppId, CheckRunId, CheckStatus, CheckSuiteId, UserId};
 use octocrab::service::middleware::retry::RetryConfig;
 use octocrab::{
     DefaultOctocrabBuilderConfig, NoAuth, NoSvc, NotLayerReady, Octocrab, OctocrabBuilder,
@@ -283,10 +284,22 @@ impl Display for PullRequestNumber {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct ExtendedCheckRun {
-    pub name: String, // seriously octocrab???
-    #[serde(flatten)]
-    pub check_run: octocrab::models::CheckRun,
+    pub id: CheckRunId,
+    pub name: String,
+    pub head_sha: String,
+    pub external_id: Option<String>,
+    pub status: Option<CheckStatus>,
+    pub conclusion: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub check_suite: CheckRunCheckSuite,
     pub app: octocrab::models::App,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CheckRunCheckSuite {
+    pub id: CheckSuiteId,
+    pub head_branch: Option<String>,
 }
 
 /// Creates a new Octocrab client with the proper shared defaults configured.

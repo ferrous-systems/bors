@@ -1,8 +1,8 @@
-use crate::circleci::CircleCiWorkflowId;
+use crate::bors::WorkflowRunId;
 use crate::database::WorkflowStatus;
 use crate::github::{CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestNumber};
-use chrono::Duration;
 use octocrab::models::{CheckSuiteId, JobId, RunId};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub enum BorsRepositoryEvent {
@@ -178,18 +178,12 @@ pub struct PushToBranch {
 }
 
 #[derive(Debug)]
-pub enum WorkflowPlatformData {
-    CircleCi(CircleCiWorkflowId),
-    GitHub(RunId),
-}
-
-#[derive(Debug)]
 pub struct WorkflowRunStarted {
     pub repository: GithubRepoName,
     pub name: String,
     pub branch: String,
     pub commit_sha: CommitSha,
-    pub platform: WorkflowPlatformData,
+    pub id: WorkflowRunId,
     pub url: String,
 }
 
@@ -198,7 +192,7 @@ pub struct WorkflowRunCompleted {
     pub repository: GithubRepoName,
     pub branch: String,
     pub commit_sha: CommitSha,
-    pub platform: WorkflowPlatformData,
+    pub id: WorkflowRunId,
     pub status: WorkflowStatus,
     pub running_time: Option<Duration>,
     /// Check suite to which this workflow is attached.

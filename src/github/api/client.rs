@@ -506,14 +506,19 @@ impl GithubRepositoryClient {
         &self,
         commit_sha: &CommitSha,
     ) -> anyhow::Result<Vec<WorkflowRun>> {
-        let (gha, circleci) = tokio::join!(
+        let (gha, check_runs) = tokio::join!(
             self.get_gha_workflow_runs_for_commit_sha(commit_sha),
-            self.get_circleci_workflow_runs_for_commit_sha(commit_sha)
+            self.get_check_runs_for_commit_sha(commit_sha)
         );
 
         let gha = gha.context("Loading GHA workflows")?;
-        let circleci = circleci.context("Loading CircleCI workflows")?;
-        Ok(gha.into_iter().chain(circleci).collect())
+        let check_runs = check_runs.context("Loading check-runs")?;
+
+        let check_run_workflows = check_runs
+            .into_iter()
+            .filter_map(|c| WorkflowRun::try_from(&c).ok());
+
+        Ok(gha.into_iter().chain(check_run_workflows).collect())
     }
 
     /// Find all check-runs attached to a specific commit SHA.
@@ -586,39 +591,30 @@ impl GithubRepositoryClient {
                 workflow_id,
                 source,
                 ..
-            } = serde_json::from_str(
-                check_run
-                    .check_run
-                    .external_id
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
-            .with_context(|| {
-                format!(
-                    "Invalid CircleCI external_id: {}",
-                    check_run.check_run.external_id.unwrap_or_default()
-                )
-            })?;
+            } = serde_json::from_str(check_run.external_id.as_deref().unwrap_or_default())
+                .with_context(|| {
+                    format!(
+                        "Invalid CircleCI external_id: {}",
+                        check_run.external_id.unwrap_or_default()
+                    )
+                })?;
 
             if source != CircleCiGitHubCheckRunSource::Notifications {
                 tracing::warn!("")
             }
 
-            let status = match check_run.check_run.status {
-                Some(CheckStatus::Completed) => match check_run
-                    .check_run
-                    .conclusion
-                    .as_deref()
-                    .unwrap_or_default()
-                {
-                    "success" => WorkflowStatus::Success,
-                    _ => WorkflowStatus::Failure,
-                },
+            let status = match check_run.status {
+                Some(CheckStatus::Completed) => {
+                    match check_run.conclusion.as_deref().unwrap_or_default() {
+                        "success" => WorkflowStatus::Success,
+                        _ => WorkflowStatus::Failure,
+                    }
+                }
                 _ => WorkflowStatus::Pending,
             };
 
-            let url = format!("https://circleci.com/workflows/{workflow_id}");
-            let created_at = check_run.check_run.started_at.unwrap_or_else(Utc::now);
+            let url = format!("https://app.circleci.com/workflows/{workflow_id}");
+            let created_at = check_run.started_at.unwrap_or_else(Utc::now);
             workflows.push(WorkflowRun {
                 id: workflow_id.into(),
                 name: check_run.name,
@@ -626,7 +622,6 @@ impl GithubRepositoryClient {
                 status,
                 created_at,
                 duration: check_run
-                    .check_run
                     .completed_at
                     .map(|completed_at| -> anyhow::Result<_> {
                         Ok((completed_at - created_at).to_std()?)

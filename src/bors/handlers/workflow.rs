@@ -2,8 +2,7 @@ use crate::bors::build::{CancelBuildConclusion, CancelBuildResult};
 use crate::bors::build_queue::BuildQueueSender;
 use crate::bors::comment::{CommentTag, append_workflow_links_to_comment};
 use crate::bors::event::{
-    WorkflowJobCompleted, WorkflowJobStarted, WorkflowPlatformData, WorkflowRunCompleted,
-    WorkflowRunStarted,
+    WorkflowJobCompleted, WorkflowJobStarted, WorkflowRunCompleted, WorkflowRunStarted,
 };
 use crate::bors::handlers::{get_build_kind_from_branch, is_bors_observed_branch};
 use crate::bors::{BuildKind, build};
@@ -16,7 +15,6 @@ use crate::{BorsContext, CircleCiClient, PgDbClient};
 use itertools::Itertools;
 use octocrab::models::workflows::Status;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::Instrument;
 
 pub(super) async fn handle_workflow_started(
@@ -29,11 +27,11 @@ pub(super) async fn handle_workflow_started(
     }
 
     tracing::info!(
-        "Handling workflow started (name={}, url={}, branch={}, commit={})",
         payload.name,
         payload.url,
         payload.branch,
-        payload.commit_sha
+        %payload.commit_sha,
+        "Handling workflow started",
     );
 
     let Some(build) = db
@@ -55,8 +53,8 @@ pub(super) async fn handle_workflow_started(
     }
 
     tracing::info!("Storing workflow started into DB");
-    match &payload.platform {
-        WorkflowPlatformData::CircleCi(workflow_id) => {
+    match &payload.id {
+        WorkflowRunId::CircleCi(workflow_id) => {
             db.create_circleci_workflow(
                 &build,
                 &payload.name,
@@ -66,7 +64,7 @@ pub(super) async fn handle_workflow_started(
             )
             .await?
         }
-        WorkflowPlatformData::GitHub(run_id) => {
+        WorkflowRunId::GitHub(run_id) => {
             db.create_github_workflow(
                 &build,
                 &payload.name,
@@ -142,33 +140,25 @@ pub(super) async fn handle_workflow_completed(
     let mut error_context = None;
     if payload.status == WorkflowStatus::Success
         && let Some(running_time) = payload.running_time
+        && let Some(min_ci_time) = repo.config.load().min_ci_time
+        && running_time < min_ci_time
     {
-        let running_time =
-            chrono::Duration::to_std(&running_time).unwrap_or(Duration::from_secs(0));
-        if let Some(min_ci_time) = repo.config.load().min_ci_time
-            && running_time < min_ci_time
-        {
-            tracing::warn!(
-                "Workflow running time is less than the minimum CI duration: workflow time ({}s) < min time ({}s). Marking it as a failure",
-                running_time.as_secs_f64(),
-                min_ci_time.as_secs_f64()
-            );
-            payload.status = WorkflowStatus::Failure;
-            error_context = Some(format!(
-                "A workflow was considered to be a failure because it took only `{}s`. The minimum duration for CI workflows is configured to be `{}s`.",
-                running_time.as_secs_f64(),
-                min_ci_time.as_secs_f64()
-            ))
-        }
+        tracing::warn!(
+            "Workflow running time is less than the minimum CI duration: workflow time ({}s) < min time ({}s). Marking it as a failure",
+            running_time.as_secs_f64(),
+            min_ci_time.as_secs_f64()
+        );
+        payload.status = WorkflowStatus::Failure;
+        error_context = Some(format!(
+            "A workflow was considered to be a failure because it took only `{}s`. The minimum duration for CI workflows is configured to be `{}s`.",
+            running_time.as_secs_f64(),
+            min_ci_time.as_secs_f64()
+        ))
     }
 
     tracing::info!("Updating status of workflow to {:?}", payload.status);
-    let run_id = match &payload.platform {
-        WorkflowPlatformData::CircleCi(workflow_id) => workflow_id.to_string(),
-        WorkflowPlatformData::GitHub(run_id) => run_id.into_inner().to_string(),
-    };
-
-    db.update_workflow_status(&run_id, payload.status).await?;
+    db.update_workflow_status(&payload.id, payload.status)
+        .await?;
 
     build_queue_tx
         .on_workflow_completed(payload, error_context)
