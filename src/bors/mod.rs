@@ -1,9 +1,13 @@
+use crate::circleci::{
+    CircleCiExternalGitHubCheckRunId, CircleCiGitHubCheckRunSource, CircleCiWorkflowId,
+};
 use crate::config::RepositoryConfig;
-use crate::github::GithubRepoName;
 use crate::github::api::client::{GithubRepositoryClient, HideCommentReason};
+use crate::github::{CIRCLECI_CHECKS_APP_ID, ExtendedCheckRun, GithubRepoName};
 use crate::permissions::UserPermissions;
 #[cfg(test)]
 use crate::tests::TestSyncMarker;
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 pub use command::CommandParser;
@@ -12,8 +16,8 @@ pub use comment::Comment;
 pub use context::BorsContext;
 pub use handlers::{handle_bors_global_event, handle_bors_repository_event};
 use itertools::Itertools;
-use octocrab::models::RunId;
 use octocrab::models::workflows::Job;
+use octocrab::models::{CheckStatus, RunId};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -229,12 +233,105 @@ fn elapsed_time_since(date: DateTime<Utc>) -> Duration {
 /// Corresponds to a single execution of a workflow.
 #[derive(Clone, Debug)]
 pub struct WorkflowRun {
-    pub id: RunId,
+    pub id: WorkflowRunId,
     pub name: String,
     pub url: String,
     pub status: WorkflowStatus,
     pub created_at: DateTime<Utc>,
     pub duration: Option<Duration>,
+}
+
+impl TryFrom<&ExtendedCheckRun> for WorkflowRun {
+    type Error = anyhow::Error;
+
+    fn try_from(check_run: &ExtendedCheckRun) -> Result<Self, Self::Error> {
+        if check_run.app.id == CIRCLECI_CHECKS_APP_ID {
+            let CircleCiExternalGitHubCheckRunId {
+                source,
+                workflow_id,
+                ..
+            } = serde_json::from_str(check_run.external_id.as_deref().unwrap_or_default())
+                .context("Invalid CircleCI external_id for GitHub check-run")?;
+            anyhow::ensure!(
+                source == CircleCiGitHubCheckRunSource::Notifications,
+                "Unknown CircleCI external_id for GitHub check-run: {:?}",
+                check_run.external_id
+            );
+
+            let url = format!("https://app.circleci.com/workflow/{workflow_id}");
+            let created_at = check_run.started_at.unwrap_or(Utc::now());
+            return Ok(WorkflowRun {
+                id: WorkflowRunId::CircleCi(workflow_id),
+                name: check_run.name.clone(),
+                url,
+                status: match check_run.status.unwrap_or(CheckStatus::Queued) {
+                    CheckStatus::Completed => {
+                        match check_run.conclusion.as_deref().unwrap_or_default() {
+                            "success" => WorkflowStatus::Success,
+                            _ => WorkflowStatus::Failure,
+                        }
+                    }
+                    _ => WorkflowStatus::Pending,
+                },
+                created_at,
+                duration: match (check_run.started_at, check_run.completed_at) {
+                    (Some(started_at), Some(completed_at)) => Some(
+                        (completed_at - started_at)
+                            .to_std()
+                            .unwrap_or(Duration::from_secs(0)),
+                    ),
+                    _ => None,
+                },
+            });
+        }
+
+        Err(anyhow::anyhow!("check-run is not a workflow"))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowRunId {
+    GitHub(RunId),
+    CircleCi(CircleCiWorkflowId),
+}
+
+impl From<RunId> for WorkflowRunId {
+    fn from(value: RunId) -> Self {
+        Self::GitHub(value)
+    }
+}
+
+impl PartialEq<RunId> for WorkflowRunId {
+    fn eq(&self, other: &RunId) -> bool {
+        let Self::GitHub(github_run_id) = self else {
+            return false;
+        };
+        github_run_id == other
+    }
+}
+
+impl From<CircleCiWorkflowId> for WorkflowRunId {
+    fn from(value: CircleCiWorkflowId) -> Self {
+        Self::CircleCi(value)
+    }
+}
+
+impl PartialEq<CircleCiWorkflowId> for WorkflowRunId {
+    fn eq(&self, other: &CircleCiWorkflowId) -> bool {
+        let Self::CircleCi(circleci_workflow_id) = self else {
+            return false;
+        };
+        circleci_workflow_id == other
+    }
+}
+
+impl From<WorkflowRunId> for String {
+    fn from(value: WorkflowRunId) -> Self {
+        match value {
+            WorkflowRunId::CircleCi(workflow_id) => workflow_id.into(),
+            WorkflowRunId::GitHub(run_id) => run_id.to_string(),
+        }
+    }
 }
 
 pub struct FailedWorkflowRun {

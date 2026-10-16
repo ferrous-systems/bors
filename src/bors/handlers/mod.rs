@@ -34,7 +34,7 @@ use crate::github::{
     CommitSha, GithubUser, LabelTrigger, PullRequest, PullRequestInfo, PullRequestNumber,
 };
 use crate::permissions::PermissionType;
-use crate::{PgDbClient, TeamApiClient, load_repositories};
+use crate::{CircleCiClient, PgDbClient, TeamApiClient, load_repositories};
 use anyhow::Context;
 use futures::TryFutureExt;
 use octocrab::Octocrab;
@@ -115,7 +115,7 @@ pub async fn handle_bors_repository_event(
             let span = tracing::info_span!(
                 "Workflow started",
                 repo = payload.repository.to_string(),
-                id = payload.run_id.into_inner()
+                id = ?payload.id,
             );
             handle_workflow_started(repo, db, payload)
                 .instrument(span.clone())
@@ -125,7 +125,7 @@ pub async fn handle_bors_repository_event(
             let span = tracing::info_span!(
                 "Workflow completed",
                 repo = payload.repository.to_string(),
-                id = payload.run_id.into_inner()
+                id = ?payload.id,
             );
             handle_workflow_completed(repo, db, payload, senders.build_queue())
                 .instrument(span)
@@ -159,17 +159,29 @@ pub async fn handle_bors_repository_event(
             let span =
                 tracing::info_span!("Pull request edited", repo = payload.repository.to_string());
 
-            handle_pull_request_edited(repo, db, senders.mergeability_queue(), payload)
-                .instrument(span)
-                .await?;
+            handle_pull_request_edited(
+                repo,
+                ctx.get_circleci_api(),
+                db,
+                senders.mergeability_queue(),
+                payload,
+            )
+            .instrument(span)
+            .await?;
         }
         BorsRepositoryEvent::PullRequestCommitPushed(payload) => {
             let span =
                 tracing::info_span!("Pull request pushed", repo = payload.repository.to_string());
 
-            handle_push_to_pull_request(repo, db, senders.mergeability_queue(), payload)
-                .instrument(span)
-                .await?;
+            handle_push_to_pull_request(
+                repo,
+                ctx.get_circleci_api(),
+                db,
+                senders.mergeability_queue(),
+                payload,
+            )
+            .instrument(span)
+            .await?;
         }
         BorsRepositoryEvent::PullRequestOpened(payload) => {
             let span =
@@ -183,7 +195,7 @@ pub async fn handle_bors_repository_event(
             let span =
                 tracing::info_span!("Pull request closed", repo = payload.repository.to_string());
 
-            handle_pull_request_closed(repo, db, payload)
+            handle_pull_request_closed(repo, ctx.get_circleci_api(), db, payload)
                 .instrument(span)
                 .await?;
         }
@@ -528,9 +540,16 @@ async fn handle_comment(
                     }
                     BorsCommand::Unapprove => {
                         let span = tracing::info_span!("Unapprove");
-                        command_unapprove(repo, database, pr, &comment.author, &comment.html_url)
-                            .instrument(span)
-                            .await
+                        command_unapprove(
+                            repo,
+                            ctx.get_circleci_api(),
+                            database,
+                            pr,
+                            &comment.author,
+                            &comment.html_url,
+                        )
+                        .instrument(span)
+                        .await
                     }
                     BorsCommand::SetPriority { priority, note } => {
                         let span = tracing::info_span!("Priority");
@@ -589,6 +608,7 @@ async fn handle_comment(
                         let command_prefix: CommandPrefix = "@bors".to_string().into();
                         command_try_build(
                             repo,
+                            ctx.get_circleci_api(),
                             database,
                             pr,
                             &comment.author,
@@ -602,9 +622,15 @@ async fn handle_comment(
                     }
                     BorsCommand::TryCancel => {
                         let span = tracing::info_span!("Cancel try");
-                        command_try_cancel(repo, database, pr, &comment.author)
-                            .instrument(span)
-                            .await
+                        command_try_cancel(
+                            repo,
+                            ctx.get_circleci_api(),
+                            database,
+                            pr,
+                            &comment.author,
+                        )
+                        .instrument(span)
+                        .await
                     }
                     BorsCommand::Info => {
                         let span = tracing::info_span!("Info");
@@ -633,6 +659,7 @@ async fn handle_comment(
                         let span = tracing::info_span!("Cancel");
                         command_cancel(
                             repo,
+                            ctx.get_circleci_api(),
                             database,
                             pr,
                             &comment.author,
@@ -647,6 +674,7 @@ async fn handle_comment(
                         if ctx.local_git_available() {
                             squash::command_squash(
                                 repo,
+                                ctx.get_circleci_api(),
                                 database,
                                 pr,
                                 &comment.author,
@@ -923,6 +951,7 @@ pub struct MaybeInvalidatedRollup {
 /// If nothing else would be added to the `comment` text, no comment will be sent!
 pub async fn invalidate_pr(
     repo_state: &RepositoryState,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     pr_db: &PullRequestModel,
     pr_gh: &PullRequest,
@@ -950,6 +979,7 @@ pub async fn invalidate_pr(
     // Step 2: if there was a running auto build on the PR, cancel it
     let auto_build_cancel_message = maybe_cancel_auto_build(
         &repo_state.client,
+        circleci,
         db,
         pr_db,
         get_cancel_reason(&info.reason),
@@ -1005,6 +1035,7 @@ pub async fn invalidate_pr(
                 let rollup_pr = repo_state.client.get_pull_request(rollup_db.number).await?;
                 let outcome = invalidate_pr(
                     repo_state,
+                    circleci,
                     &db,
                     rollup_db,
                     &rollup_pr,

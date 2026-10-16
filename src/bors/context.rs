@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::{RepositoryState, RepositoryStore};
 use crate::bors::gitops::Git;
 use crate::bors::job_cache::AutoWorkflowJobCache;
+use crate::circleci::CircleCiClient;
 use crate::ec2::Ec2Context;
 use crate::{PgDbClient, ZulipClient, bors::command::CommandParser, github::GithubRepoName};
 
@@ -15,9 +16,11 @@ pub struct BorsContext {
     zulip_client: Option<ZulipClient>,
     ec2_ctx: Option<Ec2Context>,
     job_cache: AutoWorkflowJobCache,
+    circleci_client: Option<CircleCiClient>,
 }
 
 impl BorsContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parser: CommandParser,
         db: Arc<PgDbClient>,
@@ -26,6 +29,7 @@ impl BorsContext {
         web_url: &str,
         zulip_client: Option<ZulipClient>,
         ec2_ctx: Option<Ec2Context>,
+        circleci_client: Option<CircleCiClient>,
     ) -> Self {
         Self {
             parser,
@@ -36,6 +40,7 @@ impl BorsContext {
             zulip_client,
             ec2_ctx,
             job_cache: AutoWorkflowJobCache::default(),
+            circleci_client,
         }
     }
 
@@ -72,5 +77,9 @@ impl BorsContext {
 
     pub fn get_job_cache(&self) -> &AutoWorkflowJobCache {
         &self.job_cache
+    }
+
+    pub fn get_circleci_api(&self) -> Option<&CircleCiClient> {
+        self.circleci_client.as_ref()
     }
 }

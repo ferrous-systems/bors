@@ -4,8 +4,8 @@ use std::{
     str::FromStr,
 };
 
-use crate::bors::BuildKind;
 use crate::bors::comment::CommentTag;
+use crate::bors::{BuildKind, WorkflowRunId};
 use crate::{
     bors::{PullRequestStatus, RollupMode},
     github::{CommitSha, GithubRepoName, PullRequest, PullRequestNumber},
@@ -626,11 +626,11 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for DelegationStatus {
 #[derive(Debug, Clone, PartialEq, sqlx::Type)]
 #[sqlx(type_name = "TEXT")]
 #[sqlx(rename_all = "lowercase")]
-pub enum WorkflowType {
+pub enum WorkflowPlatform {
     /// GitHub Actions workflow.
     Github,
     /// External CI system workflow.
-    External,
+    CircleCi,
 }
 
 /// Status of a workflow.
@@ -660,15 +660,27 @@ pub struct WorkflowModel {
     pub build: BuildModel,
     /// The name of the workflow (e.g., "CI", "Tests").
     pub name: String,
-    /// URL to view this workflow run on GitHub or external CI.
+    /// URL to view this workflow run on GitHub or some other CI.
     pub url: String,
     /// Unique identifier for this workflow run.
-    pub run_id: RunId,
-    /// Whether this is a GitHub Actions workflow or external CI.
-    pub workflow_type: WorkflowType,
+    pub run_id: String,
+    /// Whether this is a GitHub Actions workflow or some other CI.
+    pub platform: WorkflowPlatform,
     /// Current status of the workflow (pending, success, failure).
     pub status: WorkflowStatus,
     pub created_at: DateTime<Utc>,
+}
+
+impl WorkflowModel {
+    pub fn workflow_run_id(&self) -> anyhow::Result<WorkflowRunId> {
+        match self.platform {
+            WorkflowPlatform::CircleCi => Ok(WorkflowRunId::CircleCi(self.run_id.clone().into())),
+            WorkflowPlatform::Github => {
+                let parsed = self.run_id.parse::<u64>()?;
+                Ok(WorkflowRunId::GitHub(parsed.into()))
+            }
+        }
+    }
 }
 
 /// Represents the state of a repository's tree.

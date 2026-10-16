@@ -1,26 +1,17 @@
-use crate::PgDbClient;
-use crate::bors::{BuildKind, RepositoryState, WorkflowRun};
+use std::collections::HashSet;
+
+use crate::bors::{BuildKind, RepositoryState, WorkflowRun, WorkflowRunId};
 use crate::database::{
     BuildModel, BuildStatus, ExclusiveLockProof, PullRequestModel, UpdateBuildParams, WorkflowModel,
 };
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::api::operations::{CommitAuthor, ForcePush};
 use crate::github::{CommitSha, MergeResult, attempt_merge};
+use crate::{CircleCiClient, PgDbClient};
+use anyhow::Context;
 use octocrab::models::CheckRunId;
 use octocrab::models::workflows::{Conclusion, Job, Status};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
-
-/// We want to distinguish between a critical failure (a build was not marked as cancelled, in which
-/// case bors should not continue with its normal logic), and a less important failure (could not
-/// cancel some workflow or finish check run).
-#[must_use]
-pub enum CancelBuildError {
-    /// It was not possible to mark the build as cancelled.
-    FailedToMarkBuildAsCancelled(anyhow::Error),
-    /// The build was marked as cancelled, but it was not possible to cancel external workflows
-    /// and/or mark the check run status as cancelled.
-    FailedToCancelWorkflows(anyhow::Error),
-}
 
 /// How should we treat the cancellation of a build.
 pub enum CancelBuildConclusion {
@@ -32,15 +23,29 @@ pub enum CancelBuildConclusion {
     Cancel,
 }
 
+#[derive(Default)]
+pub struct CancelBuildResult {
+    pub cancelled_workflows: Vec<WorkflowModel>,
+    pub not_cancelled_workflows: Vec<WorkflowModel>,
+    pub messages: HashSet<String>,
+}
+
+impl CancelBuildResult {
+    pub fn did_cancel(&self) -> bool {
+        !self.cancelled_workflows.is_empty() || !self.not_cancelled_workflows.is_empty()
+    }
+}
+
 /// Attempt to cancel a pending build.
 /// It also tries to cancel its pending workflows and check run status, but that has a lesser
 /// priority.
 pub async fn cancel_build(
-    client: &GithubRepositoryClient,
+    github: &GithubRepositoryClient,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     build: &BuildModel,
     conclusion: CancelBuildConclusion,
-) -> Result<Vec<WorkflowModel>, CancelBuildError> {
+) -> anyhow::Result<CancelBuildResult> {
     assert_eq!(
         build.status,
         BuildStatus::Pending,
@@ -54,30 +59,72 @@ pub async fn cancel_build(
         CancelBuildConclusion::Cancel => BuildStatus::Cancelled,
     };
     db.update_build(build.id, UpdateBuildParams::default().status(status))
-        .await
-        .map_err(CancelBuildError::FailedToMarkBuildAsCancelled)?;
+        .await?;
 
-    let pending_workflows = db
-        .get_pending_workflows_for_build(build)
-        .await
-        .map_err(CancelBuildError::FailedToCancelWorkflows)?;
-    let pending_workflow_ids: Vec<octocrab::models::RunId> = pending_workflows
-        .iter()
-        .map(|workflow| octocrab::models::RunId(workflow.run_id.0))
-        .collect();
+    let pending_workflows = match db.get_pending_workflows_for_build(build).await {
+        Ok(workflows) => workflows,
+        Err(error) => {
+            tracing::error!("Unable to fetch workflows to cancel from DB: {error:?}");
+            return Ok(CancelBuildResult::default());
+        }
+    };
 
-    tracing::info!("Cancelling workflows {:?}", pending_workflow_ids);
-    client
-        .cancel_workflows(&pending_workflow_ids)
-        .await
-        .map_err(CancelBuildError::FailedToCancelWorkflows)?;
+    let mut result = CancelBuildResult::default();
+    let mut pending_github_workflows = Vec::with_capacity(pending_workflows.len());
+    for workflow in pending_workflows {
+        let run_id = match workflow.workflow_run_id() {
+            Ok(run_id) => run_id,
+            Err(err) => {
+                tracing::error!("Invalid run id in database: {err:?}");
+                continue;
+            }
+        };
+
+        match run_id {
+            WorkflowRunId::GitHub(run_id) => pending_github_workflows.push((run_id, workflow)),
+            WorkflowRunId::CircleCi(workflow_id) => {
+                let Some(circleci) = circleci else {
+                    tracing::warn!(%workflow_id, "Unable to cancel CircleCI workflow - no token");
+                    result.not_cancelled_workflows.push(workflow);
+                    result.messages.insert(
+                        ":warning: Unable to cancel CircleCI workflows due to missing API token"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                tracing::info!(%workflow_id, "Cancelling CircleCI workflow");
+                if let Err(error) = circleci.cancel_workflow(&workflow_id).await {
+                    tracing::error!(%workflow_id, "Unable to cancel CircleCI workflow: {error:?}");
+                    result
+                        .messages
+                        .insert(":warning: Unable to cancel some CircleCI workflows".to_string());
+                    result.not_cancelled_workflows.push(workflow);
+                } else {
+                    result.cancelled_workflows.push(workflow);
+                }
+            }
+        }
+    }
+
+    if !pending_github_workflows.is_empty() {
+        let (ids, workflows): (Vec<_>, Vec<_>) = pending_github_workflows.into_iter().unzip();
+        tracing::info!(?ids, "Cancelling GitHub workflows");
+        if let Err(err) = github.cancel_workflows(&ids).await {
+            tracing::error!(?ids, "Unable to cancel GitHub workflows: {err:?}");
+            result
+                .messages
+                .insert(":warning: Unable to cancel GitHub Actions workflows".to_string());
+        } else {
+            result.cancelled_workflows.extend(workflows);
+        }
+    }
 
     let check_run_conclusion = match conclusion {
         CancelBuildConclusion::Timeout => CheckRunConclusion::TimedOut,
         CancelBuildConclusion::Cancel => CheckRunConclusion::Cancelled,
     };
     if let Some(check_run_id) = build.check_run_id
-        && let Err(error) = client
+        && let Err(error) = github
             .update_check_run(
                 CheckRunId(check_run_id as u64),
                 CheckRunStatus::Completed,
@@ -88,7 +135,7 @@ pub async fn cancel_build(
         tracing::error!("Could not update check run {check_run_id} for build {build:?}: {error:?}");
     }
 
-    Ok(pending_workflows)
+    Ok(result)
 }
 
 /// Return failed jobs from the given workflow run.
@@ -126,8 +173,9 @@ pub async fn load_workflow_runs(
     // This tells us for how many workflow runs we should wait.
     let mut workflow_runs: Vec<WorkflowRun> = repo
         .client
-        .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
-        .await?;
+        .get_all_workflow_runs_for_commit_sha(&CommitSha(build.commit_sha.clone()))
+        .await
+        .context("Loading workflow runs from GitHub")?;
     tracing::debug!("Workflow runs from GitHub: {workflow_runs:?}");
 
     // It is possible that the GitHub state is not fully up-to-date, or that we have overridden
@@ -136,9 +184,19 @@ pub async fn load_workflow_runs(
     // propagated to the DB yet.
     // Here we reconcile the two world views.
     for db_run in db_workflow_runs {
+        let Ok(db_run_id) = db_run.workflow_run_id() else {
+            tracing::error!(
+                id = db_run.id,
+                run_id = %db_run.run_id,
+                platform = ?db_run.platform,
+                "DB has invalid workflow run_id - ignoring",
+            );
+            continue;
+        };
+
         if let Some(gh_run) = workflow_runs
             .iter_mut()
-            .find(|gh_run| gh_run.id == db_run.run_id.into())
+            .find(|gh_run| gh_run.id == db_run_id)
         {
             if gh_run.status != db_run.status && !db_run.status.is_pending() {
                 // If our DB has a conclusion for the workflow that does not match GH state, we
@@ -150,12 +208,13 @@ pub async fn load_workflow_runs(
             // For some reason, we have a workflow in the DB that is not on GitHub. This shouldn't
             // really happen, but in any case we backfill it.
             tracing::warn!(
-                "Found DB workflow {} with status {:?} that was not on GitHub",
-                db_run.run_id,
-                db_run.status
+                id = db_run.id,
+                run_id = ?db_run_id,
+                status = ?db_run.status,
+                "Found DB workflow that was not on GitHub",
             );
             workflow_runs.push(WorkflowRun {
-                id: db_run.run_id.into(),
+                id: db_run_id,
                 name: db_run.name,
                 url: db_run.url,
                 status: db_run.status,

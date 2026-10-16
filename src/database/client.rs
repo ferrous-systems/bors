@@ -15,21 +15,22 @@ use super::operations::{
 };
 use super::{
     ApprovalInfo, DelegatedPermission, MergeableState, PrimaryKey, RegisterRollupMemberParams,
-    RollupMember, RollupMemberForUnrolling, RunId, UnrollState, UpdateBuildParams,
+    RollupMember, RollupMemberForUnrolling, UnrollState, UpdateBuildParams,
     UpsertPullRequestParams,
 };
 use std::collections::{HashMap, HashSet};
 
 use crate::bors::comment::CommentTag;
-use crate::bors::{BuildKind, PullRequestStatus, RollupMode};
+use crate::bors::{BuildKind, PullRequestStatus, RollupMode, WorkflowRunId};
 use crate::database::{
     BuildModel, CommentModel, PullRequestModel, RepoModel, TreeState, WorkflowModel,
-    WorkflowStatus, WorkflowType,
+    WorkflowPlatform, WorkflowStatus,
 };
 use crate::github::PullRequestNumber;
 use crate::github::{CommitSha, GithubRepoName};
 use anyhow::Context;
 use itertools::Either;
+use octocrab::models::RunId;
 use octocrab::models::UserId;
 use sqlx::PgPool;
 use sqlx::postgres::PgAdvisoryLock;
@@ -323,22 +324,41 @@ impl PgDbClient {
         update_build(&self.pool, build_id, params).await
     }
 
-    pub async fn create_workflow(
+    pub async fn create_github_workflow(
         &self,
         build: &BuildModel,
-        name: String,
-        url: String,
+        name: &str,
+        url: &str,
         run_id: RunId,
-        workflow_type: WorkflowType,
         status: WorkflowStatus,
     ) -> anyhow::Result<()> {
         create_workflow(
             &self.pool,
             build.id,
-            &name,
-            &url,
-            run_id,
-            workflow_type,
+            name,
+            url,
+            &run_id.into_inner().to_string(),
+            WorkflowPlatform::Github,
+            status,
+        )
+        .await
+    }
+
+    pub async fn create_circleci_workflow(
+        &self,
+        build: &BuildModel,
+        name: &str,
+        url: &str,
+        workflow_id: &str,
+        status: WorkflowStatus,
+    ) -> anyhow::Result<()> {
+        create_workflow(
+            &self.pool,
+            build.id,
+            name,
+            url,
+            workflow_id,
+            WorkflowPlatform::CircleCi,
             status,
         )
         .await
@@ -346,10 +366,17 @@ impl PgDbClient {
 
     pub async fn update_workflow_status(
         &self,
-        run_id: u64,
+        run_id: &WorkflowRunId,
         status: WorkflowStatus,
     ) -> anyhow::Result<()> {
-        update_workflow_status(&self.pool, run_id, status).await
+        match run_id {
+            WorkflowRunId::CircleCi(workflow_id) => {
+                update_workflow_status(&self.pool, workflow_id.as_str(), status).await
+            }
+            WorkflowRunId::GitHub(run_id) => {
+                update_workflow_status(&self.pool, &run_id.to_string(), status).await
+            }
+        }
     }
 
     pub async fn get_workflows_for_build(
@@ -374,9 +401,7 @@ impl PgDbClient {
             .get_workflows_for_build(build)
             .await?
             .into_iter()
-            .filter(|w| {
-                w.status == WorkflowStatus::Pending && w.workflow_type == WorkflowType::Github
-            })
+            .filter(|w| w.status == WorkflowStatus::Pending)
             .collect::<Vec<WorkflowModel>>();
         Ok(workflows)
     }

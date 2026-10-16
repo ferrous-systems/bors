@@ -1,5 +1,5 @@
 use crate::PgDbClient;
-use crate::bors::{BuildKind, RepositoryState};
+use crate::bors::{BuildKind, RepositoryState, WorkflowRunId};
 use crate::config::{Ec2RunnersConfig, JitRunnerKind};
 use crate::database::{RunId, WorkflowStatus};
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
@@ -320,7 +320,7 @@ pub async fn backfill_ec2_instances(
     for build in &builds {
         let Ok(workflows) = repo
             .client
-            .get_workflow_runs_for_commit_sha(CommitSha(build.commit_sha.clone()))
+            .get_gha_workflow_runs_for_commit_sha(&CommitSha(build.commit_sha.clone()))
             .await
         else {
             continue;
@@ -332,7 +332,12 @@ pub async fn backfill_ec2_instances(
                     continue;
                 }
             }
-            let Ok(workflow_jobs) = repo.client.get_jobs_for_workflow_run(workflow.id).await else {
+            let WorkflowRunId::GitHub(run_id) = workflow.id else {
+                tracing::error!(?workflow.id, "expected GHA run_id");
+                continue;
+            };
+
+            let Ok(workflow_jobs) = repo.client.get_jobs_for_workflow_run(run_id).await else {
                 continue;
             };
 
@@ -342,7 +347,7 @@ pub async fn backfill_ec2_instances(
                     .into_iter()
                     .filter(|job| job.status == Status::Queued)
                     .filter(|job| job.created_at < cutoff_date)
-                    .map(|job| (build, workflow.id, job)),
+                    .map(|job| (build, run_id, job)),
             );
         }
     }

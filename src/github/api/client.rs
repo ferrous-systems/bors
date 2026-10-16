@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use octocrab::models::checks::CheckRun;
 use octocrab::models::pulls::MergeableState;
-use octocrab::models::{CheckRunId, Repository, RunId, RunnerGroupId, UserId};
+use octocrab::models::{CheckRunId, CheckStatus, Repository, RunId, RunnerGroupId, UserId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -14,7 +14,8 @@ use tracing::log;
 
 use crate::PgDbClient;
 use crate::bors::event::PullRequestComment;
-use crate::bors::{Comment, PullRequestStatus, WorkflowRun};
+use crate::bors::{Comment, PullRequestStatus, WorkflowRun, WorkflowRunId};
+use crate::circleci::{CircleCiExternalGitHubCheckRunId, CircleCiGitHubCheckRunSource};
 use crate::config::{CONFIG_FILE_PATH, RepositoryConfig, deserialize_config};
 use crate::database::WorkflowStatus;
 use crate::github::api::CommitAuthor;
@@ -23,7 +24,8 @@ use crate::github::api::operations::{
     create_check_run, create_commit, merge_branches, set_branch_to_commit, update_check_run,
 };
 use crate::github::{
-    CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestInfo, PullRequestNumber, TreeSha,
+    CIRCLECI_CHECKS_APP_ID, CommitSha, ExtendedCheckRun, GithubRepoName, GithubUser, PullRequest,
+    PullRequestInfo, PullRequestNumber, TreeSha,
 };
 use crate::utils::timing::{RetryMethod, RetryableOpError, ShouldRetry, perform_retryable};
 use futures::TryStreamExt;
@@ -500,12 +502,143 @@ impl GithubRepositoryClient {
         Ok(check_run)
     }
 
-    /// Find all workflows attached to a specific commit SHA.
-    pub async fn get_workflow_runs_for_commit_sha(
+    pub async fn get_all_workflow_runs_for_commit_sha(
         &self,
-        commit_sha: CommitSha,
+        commit_sha: &CommitSha,
     ) -> anyhow::Result<Vec<WorkflowRun>> {
-        let runs = perform_retryable("get_workflows_for_commit_sha", RetryMethod::default(), || async {
+        let (gha, check_runs) = tokio::join!(
+            self.get_gha_workflow_runs_for_commit_sha(commit_sha),
+            self.get_check_runs_for_commit_sha(commit_sha)
+        );
+
+        let gha = gha.context("Loading GHA workflows")?;
+        let check_runs = check_runs.context("Loading check-runs")?;
+
+        let check_run_workflows = check_runs
+            .into_iter()
+            .filter_map(|c| WorkflowRun::try_from(&c).ok());
+
+        Ok(gha.into_iter().chain(check_run_workflows).collect())
+    }
+
+    /// Find all check-runs attached to a specific commit SHA.
+    pub async fn get_check_runs_for_commit_sha(
+        &self,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<ExtendedCheckRun>> {
+        #[derive(Serialize)]
+        struct ListCheckRunsParameters {
+            page: u32,
+            per_page: u8,
+        }
+
+        #[derive(Deserialize)]
+        struct ListCheckRunsResponse {
+            total_count: u64,
+            check_runs: Vec<ExtendedCheckRun>,
+        }
+
+        let check_runs = perform_retryable(
+            "get_check_runs_for_commit_sha",
+            RetryMethod::default(),
+            async || -> anyhow::Result<_> {
+                let mut results = vec![];
+                let route = format!(
+                    "/repos/{owner}/{repo}/commits/{ref}/check-runs",
+                    owner = self.repo_name.owner(),
+                    repo = self.repo_name.name(),
+                    ref = commit_sha,
+                );
+                let mut params = ListCheckRunsParameters {
+                    page: 1,
+                    per_page: 100,
+                };
+
+                loop {
+                    let resp: ListCheckRunsResponse = self
+                        .client()
+                        .get(&route, Some(&params))
+                        .await
+                        .with_context(|| format!("{route}?page={}", params.page))?;
+                    results.extend(resp.check_runs);
+                    if results.len() as u64 >= resp.total_count {
+                        return Ok(results);
+                    }
+                    params.page += 1;
+                }
+            },
+        )
+        .await?;
+
+        Ok(check_runs)
+    }
+
+    pub async fn get_circleci_workflow_runs_for_commit_sha(
+        &self,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<WorkflowRun>> {
+        let check_runs = self
+            .get_check_runs_for_commit_sha(commit_sha)
+            .await
+            .context("Listing all check-runs")?;
+
+        let mut workflows = vec![];
+        for check_run in check_runs {
+            if check_run.app.id != CIRCLECI_CHECKS_APP_ID {
+                continue;
+            }
+            let CircleCiExternalGitHubCheckRunId {
+                workflow_id,
+                source,
+                ..
+            } = serde_json::from_str(check_run.external_id.as_deref().unwrap_or_default())
+                .with_context(|| {
+                    format!(
+                        "Invalid CircleCI external_id: {}",
+                        check_run.external_id.unwrap_or_default()
+                    )
+                })?;
+
+            if source != CircleCiGitHubCheckRunSource::Notifications {
+                tracing::warn!("")
+            }
+
+            let status = match check_run.status {
+                Some(CheckStatus::Completed) => {
+                    match check_run.conclusion.as_deref().unwrap_or_default() {
+                        "success" => WorkflowStatus::Success,
+                        _ => WorkflowStatus::Failure,
+                    }
+                }
+                _ => WorkflowStatus::Pending,
+            };
+
+            let url = format!("https://app.circleci.com/workflows/{workflow_id}");
+            let created_at = check_run.started_at.unwrap_or_else(Utc::now);
+            workflows.push(WorkflowRun {
+                id: workflow_id.into(),
+                name: check_run.name,
+                url,
+                status,
+                created_at,
+                duration: check_run
+                    .completed_at
+                    .map(|completed_at| -> anyhow::Result<_> {
+                        Ok((completed_at - created_at).to_std()?)
+                    })
+                    .transpose()?,
+            });
+        }
+
+        Ok(workflows)
+    }
+
+    /// Find all github actions workflows attached to a specific commit SHA.
+    pub async fn get_gha_workflow_runs_for_commit_sha(
+        &self,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<WorkflowRun>> {
+        let runs = perform_retryable("get_gha_workflows_for_commit_sha", RetryMethod::default(), || async {
             let response = self.client.workflows(self.repo_name.owner(), self.repo_name.name())
                 .list_all_runs()
                 .head_sha(&commit_sha.0)
@@ -547,7 +680,7 @@ impl GithubRepositoryClient {
                 };
 
                 let run = WorkflowRun {
-                    id: run.id,
+                    id: WorkflowRunId::GitHub(run.id),
                     name: run.name,
                     url: run.html_url.to_string(),
                     status,

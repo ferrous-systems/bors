@@ -1,8 +1,10 @@
 use crate::bors::PullRequestStatus;
+use crate::circleci::{CircleCiClient, CircleCiWorkflowId};
 use crate::github::GithubRepoName;
 use crate::github::api::client::HideCommentReason;
 use crate::tests::github::CommentMsg;
 use crate::tests::mock::app::{AppHandler, default_app_id};
+use crate::tests::mock::circleci::CircleCiMockServer;
 use crate::tests::mock::permissions::TeamApiMockServer;
 use crate::tests::mock::repository::{mock_repo, mock_repo_list};
 use crate::tests::{GitHub, User};
@@ -11,6 +13,7 @@ use graphql_parser::query::{Definition, Document, OperationDefinition, Selection
 use http::HeaderValue;
 use http::header::AUTHORIZATION;
 use octocrab::Octocrab;
+use octocrab::models::CheckRunId;
 use octocrab::models::pulls::MergeableState;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -21,6 +24,8 @@ use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod app;
+mod check_run;
+mod circleci;
 mod comment;
 mod oauth;
 mod permissions;
@@ -30,6 +35,7 @@ mod workflow;
 mod zulip;
 
 use crate::tests::mock::oauth::mock_oauth;
+pub use check_run::GitHubCheckRunEventPayload;
 pub use comment::GitHubIssueCommentEventPayload;
 pub use pull_request::{
     GitHubPullRequestEventPayload, GitHubPushEventPayload, PullRequestChangeEvent,
@@ -117,6 +123,7 @@ pub struct ExternalHttpMock {
     pub(super) gh_server: GitHubMockServer,
     team_api_server: TeamApiMockServer,
     zulip_server: ZulipMockServer,
+    circleci_server: CircleCiMockServer,
 }
 
 impl ExternalHttpMock {
@@ -124,10 +131,12 @@ impl ExternalHttpMock {
         let gh_server = GitHubMockServer::start(github.clone()).await;
         let team_api_server = TeamApiMockServer::start(github.clone()).await;
         let zulip_server = ZulipMockServer::start().await;
+        let circleci_server = CircleCiMockServer::start(github.clone()).await;
         Self {
             gh_server,
             team_api_server,
             zulip_server,
+            circleci_server,
         }
     }
 
@@ -143,6 +152,10 @@ impl ExternalHttpMock {
         self.zulip_server.client()
     }
 
+    pub fn circleci_client(&self) -> CircleCiClient {
+        self.circleci_server.client()
+    }
+
     pub async fn zulip_messages(&self) -> Vec<ZulipMessage> {
         self.zulip_server.take_received_messages()
     }
@@ -150,6 +163,7 @@ impl ExternalHttpMock {
     pub async fn assert_empty_queues(self) -> anyhow::Result<()> {
         self.gh_server.assert_empty_queues().await?;
         self.zulip_server.assert_empty_queue().await?;
+        self.circleci_server.assert_empty_queues().await?;
         Ok(())
     }
 
@@ -159,6 +173,14 @@ impl ExternalHttpMock {
             self.gh_server.mock_server.uri(),
             self.gh_server.mock_server.uri(),
         )
+    }
+
+    pub fn add_circleci_workflow(&self, workflow_id: CircleCiWorkflowId, check_run_id: CheckRunId) {
+        self.circleci_server.add_workflow(workflow_id, check_run_id);
+    }
+
+    pub fn is_circleci_workflow_cancelled(&self, id: &CircleCiWorkflowId) -> bool {
+        self.circleci_server.is_workflow_cancelled(id)
     }
 }
 

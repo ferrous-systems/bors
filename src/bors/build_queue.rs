@@ -10,7 +10,7 @@
 //! other background sync processes. We want to finish builds as fast as possible.
 
 use crate::bors::build::{
-    CancelBuildConclusion, CancelBuildError, cancel_build, get_failed_jobs, load_workflow_runs,
+    CancelBuildConclusion, cancel_build, get_failed_jobs, load_workflow_runs,
 };
 use crate::bors::comment::{
     CommentTag, build_failed_comment, build_timed_out_comment, try_build_succeeded_comment,
@@ -20,19 +20,21 @@ use crate::bors::labels::handle_label_trigger;
 use crate::bors::merge_queue::MergeQueueSender;
 use crate::bors::unroll_queue::UnrollQueueSender;
 use crate::bors::{
-    BuildKind, FailedWorkflowRun, RepositoryState, elapsed_time_since, hide_tagged_comments,
+    BuildKind, FailedWorkflowRun, RepositoryState, WorkflowRunId, elapsed_time_since,
+    hide_tagged_comments,
 };
 use crate::database::{
     BuildModel, BuildStatus, PullRequestModel, UpdateBuildParams, WorkflowStatus,
 };
 use crate::github::{CommitSha, GithubRepoName, LabelTrigger};
-use crate::{BorsContext, PgDbClient};
+use crate::{BorsContext, CircleCiClient, PgDbClient};
 use anyhow::Context;
 use octocrab::models::CheckRunId;
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 pub type BuildQueueReceiver = mpsc::Receiver<BuildQueueEvent>;
 
@@ -124,7 +126,15 @@ pub async fn handle_build_queue_event(
                         )
                         .await?
                         {
-                            maybe_timeout_build(&repo, db, &build, &pr, timeout).await?;
+                            maybe_timeout_build(
+                                &repo,
+                                ctx.get_circleci_api(),
+                                db,
+                                &build,
+                                &pr,
+                                timeout,
+                            )
+                            .await?;
                         }
                     } else {
                         // This is an orphaned build. It should never be created, unless we have some bug or
@@ -198,25 +208,23 @@ pub async fn handle_build_queue_event(
 
 async fn maybe_timeout_build(
     repo: &RepositoryState,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     build: &BuildModel,
     pr: &PullRequestModel,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     if elapsed_time_since(build.created_at) >= timeout {
-        tracing::info!("Cancelling build {build:?}");
-        match cancel_build(&repo.client, db, build, CancelBuildConclusion::Timeout).await {
-            Ok(_) => {}
-            Err(
-                CancelBuildError::FailedToMarkBuildAsCancelled(error)
-                | CancelBuildError::FailedToCancelWorkflows(error),
-            ) => {
-                tracing::error!(
-                    "Could not cancel workflows for SHA {}: {error:?}",
-                    build.commit_sha
-                );
-            }
-        }
+        let span = tracing::info_span!("Cancelling build", ?build,);
+        let cancel_result = cancel_build(
+            &repo.client,
+            circleci,
+            db,
+            build,
+            CancelBuildConclusion::Timeout,
+        )
+        .instrument(span)
+        .await?;
 
         // Also handle label triggers
         let trigger = match build.kind {
@@ -229,7 +237,11 @@ async fn maybe_timeout_build(
 
         if let Err(error) = repo
             .client
-            .post_comment(pr.number, build_timed_out_comment(timeout), db)
+            .post_comment(
+                pr.number,
+                build_timed_out_comment(timeout, cancel_result),
+                db,
+            )
             .await
         {
             tracing::error!("Could not send comment to PR {}: {error:?}", pr.number);
@@ -418,16 +430,22 @@ async fn maybe_complete_build(
         // Download failed jobs
         let mut failed_workflow_runs: Vec<FailedWorkflowRun> = vec![];
         for workflow_run in workflow_runs {
-            let failed_jobs = match get_failed_jobs(repo, workflow_run.id).await {
-                Ok(jobs) => jobs,
-                Err(error) => {
-                    tracing::error!(
-                        "Cannot download jobs for workflow run {}: {error:?}",
-                        workflow_run.id
-                    );
+            let failed_jobs = match &workflow_run.id {
+                WorkflowRunId::GitHub(run_id) => match get_failed_jobs(repo, *run_id).await {
+                    Ok(jobs) => jobs,
+                    Err(error) => {
+                        tracing::error!(
+                            "Cannot download jobs for workflow run {run_id}: {error:?}",
+                        );
+                        vec![]
+                    }
+                },
+                WorkflowRunId::CircleCi(workflow_id) => {
+                    tracing::warn!(%workflow_id, "TODO: fetch failed jobs from CircleCI");
                     vec![]
                 }
             };
+
             failed_workflow_runs.push(FailedWorkflowRun {
                 workflow_run,
                 failed_jobs,
