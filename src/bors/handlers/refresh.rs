@@ -571,7 +571,7 @@ auto_build_failed = ["+failed"]
 
                 // The try build was completed successfully, not timed out
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
-                :sunny: Try build successful ([CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
+                :sunny: Try build successful ([CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
                 Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
                 Base parent: main-sha1 (`main-sha1`)
 
@@ -637,7 +637,7 @@ auto_build_failed = ["+failed"]
             // The auto build should be completed
             let comment = ctx.get_next_comment_text(()).await?;
             insta::assert_snapshot!(comment, @r#"
-            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `1h`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
@@ -702,7 +702,7 @@ auto_build_failed = ["+failed"]
             // The auto build should be completed
             let comment = ctx.get_next_comment_text(()).await?;
             insta::assert_snapshot!(comment, @r#"
-            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `1h`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...

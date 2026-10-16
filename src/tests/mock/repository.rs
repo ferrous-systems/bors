@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::database::WorkflowStatus;
-use crate::github::{CommitSha, GithubRepoName};
+use crate::github::{CheckRunCheckSuite, CommitSha, GithubRepoName};
 use crate::tests::BranchPushError;
 use crate::tests::github::{BORS_APP_ID, CheckRunData, Commit, GitUser, WorkflowRun};
 use crate::tests::mock::pull_request::mock_pull_requests;
@@ -14,7 +14,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use octocrab::models::repos::Object;
 use octocrab::models::workflows::{Conclusion, Status, Step};
-use octocrab::models::{CheckRunId, JobId, RunId};
+use octocrab::models::{CheckRunId, CheckSuiteId, JobId, RunId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -595,6 +595,7 @@ struct CheckRunResponse {
     output: CheckRunResponseOutput,
     pull_requests: Vec<serde_json::Value>,
     app: octocrab::models::App,
+    check_suite: CheckRunCheckSuite,
 }
 
 impl CheckRunResponse {
@@ -655,6 +656,10 @@ impl CheckRunResponse {
             },
             pull_requests: vec![],
             app,
+            check_suite: CheckRunCheckSuite {
+                id: CheckSuiteId(69),
+                head_branch: None,
+            },
         })
     }
 }

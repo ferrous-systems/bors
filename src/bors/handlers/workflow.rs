@@ -615,8 +615,8 @@ mod tests {
                 ctx.get_next_comment_text(()).await?,
                 @r#"
             :sunny: Try build successful
-            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
-            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
             Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
             Base parent: main-sha1 (`main-sha1`)
 
@@ -649,8 +649,8 @@ mod tests {
                 ctx.get_next_comment_text(()).await?,
                 @r#"
             :sunny: Try build successful
-            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
-            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/2) :white_check_mark:
             Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
@@ -712,8 +712,8 @@ mod tests {
                 ctx.get_next_comment_text(()).await?,
                 @r#"
             :sunny: Try build successful
-            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
-            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
             Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
             Base parent: main-sha1 (`main-sha1`)
 
@@ -749,8 +749,8 @@ mod tests {
                 ctx.get_next_comment_text(()).await?,
                 @r#"
             :sunny: Try build successful
-            - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
-            - [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :white_check_mark:
+            - [CircleCI workflow](https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1) :white_check_mark:
             - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/2) :white_check_mark:
             Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
@@ -800,7 +800,7 @@ mod tests {
             ctx.circleci_workflow_event(CheckRunEvent::failure(w2)).await?;
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0), [CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C)"
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0), [CircleCI workflow](https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C)"
             );
             Ok(())
         })
@@ -821,7 +821,7 @@ mod tests {
             ctx.workflow_event(WorkflowEvent::failure(w1)).await?;
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1), [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1), [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
             );
             Ok(())
         })
@@ -842,7 +842,7 @@ mod tests {
             ctx.circleci_workflow_event(CheckRunEvent::failure(w2)).await?;
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1), [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1), [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
             );
             Ok(())
         })
@@ -897,7 +897,7 @@ min_ci_time = 10
                     .circleci_workflow_full_success(w1)
                     .await?;
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-                :broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+                :broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
                 A workflow was considered to be a failure because it took only `1s`. The minimum duration for CI workflows is configured to be `10s`.
                 ");
                 Ok(())
@@ -949,7 +949,7 @@ min_ci_time = 10
                 ctx
                     .circleci_workflow_full_failure(w1)
                     .await?;
-                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)");
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)");
                 Ok(())
             })
             .await;
@@ -1002,7 +1002,7 @@ min_ci_time = 20
                     .circleci_workflow_full_success(w1)
                     .await?;
                 insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
-                :sunny: Try build successful ([CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
+                :sunny: Try build successful ([CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
                 Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
                 Base parent: main-sha1 (`main-sha1`)
 

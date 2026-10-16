@@ -297,6 +297,7 @@ pub struct ExtendedCheckRun {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct CheckRunCheckSuite {
     pub id: CheckSuiteId,
     pub head_branch: Option<String>,

@@ -1793,7 +1793,7 @@ mod tests {
                             commit_sha: CommitSha(
                                 "c9abcadf285659684c0975cead8bf982fa84e123",
                             ),
-                            platform: GitHub(
+                            id: GitHub(
                                 RunId(
                                     4900979074,
                                 ),
@@ -1823,17 +1823,14 @@ mod tests {
                             commit_sha: CommitSha(
                                 "c9abcadf285659684c0975cead8bf982fa84e123",
                             ),
-                            platform: GitHub(
+                            id: GitHub(
                                 RunId(
                                     4900979072,
                                 ),
                             ),
                             status: Failure,
                             running_time: Some(
-                                TimeDelta {
-                                    secs: 13,
-                                    nanos: 0,
-                                },
+                                13s,
                             ),
                             check_suite_id: CheckSuiteId(
                                 12717696197,
@@ -1928,7 +1925,7 @@ mod tests {
                             commit_sha: CommitSha(
                                 "aa494bc0e9017d68437de2dc434217c8270d33f7",
                             ),
-                            platform: CircleCi(
+                            id: CircleCi(
                                 CircleCiWorkflowId(
                                     "31250ea2-caeb-4068-9290-42e511a0582c",
                                 ),
@@ -1958,17 +1955,14 @@ mod tests {
                             commit_sha: CommitSha(
                                 "aa494bc0e9017d68437de2dc434217c8270d33f7",
                             ),
-                            platform: CircleCi(
+                            id: CircleCi(
                                 CircleCiWorkflowId(
                                     "31250ea2-caeb-4068-9290-42e511a0582c",
                                 ),
                             ),
                             status: Success,
                             running_time: Some(
-                                TimeDelta {
-                                    secs: 7,
-                                    nanos: 0,
-                                },
+                                7s,
                             ),
                             check_suite_id: CheckSuiteId(
                                 91516128170,

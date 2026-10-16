@@ -1025,7 +1025,7 @@ merge_queue_enabled = false
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @r#"
-            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `1h`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
@@ -1077,7 +1077,7 @@ merge_queue_enabled = false
             insta::assert_snapshot!(
                   ctx.get_next_comment_text(()).await?,
                   @r#"
-            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `1h 20m`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
@@ -1129,7 +1129,7 @@ merge_queue_enabled = false
             insta::assert_snapshot!(
                   ctx.get_next_comment_text(()).await?,
                   @r#"
-            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `3h 25m 45s`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
@@ -1181,7 +1181,7 @@ merge_queue_enabled = false
             insta::assert_snapshot!(
                   ctx.get_next_comment_text(()).await?,
                   @r#"
-            :sunny: Test successful - [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `45s`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
@@ -1218,7 +1218,7 @@ merge_queue_enabled = false
 
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
             );
             Ok(())
         })

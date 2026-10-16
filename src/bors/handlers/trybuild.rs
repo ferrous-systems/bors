@@ -296,7 +296,7 @@ mod tests {
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @r#"
-            :sunny: Try build successful ([CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
+            :sunny: Try build successful ([CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
             Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
             Base parent: main-sha1 (`main-sha1`)
 
@@ -331,7 +331,7 @@ mod tests {
             ctx.circleci_workflow_full_failure(ctx.circleci_try_workflow()).await?;
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
-                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://circleci.com/workflows/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
             );
             Ok(())
         })
@@ -919,7 +919,7 @@ try-job: Bar
                 .circleci_workflow_full_success(ctx.circleci_try_workflow())
                 .await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
-            :sunny: Try build successful ([CircleCI workflow](https://circleci.com/workflows/33581884-12F7-4BEB-9FE0-9BCE96258D3C))
+            :sunny: Try build successful ([CircleCI workflow](https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C))
             Build commit: merge-1-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-1-pr-1-d7d45f1f-reauthored-to-handlebors`)
             Base parent: main-sha1 (`main-sha1`)
 
