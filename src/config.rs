@@ -52,6 +52,8 @@ pub struct RepositoryConfig {
     /// Enable unrolling of rollups.
     #[serde(default)]
     pub unroll: Option<UnrollConfig>,
+    #[serde(default)]
+    pub required: Option<RequiredConfig>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -94,6 +96,10 @@ pub struct Ec2RunnersConfig {
     #[serde(default)]
     pub allowed_instances: Vec<String>,
 }
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RequiredConfig {}
 
 /// Load a repository config from TOML.
 pub fn deserialize_config(text: &str) -> Result<RepositoryConfig, toml::de::Error> {
@@ -492,6 +498,7 @@ allowed_instances = ["c8a.12xlarge"]
                 },
             ),
             unroll: None,
+            required: None,
         }
         "#);
     }
@@ -515,6 +522,7 @@ allowed_instances = ["c8a.12xlarge"]
             unroll: Some(
                 UnrollConfig,
             ),
+            required: None,
         }
         ");
     }
