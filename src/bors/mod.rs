@@ -289,6 +289,12 @@ impl TryFrom<&ExtendedCheckRun> for WorkflowRun {
     }
 }
 
+impl WorkflowRun {
+    pub fn is_circleci(&self) -> bool {
+        matches!(self.id, WorkflowRunId::CircleCi(_))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkflowRunId {
     GitHub(RunId),

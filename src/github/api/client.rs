@@ -170,6 +170,39 @@ impl GithubRepositoryClient {
         Ok(config)
     }
 
+    pub async fn path_exists(&self, path: &str, sha: Option<CommitSha>) -> anyhow::Result<bool> {
+        use std::fmt::Write;
+
+        let exists = perform_retryable(
+            "path_exists",
+            RetryMethod::default(),
+            async || -> anyhow::Result<bool> {
+                let mut uri = format!("/repos/{}/contents/{path}", self.repository());
+                if let Some(sha) = &sha {
+                    write!(uri, "?ref={sha}").unwrap();
+                }
+
+                let response = self.client._get(&uri).await?;
+                match response.status() {
+                    StatusCode::OK => Ok(true),
+                    StatusCode::NOT_FOUND => Ok(false),
+                    status => {
+                        let text = self
+                            .client
+                            .body_to_string(response)
+                            .await
+                            .unwrap_or_default();
+                        Err(anyhow::anyhow!(
+                            "Could not read response ({status}): {text}"
+                        ))
+                    }
+                }
+            },
+        )
+        .await?;
+        Ok(exists)
+    }
+
     /// Loads a file at the specified `path` and commit `sha`.
     /// If the commit SHA is not specified, loads the file from the default branch.
     pub async fn load_file_at(

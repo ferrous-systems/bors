@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\nSELECT\n    id,\n    repository as \"repository: GithubRepoName\",\n    pr_number as \"pr_number: PullRequestNumber\",\n    branch,\n    kind as \"kind: BuildKind\",\n    commit_sha,\n    status as \"status: BuildStatus\",\n    parent,\n    created_at as \"created_at: DateTime<Utc>\",\n    check_run_id,\n    duration as \"duration: PgDuration\"\nFROM build\nWHERE repository = $1\n    AND status = $2\n",
+  "query": "\nSELECT\n    id,\n    repository as \"repository: GithubRepoName\",\n    pr_number as \"pr_number: PullRequestNumber\",\n    branch,\n    kind as \"kind: BuildKind\",\n    commit_sha,\n    status as \"status: BuildStatus\",\n    parent,\n    created_at as \"created_at: DateTime<Utc>\",\n    check_run_id,\n    duration as \"duration: PgDuration\",\n    expects_circleci_workflow\nFROM build\nWHERE repository = $1\n    AND branch = $2\n    AND commit_sha = $3\n",
   "describe": {
     "columns": [
       {
@@ -57,10 +57,16 @@
         "ordinal": 10,
         "name": "duration: PgDuration",
         "type_info": "Interval"
+      },
+      {
+        "ordinal": 11,
+        "name": "expects_circleci_workflow",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Text",
         "Text"
       ]
@@ -76,8 +82,9 @@
       false,
       false,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "343592a7c6ceddeb09cf1cf9cac9e529deccba539159b9cf02ac11609de2260b"
+  "hash": "b7a5128d752d25a02f9c18e96c3d4ad480bf263408d82a27b7de86f5563d0dc5"
 }

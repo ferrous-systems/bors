@@ -710,12 +710,13 @@ pub(crate) async fn create_build(
     kind: BuildKind,
     commit_sha: &CommitSha,
     parent: &CommitSha,
+    expects_circleci_workflow: bool,
 ) -> anyhow::Result<i32> {
     measure_db_query("create_build", || async {
         let build_id = sqlx::query_scalar!(
             r#"
-INSERT INTO build (repository, pr_number, branch, kind, commit_sha, parent, status)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO build (repository, pr_number, branch, kind, commit_sha, parent, status, expects_circleci_workflow)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id
 "#,
             &pr.repository as &GithubRepoName,
@@ -724,7 +725,8 @@ RETURNING id
             kind as BuildKind,
             commit_sha.0,
             parent.0,
-            BuildStatus::Pending as BuildStatus
+            BuildStatus::Pending as BuildStatus,
+            expects_circleci_workflow,
         )
         .fetch_one(executor)
         .await?;
@@ -754,7 +756,8 @@ SELECT
     parent,
     created_at as "created_at: DateTime<Utc>",
     check_run_id,
-    duration as "duration: PgDuration"
+    duration as "duration: PgDuration",
+    expects_circleci_workflow
 FROM build
 WHERE repository = $1
     AND branch = $2
@@ -790,7 +793,8 @@ SELECT
     parent,
     created_at as "created_at: DateTime<Utc>",
     check_run_id,
-    duration as "duration: PgDuration"
+    duration as "duration: PgDuration",
+    expects_circleci_workflow
 FROM build
 WHERE repository = $1
     AND status = $2
@@ -1585,7 +1589,8 @@ pub(crate) async fn get_last_n_successful_auto_builds(
             parent,
             created_at as "created_at: DateTime<Utc>",
             check_run_id,
-            duration as "duration: PgDuration"
+            duration as "duration: PgDuration",
+            expects_circleci_workflow
         FROM build
         WHERE repository = $1 AND
             kind = 'auto' AND

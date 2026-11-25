@@ -253,10 +253,19 @@ impl PgDbClient {
         branch: String,
         commit_sha: CommitSha,
         parent: CommitSha,
+        expects_circleci_workflow: bool,
     ) -> anyhow::Result<i32> {
         let mut tx = self.pool.begin().await?;
-        let build_id =
-            create_build(&mut *tx, pr, &branch, BuildKind::Try, &commit_sha, &parent).await?;
+        let build_id = create_build(
+            &mut *tx,
+            pr,
+            &branch,
+            BuildKind::Try,
+            &commit_sha,
+            &parent,
+            expects_circleci_workflow,
+        )
+        .await?;
         update_pr_try_build_id(&mut *tx, pr.id, build_id).await?;
         tx.commit().await?;
         Ok(build_id)
@@ -268,10 +277,19 @@ impl PgDbClient {
         branch: String,
         commit_sha: CommitSha,
         parent: CommitSha,
+        expects_circleci_workflow: bool,
     ) -> anyhow::Result<i32> {
         let mut tx = self.pool.begin().await?;
-        let build_id =
-            create_build(&mut *tx, pr, &branch, BuildKind::Auto, &commit_sha, &parent).await?;
+        let build_id = create_build(
+            &mut *tx,
+            pr,
+            &branch,
+            BuildKind::Auto,
+            &commit_sha,
+            &parent,
+            expects_circleci_workflow,
+        )
+        .await?;
         update_pr_auto_build_id(&mut *tx, pr.id, build_id).await?;
         tx.commit().await?;
         Ok(build_id)
@@ -284,6 +302,7 @@ impl PgDbClient {
         branch: String,
         commit_sha: CommitSha,
         parent: CommitSha,
+        expects_circleci_workflow: bool,
     ) -> anyhow::Result<i32> {
         let mut tx = self.pool.begin().await?;
         let build_id = create_build(
@@ -293,6 +312,7 @@ impl PgDbClient {
             BuildKind::UnrolledMember,
             &commit_sha,
             &parent,
+            expects_circleci_workflow,
         )
         .await?;
         update_pr_unrolled_build_id(&mut *tx, pr.id, build_id).await?;

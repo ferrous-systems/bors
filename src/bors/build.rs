@@ -326,6 +326,17 @@ pub async fn start_build(
         .await
         .map_err(|error| StartBuildError::GithubError(error.into()))?;
 
+    let expects_circleci_workflow = repo
+        .client
+        .path_exists(".circleci", Some(build_commit_sha.clone()))
+        .await
+        .map_err(|error| StartBuildError::GithubError(error.into()))?;
+    tracing::debug!(
+        repo = %repo.repository(),
+        pr = %pr.number,
+        "expects circleci workflow? {expects_circleci_workflow}",
+    );
+
     // Push the build commit to the CI branch where workflows run.
     repo.client
         .set_branch_to_sha(&ci_branch, &build_commit_sha, ForcePush::Yes)
@@ -340,6 +351,7 @@ pub async fn start_build(
                 ci_branch.clone(),
                 build_commit_sha.clone(),
                 base_sha.clone(),
+                expects_circleci_workflow,
             )
             .await
         }
@@ -349,6 +361,7 @@ pub async fn start_build(
                 ci_branch.clone(),
                 build_commit_sha.clone(),
                 base_sha.clone(),
+                expects_circleci_workflow,
             )
             .await
         }
@@ -358,6 +371,7 @@ pub async fn start_build(
                 ci_branch.clone(),
                 build_commit_sha.clone(),
                 base_sha.clone(),
+                expects_circleci_workflow,
             )
             .await
         }

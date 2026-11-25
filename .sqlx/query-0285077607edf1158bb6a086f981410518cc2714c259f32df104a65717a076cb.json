@@ -89,6 +89,10 @@
                 [
                   "pr_number",
                   "Int8"
+                ],
+                [
+                  "expects_circleci_workflow",
+                  "Bool"
                 ]
               ]
             }

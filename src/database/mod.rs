@@ -420,6 +420,10 @@ pub struct BuildModel {
     /// The pull request number to which this build is attached.
     /// We store only the number, and not the whole model, because a PR may also contain a build.
     pub pr_number: Option<PullRequestNumber>,
+    /// Whether `.circleci/` exists in the build, indicating that a CircleCI
+    /// workflow is expected, and the build should not be considered completed
+    /// until CircleCI workflow events have been received.
+    pub expects_circleci_workflow: bool,
 }
 
 impl sqlx::Type<sqlx::Postgres> for BuildKind {

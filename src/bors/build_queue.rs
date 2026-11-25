@@ -312,6 +312,15 @@ async fn maybe_complete_build(
     // appear out of nowhere.
     assert!(!workflow_runs.is_empty());
 
+    if build.expects_circleci_workflow && !workflow_runs.iter().any(|run| run.is_circleci()) {
+        tracing::warn!(
+            repo = %build.repository,
+            pr = %pr.number,
+            "PR expecting CircleCI workflows does not have any. Exiting build completion check.",
+        );
+        return Ok(false);
+    }
+
     let has_failure = workflow_runs
         .iter()
         .any(|run| matches!(run.status, WorkflowStatus::Failure));
