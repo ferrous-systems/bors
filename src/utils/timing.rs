@@ -1,4 +1,5 @@
 use crate::github::api::DEFAULT_REQUEST_TIMEOUT;
+use http::StatusCode;
 use itertools::Itertools;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
@@ -38,6 +39,17 @@ pub enum ShouldRetry<E> {
 impl From<anyhow::Error> for ShouldRetry<anyhow::Error> {
     fn from(error: anyhow::Error) -> Self {
         Self::Yes(error)
+    }
+}
+
+impl From<reqwest::Error> for ShouldRetry<reqwest::Error> {
+    fn from(error: reqwest::Error) -> Self {
+        match error.status() {
+            Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {
+                Self::No(error)
+            }
+            _ => Self::Yes(error),
+        }
     }
 }
 

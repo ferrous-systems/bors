@@ -252,6 +252,32 @@ auto_build_failed = ["+failed"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn refresh_cancel_circleci_build_apply_timeout(pool: sqlx::PgPool) {
+        let gh = GitHub::default().append_to_default_config(
+            r#"
+[labels]
+auto_build_failed = ["+failed"]
+"#,
+        );
+        run_test((pool, gh), async |ctx: &mut BorsTester| {
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            let wf = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(wf).await?;
+
+            with_mocked_time(Duration::from_secs(4000), async {
+                ctx.refresh_pending_builds().await;
+            })
+                .await;
+            ctx.expect_cancelled_circleci_workflows((), &[wf]);
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @":boom: Test timed out after `3600`s");
+            ctx.pr(()).await.expect_added_labels(&["failed"]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn refresh_cancel_build_updates_check_run(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
@@ -291,6 +317,26 @@ auto_build_failed = ["+failed"]
             .await;
             ctx.expect_comments((), 1).await;
             ctx.expect_cancelled_workflows((), &[run_id]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn refresh_cancel_circleci_workflow_after_timeout(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let run_id = ctx.circleci_try_workflow();
+            ctx.circleci_workflow_start(run_id).await?;
+
+            with_mocked_time(Duration::from_secs(4000), async {
+                ctx.refresh_pending_builds().await;
+            })
+            .await;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_cancelled_circleci_workflows((), &[run_id]);
             Ok(())
         })
         .await;
@@ -501,6 +547,44 @@ auto_build_failed = ["+failed"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn refresh_circleci_complete_before_timeout(pool: sqlx::PgPool) {
+        run_test(
+            pool,
+            async |ctx: &mut BorsTester| {
+                ctx.post_comment("@bors try").await?;
+                ctx.expect_comments((), 1).await;
+
+                let workflow = ctx.circleci_try_workflow();
+                ctx.circleci_workflow_start(workflow).await?;
+
+                // Bors crashed and didn't start for some time
+                with_mocked_time(Duration::from_secs(4000), async {
+                    // Finish the workflow
+                    ctx.modify_check_run(workflow, |w| {
+                        w.status = CheckRunStatus::Completed;
+                        w.conclusion = Some(CheckRunConclusion::Success);
+                    });
+
+                    ctx.refresh_pending_builds().await;
+                })
+                .await;
+
+                // The try build was completed successfully, not timed out
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
+                :sunny: Try build successful ([CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
+                Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
+                Base parent: main-sha1 (`main-sha1`)
+
+                <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+                "#);
+
+                Ok(())
+            },
+        )
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn complete_build_missed_complete_webhook(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             // Start an auto build
@@ -534,6 +618,40 @@ auto_build_failed = ["+failed"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn complete_build_missed_complete_circleci_webhook(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            // Start an auto build
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            let run_id = ctx.circleci_auto_workflow();
+            ctx.circleci_workflow_start(run_id).await?;
+
+            // Now bors crashed and didn't receive a webhook about a build being completed
+            ctx.modify_check_run(run_id, |w| {
+                w.status = CheckRunStatus::Completed;
+                w.conclusion = Some(CheckRunConclusion::Success);
+            });
+            ctx.refresh_pending_builds().await;
+            ctx.run_merge_queue_now().await;
+
+            // The auto build should be completed
+            let comment = ctx.get_next_comment_text(()).await?;
+            insta::assert_snapshot!(comment, @r#"
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
+            Approved by: `default-user`
+            Duration: `1h`
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#);
+
+            ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn complete_build_missed_all_webhooks(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             // Start an auto build
@@ -552,6 +670,39 @@ auto_build_failed = ["+failed"]
             let comment = ctx.get_next_comment_text(()).await?;
             insta::assert_snapshot!(comment, @r#"
             :sunny: Test successful - [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)
+            Approved by: `default-user`
+            Duration: `1h`
+            Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...
+            <!-- homu: {"type":"BuildCompleted","base_ref":"main","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#);
+
+            ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn complete_build_missed_all_circleci_webhooks(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            // Start an auto build
+            ctx.approve(()).await?;
+            ctx.start_auto_build(()).await?;
+            let run_id = ctx.circleci_auto_workflow();
+
+            // Now bors crashed and didn't receive a webhook about a build being started
+            ctx.modify_check_run(run_id, |w| {
+                w.status = CheckRunStatus::Completed;
+                w.conclusion = Some(CheckRunConclusion::Success);
+            });
+            ctx.refresh_pending_builds().await;
+            ctx.run_merge_queue_now().await;
+
+            // The auto build should be completed
+            let comment = ctx.get_next_comment_text(()).await?;
+            insta::assert_snapshot!(comment, @r#"
+            :sunny: Test successful - [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)
             Approved by: `default-user`
             Duration: `1h`
             Pushing merge-0-pr-1-d7d45f1f-reauthored-to-handlebors to `main`...

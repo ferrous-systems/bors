@@ -1082,7 +1082,7 @@ also include this pls"
 
             This rollup was thus unapproved.
 
-            Auto build was cancelled due to unapproval. Cancelled workflows:
+            Auto build was cancelled due to unapproval.
             ");
 
             ctx.pr(4).await.expect_unapproved();

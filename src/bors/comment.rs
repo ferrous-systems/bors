@@ -1,3 +1,4 @@
+use crate::bors::build::CancelBuildResult;
 use crate::bors::command::CommandPrefix;
 use crate::bors::{FailedWorkflowRun, WorkflowRun};
 use crate::database::PullRequestModel;
@@ -133,18 +134,23 @@ pub fn no_auto_build_in_progress_comment(
     Comment::new(msg)
 }
 
-pub fn try_build_cancelled_with_failed_workflow_cancel_comment() -> Comment {
-    Comment::new(
-        "Try build was cancelled. It was not possible to cancel some workflows.".to_string(),
-    )
-}
-
-pub fn try_build_cancelled_comment(workflow_urls: impl Iterator<Item = String>) -> Comment {
-    let mut comment = r#"Try build cancelled. Cancelled workflows:"#.to_string();
-    for url in workflow_urls {
-        comment += format!("\n- {url}").as_str();
+pub fn try_build_cancelled_comment(cancel_result: CancelBuildResult) -> Comment {
+    let mut comment = "Try build cancelled.".to_string();
+    if !cancel_result.cancelled_workflows.is_empty() {
+        comment.push_str(" Cancelled workflows:");
     }
-    writeln!(comment, "\n\n**Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.").unwrap();
+    comment.push('\n');
+
+    for workflow in cancel_result.cancelled_workflows {
+        writeln!(comment, "- {}", workflow.url).unwrap();
+    }
+
+    comment.push('\n');
+    for message in cancel_result.messages {
+        writeln!(comment, "{message}\n").unwrap();
+    }
+
+    writeln!(comment, "**Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.").unwrap();
 
     Comment::new(comment)
 }
@@ -218,16 +224,20 @@ pub fn try_build_started_comment(
     head_sha: &CommitSha,
     merge_sha: &CommitSha,
     bot_prefix: &CommandPrefix,
-    cancelled_workflow_urls: Vec<String>,
+    cancel_result: CancelBuildResult,
 ) -> Comment {
     let mut msg = format!(":hourglass: Trying commit {head_sha} with merge {merge_sha}…\n\n");
 
-    if !cancelled_workflow_urls.is_empty() {
+    if cancel_result.did_cancel() {
         writeln!(
             msg,
-            "(The previously running try build was automatically cancelled.)\n"
+            "The previously running try build was automatically cancelled.\n"
         )
         .unwrap();
+    }
+
+    for message in cancel_result.messages {
+        writeln!(msg, "{message}\n").unwrap();
     }
 
     writeln!(
@@ -444,11 +454,18 @@ fn delegation_legacy_warning(legacy: bool) -> String {
     }
 }
 
-pub fn build_timed_out_comment(timeout: Duration) -> Comment {
-    Comment::new(format!(
-        ":boom: Test timed out after `{}`s",
-        timeout.as_secs()
-    ))
+pub fn build_timed_out_comment(timeout: Duration, cancel_result: CancelBuildResult) -> Comment {
+    let mut comment = format!(":boom: Test timed out after `{}`s", timeout.as_secs());
+
+    if !cancel_result.messages.is_empty() {
+        comment.push('\n');
+        // only add the messages - don't care about cancelled workflows
+        for message in cancel_result.messages {
+            writeln!(comment, "\n{message}").unwrap();
+        }
+    }
+
+    Comment::new(comment)
 }
 
 fn list_workflows_status(workflows: &[WorkflowRun]) -> String {

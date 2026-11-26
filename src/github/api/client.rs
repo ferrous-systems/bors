@@ -14,7 +14,7 @@ use tracing::log;
 
 use crate::PgDbClient;
 use crate::bors::event::PullRequestComment;
-use crate::bors::{Comment, PullRequestStatus, WorkflowRun};
+use crate::bors::{Comment, PullRequestStatus, WorkflowRun, WorkflowRunId};
 use crate::config::{CONFIG_FILE_PATH, RepositoryConfig, deserialize_config};
 use crate::database::WorkflowStatus;
 use crate::github::api::CommitAuthor;
@@ -23,7 +23,8 @@ use crate::github::api::operations::{
     create_check_run, create_commit, merge_branches, set_branch_to_commit, update_check_run,
 };
 use crate::github::{
-    CommitSha, GithubRepoName, GithubUser, PullRequest, PullRequestInfo, PullRequestNumber, TreeSha,
+    CommitSha, ExtendedCheckRun, GithubRepoName, GithubUser, PullRequest, PullRequestInfo,
+    PullRequestNumber, TreeSha,
 };
 use crate::utils::timing::{RetryMethod, RetryableOpError, ShouldRetry, perform_retryable};
 use futures::TryStreamExt;
@@ -167,6 +168,39 @@ impl GithubRepositoryClient {
             anyhow::anyhow!("Could not deserialize repository config: {error:?}")
         })?;
         Ok(config)
+    }
+
+    pub async fn path_exists(&self, path: &str, sha: Option<CommitSha>) -> anyhow::Result<bool> {
+        use std::fmt::Write;
+
+        let exists = perform_retryable(
+            "path_exists",
+            RetryMethod::default(),
+            async || -> anyhow::Result<bool> {
+                let mut uri = format!("/repos/{}/contents/{path}", self.repository());
+                if let Some(sha) = &sha {
+                    write!(uri, "?ref={sha}").unwrap();
+                }
+
+                let response = self.client._get(&uri).await?;
+                match response.status() {
+                    StatusCode::OK => Ok(true),
+                    StatusCode::NOT_FOUND => Ok(false),
+                    status => {
+                        let text = self
+                            .client
+                            .body_to_string(response)
+                            .await
+                            .unwrap_or_default();
+                        Err(anyhow::anyhow!(
+                            "Could not read response ({status}): {text}"
+                        ))
+                    }
+                }
+            },
+        )
+        .await?;
+        Ok(exists)
     }
 
     /// Loads a file at the specified `path` and commit `sha`.
@@ -500,12 +534,83 @@ impl GithubRepositoryClient {
         Ok(check_run)
     }
 
-    /// Find all workflows attached to a specific commit SHA.
-    pub async fn get_workflow_runs_for_commit_sha(
+    pub async fn get_all_workflow_runs_for_commit_sha(
         &self,
-        commit_sha: CommitSha,
+        commit_sha: &CommitSha,
     ) -> anyhow::Result<Vec<WorkflowRun>> {
-        let runs = perform_retryable("get_workflows_for_commit_sha", RetryMethod::default(), || async {
+        let (gha, check_runs) = tokio::join!(
+            self.get_gha_workflow_runs_for_commit_sha(commit_sha),
+            self.get_check_runs_for_commit_sha(commit_sha)
+        );
+
+        let gha = gha.context("Loading GHA workflows")?;
+        let check_runs = check_runs.context("Loading check-runs")?;
+
+        let check_run_workflows = check_runs
+            .into_iter()
+            .filter_map(|c| WorkflowRun::try_from(&c).ok());
+
+        Ok(gha.into_iter().chain(check_run_workflows).collect())
+    }
+
+    /// Find all check-runs attached to a specific commit SHA.
+    pub async fn get_check_runs_for_commit_sha(
+        &self,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<ExtendedCheckRun>> {
+        #[derive(Serialize)]
+        struct ListCheckRunsParameters {
+            page: u32,
+            per_page: u8,
+        }
+
+        #[derive(Deserialize)]
+        struct ListCheckRunsResponse {
+            total_count: u64,
+            check_runs: Vec<ExtendedCheckRun>,
+        }
+
+        let check_runs = perform_retryable(
+            "get_check_runs_for_commit_sha",
+            RetryMethod::default(),
+            async || -> anyhow::Result<_> {
+                let mut results = vec![];
+                let route = format!(
+                    "/repos/{owner}/{repo}/commits/{ref}/check-runs",
+                    owner = self.repo_name.owner(),
+                    repo = self.repo_name.name(),
+                    ref = commit_sha,
+                );
+                let mut params = ListCheckRunsParameters {
+                    page: 1,
+                    per_page: 100,
+                };
+
+                loop {
+                    let resp: ListCheckRunsResponse = self
+                        .client()
+                        .get(&route, Some(&params))
+                        .await
+                        .with_context(|| format!("{route}?page={}", params.page))?;
+                    results.extend(resp.check_runs);
+                    if results.len() as u64 >= resp.total_count {
+                        return Ok(results);
+                    }
+                    params.page += 1;
+                }
+            },
+        )
+        .await?;
+
+        Ok(check_runs)
+    }
+
+    /// Find all github actions workflows attached to a specific commit SHA.
+    pub async fn get_gha_workflow_runs_for_commit_sha(
+        &self,
+        commit_sha: &CommitSha,
+    ) -> anyhow::Result<Vec<WorkflowRun>> {
+        let runs = perform_retryable("get_gha_workflows_for_commit_sha", RetryMethod::default(), || async {
             let response = self.client.workflows(self.repo_name.owner(), self.repo_name.name())
                 .list_all_runs()
                 .head_sha(&commit_sha.0)
@@ -547,7 +652,7 @@ impl GithubRepositoryClient {
                 };
 
                 let run = WorkflowRun {
-                    id: run.id,
+                    id: WorkflowRunId::GitHub(run.id),
                     name: run.name,
                     url: run.html_url.to_string(),
                     status,

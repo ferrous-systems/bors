@@ -137,6 +137,7 @@ Nevertheless, sometimes it might be easier to test it on your own repository. Th
     - `Pull request review comment`
     - `Workflow job`
     - `Workflow run`
+    - `Check run`
 - Install your GitHub app on some test repository where you want to test bors.
 - Add `rust-bors.toml` in the root of the repository, and also add some example CI workflows.
 - If you want to use custom permissions for PR approvals, create team data files for GitHub users in `data/team`. You can find examples in that directory, which you should copy and remove the `.example` suffix.
@@ -154,6 +155,7 @@ Nevertheless, sometimes it might be easier to test it on your own repository. Th
    - (optional) Set `CMD_PREFIX` to the command prefix used to control the bot (e.g. `@bors`).
    - (optional) Set `PERMISSIONS` `"data/permissions"` directory path to list users with permissions to perform try/review.
    - (optional) Set `INSECURE_COOKIES` if you're accessing the web server UI via `http`. This allows github authentication to persist in browser sessions.
+   - (optional) Set `CIRCLECI_TOKEN` if you'd like for CircleCI workflows to be cancelled when GitHub Actions workflows fail.
 3. Redirect webhooks from your test repository to bors. You can [gh webhook](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/using-the-github-cli-to-forward-webhooks-for-testing) for that.
    - If you want to do it manually, you need to configure a globally reachable URL/IP address for your computer e.g. using [ngrok](https://ngrok.com/), and then configure the webhook URL of your GitHub app to point to `<your-pc-address>/github`.
 4. Try `@bors ping` on some PR on your test repository :)

@@ -1,4 +1,3 @@
-use crate::PgDbClient;
 use crate::bors::command::SquashCommitMessage;
 use crate::bors::comment::CommentTag;
 use crate::bors::gitops_queue::{
@@ -16,6 +15,7 @@ use crate::github::api::CommitAuthor;
 use crate::github::api::operations::Commit;
 use crate::github::{GithubRepoName, GithubUser};
 use crate::permissions::PermissionType;
+use crate::{CircleCiClient, PgDbClient};
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -24,8 +24,10 @@ const CO_AUTHORED_BY_TRAILER: &str = "Co-authored-by";
 
 /// Entry point for the squash command.
 /// This function validates the command and enqueues the actual work to the gitops queue.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn command_squash(
     repo_state: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -182,6 +184,7 @@ pub(super) async fn command_squash(
     let db2 = db.clone();
     let commit2 = commit.clone();
     let pr_github = pr.github.clone();
+    let circleci = circleci.cloned();
 
     // We have to help inference here by annotating the variable
     let on_finish: PushCallback = Box::new(move |push_result: anyhow::Result<()>| {
@@ -224,6 +227,7 @@ pub(super) async fn command_squash(
             };
             invalidate_pr(
                 &repo_state,
+                circleci.as_ref(),
                 &db,
                 &pr_model,
                 &pr_github,

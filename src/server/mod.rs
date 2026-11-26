@@ -1,6 +1,6 @@
 use crate::bors::event::BorsEvent;
 use crate::bors::{BuildKind, CommandPrefix, RepositoryState, format_help};
-use crate::database::{ApprovalStatus, QueueStatus};
+use crate::database::{ApprovalStatus, QueueStatus, WorkflowPlatform};
 use crate::ec2::{Ec2Instance, Ec2InstanceStatus, get_aws_credentials, get_ec2_instances};
 use crate::github::{GitHubSession, GithubRepoName, OAuthExchangeCode, PullRequestNumber, rollup};
 use crate::server::cached::Cached;
@@ -479,19 +479,22 @@ pub async fn queue_handler(
             QueueStatus::Pending(_, build) => Some((pr.number, build)),
             _ => None,
         });
-        let mut pending = HashMap::new();
+        let mut pending = HashMap::<PullRequestNumber, PendingBuild>::new();
         for (pr, build_model) in builds {
             let workflow = db
                 .get_workflows_for_build(build_model)
                 .await?
                 .into_iter()
-                .next();
-            let workflow = workflow.map(|workflow| {
+                .find(|w| w.platform == WorkflowPlatform::Github);
+            let workflow = workflow.and_then(|workflow| {
+                let Ok(run_id) = workflow.run_id.parse::<u64>() else {
+                    return None;
+                };
                 let jobs = state
                     .ctx
                     .get_job_cache()
-                    .get_jobs(&repo.name, workflow.run_id.into());
-                PendingWorkflow { workflow, jobs }
+                    .get_jobs(&repo.name, run_id.into());
+                Some(PendingWorkflow { workflow, jobs })
             });
 
             pending.insert(

@@ -493,6 +493,110 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn unroll_circleci_success(pool: sqlx::PgPool) {
+        run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            let pr3 = ctx.open_pr((), |_| {}).await?;
+            ctx.approve(pr2.id()).await?;
+            ctx.approve(pr3.id()).await?;
+
+            let rollup = make_merged_rollup(ctx, &[&pr2, &pr3]).await?;
+
+            // Ensure that waiting state has been set
+            ctx.get_rollup(rollup)
+                .await?
+                .expect_unroll_state_all(UnrollState::Waiting);
+
+            // Unrolling should have been triggered by the merge queue after the rollup was merged
+            ctx.run_unroll_queue().await?;
+
+            ctx.get_rollup(rollup)
+                .await?
+                .expect_unroll_state_all(UnrollState::Pending);
+
+            for workflow in ctx.unrolled_circleci_workflows(2) {
+                ctx.circleci_workflow_full_success(workflow).await?;
+            }
+
+            ctx.run_unroll_queue().await?;
+
+            let comment = ctx.get_next_comment_text(rollup).await?;
+            insta::assert_snapshot!(comment, @"
+            :pushpin: Perf builds for each rolled up PR:
+
+            | PR# | Message | Perf Build Sha |
+            |----|----|:-----:|
+            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-handlebors))|
+            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
+
+            *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
+
+            In the case of a perf regression, run the following command for each PR you suspect might be the cause: `@rust-timer build $SHA`
+            ");
+
+            ctx.get_rollup(rollup)
+                .await?
+                .expect_unroll_state_all(UnrollState::Reported);
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn unroll_both_success(pool: sqlx::PgPool) {
+        run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            let pr3 = ctx.open_pr((), |_| {}).await?;
+            ctx.approve(pr2.id()).await?;
+            ctx.approve(pr3.id()).await?;
+
+            let rollup = make_merged_rollup(ctx, &[&pr2, &pr3]).await?;
+
+            // Ensure that waiting state has been set
+            ctx.get_rollup(rollup)
+                .await?
+                .expect_unroll_state_all(UnrollState::Waiting);
+
+            // Unrolling should have been triggered by the merge queue after the rollup was merged
+            ctx.run_unroll_queue().await?;
+
+            ctx.get_rollup(rollup)
+                .await?
+                .expect_unroll_state_all(UnrollState::Pending);
+
+            let gha = ctx.unrolled_workflows(2);
+            let circleci = ctx.unrolled_circleci_workflows(2);
+
+            for (gha, circleci) in gha.into_iter().zip(circleci) {
+                ctx.workflow_full_success(gha).await?;
+                ctx.circleci_workflow_full_success(circleci).await?;
+            }
+
+            ctx.run_unroll_queue().await?;
+
+            let comment = ctx.get_next_comment_text(rollup).await?;
+            insta::assert_snapshot!(comment, @"
+            :pushpin: Perf builds for each rolled up PR:
+
+            | PR# | Message | Perf Build Sha |
+            |----|----|:-----:|
+            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-handlebors))|
+            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
+
+            *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
+
+            In the case of a perf regression, run the following command for each PR you suspect might be the cause: `@rust-timer build $SHA`
+            ");
+
+            ctx.get_rollup(rollup)
+                .await?
+                .expect_unroll_state_all(UnrollState::Reported);
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test]
     async fn unroll_unrolled_build_commit_message(pool: sqlx::PgPool) {
         run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -559,6 +663,93 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn unroll_merge_conflict_circleci(pool: sqlx::PgPool) {
+        run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            let pr3 = ctx.open_pr((), |_| {}).await?;
+            ctx.approve(pr2.id()).await?;
+            ctx.approve(pr3.id()).await?;
+
+            let rollup = make_merged_rollup(ctx, &[&pr2, &pr3]).await?;
+
+            ctx.modify_repo(default_repo_name(), |repo| {
+                let mut n = 0;
+                repo.merge_behavior = MergeBehavior::Custom(Box::new(move || {
+                    n += 1;
+                    // Cause a conflict on the second member merge
+                    (n == 2).then_some(StatusCode::CONFLICT)
+                }));
+            });
+
+            ctx.run_unroll_queue().await?;
+            for workflow in ctx.unrolled_circleci_workflows(1) {
+                ctx.circleci_workflow_full_success(workflow).await?;
+            }
+            ctx.run_unroll_queue().await?;
+
+            let comment = ctx.get_next_comment_text(rollup).await?;
+            insta::assert_snapshot!(comment, @"
+            :pushpin: Perf builds for each rolled up PR:
+
+            | PR# | Message | Perf Build Sha |
+            |----|----|:-----:|
+            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-handlebors))|
+            |#3|Title of PR 3|:x: conflicts merging into previous parent commit :x:|
+
+            *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
+
+            In the case of a perf regression, run the following command for each PR you suspect might be the cause: `@rust-timer build $SHA`
+            ");
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn unroll_merge_conflict_both(pool: sqlx::PgPool) {
+        run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            let pr3 = ctx.open_pr((), |_| {}).await?;
+            ctx.approve(pr2.id()).await?;
+            ctx.approve(pr3.id()).await?;
+
+            let rollup = make_merged_rollup(ctx, &[&pr2, &pr3]).await?;
+
+            ctx.modify_repo(default_repo_name(), |repo| {
+                let mut n = 0;
+                repo.merge_behavior = MergeBehavior::Custom(Box::new(move || {
+                    n += 1;
+                    // Cause a conflict on the second member merge
+                    (n == 2).then_some(StatusCode::CONFLICT)
+                }));
+            });
+
+            ctx.run_unroll_queue().await?;
+            for (circleci, gha) in ctx.unrolled_circleci_workflows(1).into_iter().zip(ctx.unrolled_workflows(1)) {
+                ctx.circleci_workflow_full_success(circleci).await?;
+                ctx.workflow_full_success(gha).await?;
+            }
+            ctx.run_unroll_queue().await?;
+
+            let comment = ctx.get_next_comment_text(rollup).await?;
+            insta::assert_snapshot!(comment, @"
+            :pushpin: Perf builds for each rolled up PR:
+
+            | PR# | Message | Perf Build Sha |
+            |----|----|:-----:|
+            |#2|Title of PR 2|`merge-0-pr-2-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-0-pr-2-d7d45f1f-reauthored-to-handlebors))|
+            |#3|Title of PR 3|:x: conflicts merging into previous parent commit :x:|
+
+            *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
+
+            In the case of a perf regression, run the following command for each PR you suspect might be the cause: `@rust-timer build $SHA`
+            ");
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test]
     async fn unroll_workflow_failure(pool: sqlx::PgPool) {
         run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
             let pr2 = ctx.open_pr((), |_| {}).await?;
@@ -581,6 +772,79 @@ mod tests {
             | PR# | Message | Perf Build Sha |
             |----|----|:-----:|
             |#2|Title of PR 2|:x: build [failed](https://github.com/rust-lang/borstest/actions/runs/2) :x:|
+            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
+
+            *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
+
+            In the case of a perf regression, run the following command for each PR you suspect might be the cause: `@rust-timer build $SHA`
+            ");
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn unroll_circleci_workflow_failure(pool: sqlx::PgPool) {
+        run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            let pr3 = ctx.open_pr((), |_| {}).await?;
+            ctx.approve(pr2.id()).await?;
+            ctx.approve(pr3.id()).await?;
+
+            let rollup = make_merged_rollup(ctx, &[&pr2, &pr3]).await?;
+            ctx.run_unroll_queue().await?;
+
+            let workflows = ctx.unrolled_circleci_workflows(2);
+            ctx.circleci_workflow_full_failure(workflows[0]).await?;
+            ctx.circleci_workflow_full_success(workflows[1]).await?;
+            ctx.run_unroll_queue().await?;
+
+            let comment = ctx.get_next_comment_text(rollup).await?;
+            insta::assert_snapshot!(comment, @"
+            :pushpin: Perf builds for each rolled up PR:
+
+            | PR# | Message | Perf Build Sha |
+            |----|----|:-----:|
+            |#2|Title of PR 2|:x: build [failed](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :x:|
+            |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
+
+            *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)
+
+            In the case of a perf regression, run the following command for each PR you suspect might be the cause: `@rust-timer build $SHA`
+            ");
+            Ok(())
+        })
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn unroll_both_workflow_failure(pool: sqlx::PgPool) {
+        run_test((pool, rollup_state()), async |ctx: &mut BorsTester| {
+            let pr2 = ctx.open_pr((), |_| {}).await?;
+            let pr3 = ctx.open_pr((), |_| {}).await?;
+            ctx.approve(pr2.id()).await?;
+            ctx.approve(pr3.id()).await?;
+
+            let rollup = make_merged_rollup(ctx, &[&pr2, &pr3]).await?;
+            ctx.run_unroll_queue().await?;
+
+            let gha = ctx.unrolled_workflows(2);
+            let circleci = ctx.unrolled_circleci_workflows(2);
+
+            ctx.circleci_workflow_full_failure(circleci[0]).await?;
+            ctx.workflow_full_success(gha[0]).await?;
+            ctx.circleci_workflow_full_success(circleci[1]).await?;
+            ctx.workflow_full_success(gha[1]).await?;
+
+            ctx.run_unroll_queue().await?;
+
+            let comment = ctx.get_next_comment_text(rollup).await?;
+            insta::assert_snapshot!(comment, @"
+            :pushpin: Perf builds for each rolled up PR:
+
+            | PR# | Message | Perf Build Sha |
+            |----|----|:-----:|
+            |#2|Title of PR 2|:x: build [failed](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0) :x:|
             |#3|Title of PR 3|`merge-1-pr-3-d7d45f1f-reauthored-to-handlebors`<br>([link](https://github.com/rust-lang/borstest/commit/merge-1-pr-3-d7d45f1f-reauthored-to-handlebors))|
 
             *parent commit*: [main-sha1](https://github.com/rust-lang/borstest/commit/main-sha1)

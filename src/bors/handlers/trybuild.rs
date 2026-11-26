@@ -2,14 +2,12 @@ use std::sync::Arc;
 
 use super::has_permission;
 use super::{PullRequestData, deny_request};
-use crate::PgDbClient;
-use crate::bors::build::{CancelBuildConclusion, CancelBuildError, cancel_build};
+use crate::bors::build::{CancelBuildConclusion, CancelBuildResult, cancel_build};
 use crate::bors::build::{
     StartBuildCheckRun, StartBuildCommit, StartBuildContext, StartBuildError, StartBuildOutcome,
     start_build,
 };
 use crate::bors::command::{CommandPrefix, Parent};
-use crate::bors::comment::try_build_cancelled_with_failed_workflow_cancel_comment;
 use crate::bors::comment::{CommentTag, no_try_build_in_progress_comment};
 use crate::bors::comment::{
     cant_find_last_parent_comment, merge_attempt_merge_conflict_comment, try_build_started_comment,
@@ -22,6 +20,7 @@ use crate::bors::{
 use crate::database::{BuildModel, BuildStatus, ExclusiveOperationOutcome, PullRequestModel};
 use crate::github::{CommitSha, GithubUser, PullRequestNumber};
 use crate::permissions::PermissionType;
+use crate::{CircleCiClient, PgDbClient};
 use anyhow::Context;
 
 // This branch serves for preparing the final commit.
@@ -44,6 +43,7 @@ const MAX_TRY_JOBS_COUNT: usize = 20;
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn command_try_build(
     repo: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -90,8 +90,8 @@ pub(super) async fn command_try_build(
     let res = db
         .ensure_not_concurrent(BuildKind::Try, repo.repository(), async |proof| {
             // Try to cancel any previously running try build workflows
-            let cancelled_workflow_urls = if let Some(build) = get_pending_try_build(pr.db) {
-                let res = cancel_previous_try_build(repo, &db, build).await?;
+            let cancel_result = if let Some(build) = get_pending_try_build(pr.db) {
+                let res = cancel_previous_try_build(repo, circleci, &db, build).await?;
                 // Also try to hide previous "Try build started" comments that weren't hidden yet
                 if let Err(error) =
                     hide_tagged_comments(repo, &db, pr.db, CommentTag::TryBuildStarted).await
@@ -103,7 +103,7 @@ pub(super) async fn command_try_build(
 
                 res
             } else {
-                vec![]
+                CancelBuildResult::default()
             };
 
             let build_commit_result = start_build(
@@ -152,7 +152,7 @@ pub(super) async fn command_try_build(
                                 &pr.github.head.sha,
                                 &build_commit_sha,
                                 bot_prefix,
-                                cancelled_workflow_urls,
+                                cancel_result,
                             ),
                             &db,
                         )
@@ -183,25 +183,20 @@ pub(super) async fn command_try_build(
 /// Cancels a previously running try build and returns a list of cancelled workflow URLs.
 async fn cancel_previous_try_build(
     repo: &RepositoryState,
+    circleci: Option<&CircleCiClient>,
     db: &PgDbClient,
     build: &BuildModel,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<CancelBuildResult> {
     assert_eq!(build.status, BuildStatus::Pending);
 
-    match cancel_build(&repo.client, db, build, CancelBuildConclusion::Cancel).await {
-        Ok(workflows) => {
-            tracing::info!("Try build cancelled");
-            Ok(workflows.into_iter().map(|w| w.url).collect())
-        }
-        Err(CancelBuildError::FailedToMarkBuildAsCancelled(error)) => Err(error),
-        Err(CancelBuildError::FailedToCancelWorkflows(error)) => {
-            tracing::error!(
-                "Could not cancel workflows for SHA {}: {error:?}",
-                build.commit_sha
-            );
-            Ok(vec![])
-        }
-    }
+    cancel_build(
+        &repo.client,
+        circleci,
+        db,
+        build,
+        CancelBuildConclusion::Cancel,
+    )
+    .await
 }
 
 fn get_base_sha(pr_model: &PullRequestModel, parent: Option<Parent>) -> Option<CommitSha> {
@@ -221,6 +216,7 @@ fn get_base_sha(pr_model: &PullRequestModel, parent: Option<Parent>) -> Option<C
 
 pub(super) async fn command_try_cancel(
     repo: Arc<RepositoryState>,
+    circleci: Option<&CircleCiClient>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
@@ -240,42 +236,12 @@ pub(super) async fn command_try_cancel(
         return Ok(());
     };
 
-    match cancel_build(
-        &repo.client,
-        db.as_ref(),
-        build,
-        CancelBuildConclusion::Cancel,
-    )
-    .await
-    {
-        Ok(workflows) => {
-            tracing::info!("Try build cancelled");
+    let result = cancel_previous_try_build(repo, circleci, db.as_ref(), build).await?;
 
-            repo.client
-                .post_comment(
-                    pr_number,
-                    try_build_cancelled_comment(workflows.into_iter().map(|w| w.url)),
-                    &db,
-                )
-                .await?
-        }
-        Err(CancelBuildError::FailedToMarkBuildAsCancelled(error)) => {
-            return Err(error);
-        }
-        Err(CancelBuildError::FailedToCancelWorkflows(error)) => {
-            tracing::error!(
-                "Could not cancel workflows for try build with SHA {}: {error:?}",
-                build.commit_sha
-            );
-            repo.client
-                .post_comment(
-                    pr_number,
-                    try_build_cancelled_with_failed_workflow_cancel_comment(),
-                    &db,
-                )
-                .await?
-        }
-    };
+    tracing::info!("Try build cancelled");
+    repo.client
+        .post_comment(pr_number, try_build_cancelled_comment(result), &db)
+        .await?;
 
     Ok(())
 }
@@ -295,8 +261,8 @@ mod tests {
     use crate::database::operations::get_all_workflows;
     use crate::github::CommitSha;
     use crate::github::api::client::HideCommentReason;
-    use crate::tests::default_repo_name;
     use crate::tests::{BorsTester, Branch, Commit};
+    use crate::tests::{CheckRunEvent, default_repo_name};
     use crate::tests::{Comment, GitHub, User, WorkflowEvent, run_test};
     use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 
@@ -322,6 +288,27 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_try_success(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.circleci_workflow_full_success(ctx.circleci_try_workflow()).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @r#"
+            :sunny: Try build successful ([CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0))
+            Build commit: merge-0-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-0-pr-1-d7d45f1f-reauthored-to-handlebors`)
+            Base parent: main-sha1 (`main-sha1`)
+
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-0-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_failure(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
@@ -330,6 +317,21 @@ mod tests {
             insta::assert_snapshot!(
                 ctx.get_next_comment_text(()).await?,
                 @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [Workflow1](https://github.com/rust-lang/borstest/actions/runs/1)"
+            );
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn circleci_try_failure(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.circleci_workflow_full_failure(ctx.circleci_try_workflow()).await?;
+            insta::assert_snapshot!(
+                ctx.get_next_comment_text(()).await?,
+                @":broken_heart: Test for merge-0-pr-1-d7d45f1f-reauthored-to-handlebors failed: [CircleCI workflow](https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0)"
             );
             Ok(())
         })
@@ -671,6 +673,40 @@ try-job: Bar
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_merge_last_parent_circleci(pool: sqlx::PgPool) {
+        let gh = run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.modify_repo((), |repo| {
+                repo.add_branch(Branch::new(
+                    "test",
+                    Commit::new("ea9c1b050cc8b420c2c211d2177811e564a4dc60", "test"),
+                ));
+            });
+            ctx.post_comment("@bors try parent=ea9c1b050cc8b420c2c211d2177811e564a4dc60")
+                .await?;
+            ctx.expect_comments((), 1).await;
+            ctx.circleci_workflow_full_success(ctx.circleci_try_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+            ctx.post_comment("@bors try parent=last").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
+
+            To cancel the try build, run the command `@bors try cancel`.
+            ");
+            Ok(())
+        })
+        .await;
+        insta::assert_snapshot!(gh.get_sha_history(
+            (),
+            TRY_MERGE_BRANCH_NAME,
+        ), @"
+        ea9c1b050cc8b420c2c211d2177811e564a4dc60
+        merge-0-pr-1-d7d45f1f
+        ea9c1b050cc8b420c2c211d2177811e564a4dc60
+        merge-1-pr-1-d7d45f1f
+        ");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_merge_last_parent_unknown(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx
@@ -777,7 +813,7 @@ try-job: Bar
             To cancel the try build, run the command `@bors try cancel`.
             ");
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
-            Try build cancelled. Cancelled workflows:
+            Try build cancelled.
 
             **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
             ");
@@ -799,11 +835,34 @@ try-job: Bar
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
             :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
 
-            (The previously running try build was automatically cancelled.)
+            The previously running try build was automatically cancelled.
 
             To cancel the try build, run the command `@bors try cancel`.
             ");
             ctx.expect_cancelled_workflows((), &[run_id]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_cancel_previous_build_running_circleci_workflows(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let run_id = ctx.circleci_try_workflow();
+            ctx.circleci_workflow_start(run_id).await?;
+
+            ctx.post_comment("@bors try").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
+
+            The previously running try build was automatically cancelled.
+
+            To cancel the try build, run the command `@bors try cancel`.
+            ");
+            ctx.expect_cancelled_circleci_workflows((), &[run_id]);
             Ok(())
         })
         .await;
@@ -830,6 +889,37 @@ try-job: Bar
                 .await?;
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
             :sunny: Try build successful ([Workflow1](https://github.com/rust-lang/borstest/actions/runs/2))
+            Build commit: merge-1-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-1-pr-1-d7d45f1f-reauthored-to-handlebors`)
+            Base parent: main-sha1 (`main-sha1`)
+
+            <!-- homu: {"type":"TryBuildCompleted","merge_sha":"merge-1-pr-1-d7d45f1f-reauthored-to-handlebors"} -->
+            "#);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_again_after_circleci_checks_finish(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx
+                .circleci_workflow_full_success(ctx.circleci_try_workflow())
+                .await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.post_comment("@bors try").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :hourglass: Trying commit pr-1-sha with merge merge-1-pr-1-d7d45f1f-reauthored-to-handlebors…
+
+            To cancel the try build, run the command `@bors try cancel`.
+            ");
+            ctx
+                .circleci_workflow_full_success(ctx.circleci_try_workflow())
+                .await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"
+            :sunny: Try build successful ([CircleCI workflow](https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C))
             Build commit: merge-1-pr-1-d7d45f1f-reauthored-to-handlebors (`merge-1-pr-1-d7d45f1f-reauthored-to-handlebors`)
             Base parent: main-sha1 (`main-sha1`)
 
@@ -876,6 +966,31 @@ try-job: Bar
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_cancel_cancel_circleci_workflows(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.circleci_try_workflow();
+            let w2 = ctx.circleci_try_workflow();
+            ctx.circleci_workflow_event(CheckRunEvent::started(w1)).await?;
+            ctx.circleci_workflow_event(CheckRunEvent::started(w2)).await?;
+            ctx.post_comment("@bors try cancel").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Try build cancelled. Cancelled workflows:
+            - https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
+            - https://app.circleci.com/workflow/33581884-12F7-4BEB-9FE0-9BCE96258D3C
+
+            **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
+            ");
+            ctx.expect_cancelled_circleci_workflows((), &[w1, w2]);
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_cancel_error(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.modify_repo((), |repo| repo.workflow_cancel_error = true);
@@ -885,7 +1000,37 @@ try-job: Bar
                 .workflow_event(WorkflowEvent::started(ctx.try_workflow()))
                 .await?;
             ctx.post_comment("@bors try cancel").await?;
-            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"Try build was cancelled. It was not possible to cancel some workflows.");
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Try build cancelled.
+
+            :warning: Unable to cancel GitHub Actions workflows
+
+            **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
+            ");
+            ctx.pr(()).await.expect_try_build_cancelled();
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_cancel_circleci_error(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.modify_repo((), |repo| repo.workflow_cancel_error = true);
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx
+                .circleci_workflow_event(CheckRunEvent::started(ctx.circleci_try_workflow()))
+                .await?;
+            ctx.post_comment("@bors try cancel").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Try build cancelled.
+
+            :warning: Unable to cancel some CircleCI workflows
+
+            **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
+            ");
             ctx.pr(()).await.expect_try_build_cancelled();
 
             Ok(())
@@ -935,6 +1080,32 @@ try-job: Bar
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_cancel_ignore_finished_circleci_workflows(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            let w1 = ctx.circleci_try_workflow();
+            let w2 = ctx.circleci_try_workflow();
+            let w3 = ctx.circleci_try_workflow();
+
+            ctx.circleci_workflow_full_success(w1).await?;
+            ctx.circleci_workflow_full_success(w2).await?;
+            ctx.circleci_workflow_start(w3).await?;
+            ctx.post_comment("@bors try cancel").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            Try build cancelled. Cancelled workflows:
+            - https://app.circleci.com/workflow/FE87E745-F759-4724-903B-48BDC6FB090F
+
+            **Hint**: if you want to run another try build, you do not need to manually cancel the previous one. Just run `@bors try` and bors will cancel the previous build automatically.
+            ");
+            ctx.expect_cancelled_circleci_workflows((), &[w3]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_workflow_start_after_cancel(pool: sqlx::PgPool) {
         run_test(pool.clone(), async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
@@ -943,6 +1114,22 @@ try-job: Bar
             ctx.expect_comments((), 1).await;
 
             ctx.workflow_event(WorkflowEvent::started(ctx.try_workflow()))
+                .await?;
+            Ok(())
+        })
+        .await;
+        assert_eq!(get_all_workflows(&pool).await.unwrap().len(), 0);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_circleci_workflow_start_after_cancel(pool: sqlx::PgPool) {
+        run_test(pool.clone(), async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+            ctx.post_comment("@bors try cancel").await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.circleci_workflow_event(CheckRunEvent::started(ctx.circleci_try_workflow()))
                 .await?;
             Ok(())
         })
@@ -969,6 +1156,35 @@ try_failed = ["+foo", "+bar", "-baz"]
             ");
             ctx.pr(()).await.expect_added_labels(&[]);
             ctx.workflow_full_failure(ctx.try_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+            ctx.pr(())
+                .await
+                .expect_added_labels(&["foo", "bar"])
+                .expect_removed_labels(&["baz"]);
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_circleci_build_failed_modify_labels(pool: sqlx::PgPool) {
+        let gh = GitHub::default().append_to_default_config(
+            r#"
+[labels]
+try_failed = ["+foo", "+bar", "-baz"]
+"#,
+        );
+        run_test((pool, gh), async |ctx: &mut BorsTester| {
+            ctx.edit_pr((), |pr| pr.labels.push("baz".to_string()))
+                .await?;
+            ctx.post_comment("@bors try").await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
+
+            To cancel the try build, run the command `@bors try cancel`.
+            ");
+            ctx.pr(()).await.expect_added_labels(&[]);
+            ctx.circleci_workflow_full_failure(ctx.circleci_try_workflow()).await?;
             ctx.expect_comments((), 1).await;
             ctx.pr(())
                 .await
@@ -1021,12 +1237,58 @@ try_failed = ["+foo", "+bar", "-baz"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_build_updates_circleci_check_run_on_success(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.circleci_workflow_full_success(ctx.circleci_try_workflow())
+                .await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.expect_check_run(
+                &ctx.pr(()).await.get_gh_pr().head_sha(),
+                TRY_BUILD_CHECK_RUN_NAME,
+                "Bors try build",
+                CheckRunStatus::Completed,
+                Some(CheckRunConclusion::Success),
+            );
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn try_build_updates_check_run_on_failure(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
             ctx.expect_comments((), 1).await;
 
             ctx.workflow_full_failure(ctx.try_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.expect_check_run(
+                &ctx.pr(()).await.get_gh_pr().head_sha(),
+                TRY_BUILD_CHECK_RUN_NAME,
+                "Bors try build",
+                CheckRunStatus::Completed,
+                Some(CheckRunConclusion::Failure),
+            );
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn try_build_updates_check_run_on_circleci_failure(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            ctx.expect_comments((), 1).await;
+
+            ctx.circleci_workflow_full_failure(ctx.circleci_try_workflow())
+                .await?;
             ctx.expect_comments((), 1).await;
 
             ctx.expect_check_run(
@@ -1109,11 +1371,41 @@ try_failed = ["+foo", "+bar", "-baz"]
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn hide_try_build_started_comment_after_circleci_success(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            let comment = ctx.get_next_comment(()).await?;
+            ctx.circleci_workflow_full_success(ctx.circleci_try_workflow())
+                .await?;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_hidden_comment(&comment, HideCommentReason::Outdated);
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn hide_try_build_started_comment_after_failure(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment("@bors try").await?;
             let comment = ctx.get_next_comment(()).await?;
             ctx.workflow_full_failure(ctx.try_workflow()).await?;
+            ctx.expect_comments((), 1).await;
+            ctx.expect_hidden_comment(&comment, HideCommentReason::Outdated);
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn hide_try_build_started_comment_after_circleci_failure(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            let comment = ctx.get_next_comment(()).await?;
+            ctx.circleci_workflow_full_failure(ctx.circleci_try_workflow())
+                .await?;
             ctx.expect_comments((), 1).await;
             ctx.expect_hidden_comment(&comment, HideCommentReason::Outdated);
 
@@ -1156,6 +1448,31 @@ try_failed = ["+foo", "+bar", "-baz"]
             To cancel the try build, run the command `@bors try cancel`.
 
             **Workflow**: https://github.com/rust-lang/borstest/actions/runs/1
+            ");
+
+            Ok(())
+        })
+        .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn update_try_build_started_comment_after_circleci_workflow_starts(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment("@bors try").await?;
+            let comment = ctx.get_next_comment(()).await?;
+
+            ctx.circleci_workflow_start(ctx.circleci_try_workflow()).await?;
+
+            // Check that the comment text has been updated with a link to the started workflow
+            let updated_comment = ctx
+                .get_comment_by_node_id(&comment.node_id().unwrap())
+                .unwrap();
+            insta::assert_snapshot!(updated_comment.content(), @"
+            :hourglass: Trying commit pr-1-sha with merge merge-0-pr-1-d7d45f1f-reauthored-to-handlebors…
+
+            To cancel the try build, run the command `@bors try cancel`.
+
+            **Workflow**: https://app.circleci.com/workflow/14039835-E1C1-4BD6-A10D-DF2FB738F2A0
             ");
 
             Ok(())

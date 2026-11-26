@@ -1,4 +1,6 @@
 //! This module handles parsing webhooks and generating [`BorsEvent`]s from them.
+use std::time::Duration;
+
 use axum::RequestExt;
 use axum::body::Bytes;
 use axum::extract::FromRequest;
@@ -22,8 +24,9 @@ use crate::bors::event::{
     PullRequestUnassigned, PushToBranch, WorkflowJobCompleted, WorkflowJobStarted,
     WorkflowRunCompleted, WorkflowRunStarted,
 };
-use crate::database::{WorkflowStatus, WorkflowType};
-use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
+use crate::bors::{WorkflowRun, WorkflowRunId};
+use crate::database::WorkflowStatus;
+use crate::github::{CommitSha, ExtendedCheckRun, GithubRepoName, PullRequestNumber};
 use crate::server::ServerStateRef;
 
 /// Wrapper for a secret which is zeroed on drop and can be exposed only through the
@@ -67,6 +70,13 @@ struct WorkflowRunInner {
     check_suite_id: CheckSuiteId,
     #[serde(flatten)]
     run: workflows::Run,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct WebhookCheckRun<'a> {
+    action: &'a str,
+    check_run: ExtendedCheckRun,
+    repository: Repository,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -181,6 +191,7 @@ fn parse_webhook_event(request: Parts, body: &[u8]) -> anyhow::Result<Option<Bor
         ))),
         b"workflow_run" => parse_workflow_run_events(body),
         b"workflow_job" => parse_workflow_job_events(body),
+        b"check_run" => parse_check_run_events(body),
         _ => {
             tracing::debug!(
                 "Ignoring unknown webhook event type {:?}",
@@ -350,8 +361,7 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                 name: payload.workflow_run.run.name,
                 branch: payload.workflow_run.run.head_branch,
                 commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-                run_id: payload.workflow_run.run.id,
-                workflow_type: WorkflowType::Github,
+                id: WorkflowRunId::GitHub(payload.workflow_run.run.id),
                 url: payload.workflow_run.run.html_url.into(),
             },
         ))),
@@ -360,7 +370,11 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                 Some(payload.workflow_run.run.created_at),
                 Some(payload.workflow_run.run.updated_at),
             ) {
-                Some(completed_at - started_at)
+                Some(
+                    (completed_at - started_at)
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(0)),
+                )
             } else {
                 None
             };
@@ -369,7 +383,7 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
                     repository: repository_name,
                     branch: payload.workflow_run.run.head_branch,
                     commit_sha: CommitSha(payload.workflow_run.run.head_sha),
-                    run_id: payload.workflow_run.run.id,
+                    id: WorkflowRunId::GitHub(payload.workflow_run.run.id),
                     check_suite_id: payload.workflow_run.check_suite_id,
                     running_time,
                     status: match payload
@@ -388,6 +402,57 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
         _ => None,
     };
     Ok(result)
+}
+
+fn parse_check_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
+    let payload: WebhookCheckRun = serde_json::from_slice(body)?;
+    let repository = parse_repository_name(&payload.repository)?;
+
+    let workflow = match WorkflowRun::try_from(&payload.check_run) {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            tracing::warn!(
+                %repository,
+                payload.action,
+                %payload.check_run.id,
+                %payload.check_run.name,
+                %payload.check_run.check_suite.id,
+                "Ignoring non-workflow check-run event: {error:?}"
+            );
+            return Ok(None);
+        }
+    };
+
+    let event = match payload.action {
+        "created" => BorsRepositoryEvent::WorkflowStarted(WorkflowRunStarted {
+            repository,
+            name: workflow.name,
+            branch: payload
+                .check_run
+                .check_suite
+                .head_branch
+                .unwrap_or_default(),
+            commit_sha: payload.check_run.head_sha.into(),
+            id: workflow.id,
+            url: workflow.url,
+        }),
+        "completed" => BorsRepositoryEvent::WorkflowCompleted(WorkflowRunCompleted {
+            repository,
+            branch: payload
+                .check_run
+                .check_suite
+                .head_branch
+                .unwrap_or_default(),
+            commit_sha: payload.check_run.head_sha.into(),
+            id: workflow.id,
+            status: workflow.status,
+            running_time: workflow.duration,
+            check_suite_id: payload.check_run.check_suite.id,
+        }),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(BorsEvent::Repository(event)))
 }
 
 fn parse_workflow_job_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
@@ -1728,10 +1793,11 @@ mod tests {
                             commit_sha: CommitSha(
                                 "c9abcadf285659684c0975cead8bf982fa84e123",
                             ),
-                            run_id: RunId(
-                                4900979074,
+                            id: GitHub(
+                                RunId(
+                                    4900979074,
+                                ),
                             ),
-                            workflow_type: Github,
                             url: "https://github.com/Kobzol/bors-kindergarten/actions/runs/4900979074",
                         },
                     ),
@@ -1757,15 +1823,14 @@ mod tests {
                             commit_sha: CommitSha(
                                 "c9abcadf285659684c0975cead8bf982fa84e123",
                             ),
-                            run_id: RunId(
-                                4900979072,
+                            id: GitHub(
+                                RunId(
+                                    4900979072,
+                                ),
                             ),
                             status: Failure,
                             running_time: Some(
-                                TimeDelta {
-                                    secs: 13,
-                                    nanos: 0,
-                                },
+                                13s,
                             ),
                             check_suite_id: CheckSuiteId(
                                 12717696197,
@@ -1845,6 +1910,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn circleci_check_run_created() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/circleci-check-run-created.json", "check_run").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    WorkflowStarted(
+                        WorkflowRunStarted {
+                            repository: ferrous-systems-test/test,
+                            name: "a - e0125647",
+                            branch: "automation/bors/auto",
+                            commit_sha: CommitSha(
+                                "aa494bc0e9017d68437de2dc434217c8270d33f7",
+                            ),
+                            id: CircleCi(
+                                CircleCiWorkflowId(
+                                    "31250ea2-caeb-4068-9290-42e511a0582c",
+                                ),
+                            ),
+                            url: "https://app.circleci.com/workflow/31250ea2-caeb-4068-9290-42e511a0582c",
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
+        )
+    }
+
+    #[tokio::test]
+    async fn circleci_check_run_completed() {
+        insta::assert_debug_snapshot!(
+            check_webhook("webhook/circleci-check-run-completed.json", "check_run").await,
+            @r#"
+        Ok(
+            GitHubWebhook(
+                Repository(
+                    WorkflowCompleted(
+                        WorkflowRunCompleted {
+                            repository: ferrous-systems-test/test,
+                            branch: "automation/bors/auto",
+                            commit_sha: CommitSha(
+                                "aa494bc0e9017d68437de2dc434217c8270d33f7",
+                            ),
+                            id: CircleCi(
+                                CircleCiWorkflowId(
+                                    "31250ea2-caeb-4068-9290-42e511a0582c",
+                                ),
+                            ),
+                            status: Success,
+                            running_time: Some(
+                                7s,
+                            ),
+                            check_suite_id: CheckSuiteId(
+                                91516128170,
+                            ),
+                        },
+                    ),
+                ),
+            ),
+        )
+        "#
+        )
+    }
+
+    #[tokio::test]
     async fn unknown_event() {
         assert_eq!(
             check_webhook(
@@ -1878,6 +2010,7 @@ mod tests {
                 Arc::new(RepositoryStore::default()),
                 None,
                 "",
+                None,
                 None,
                 None,
             )),
