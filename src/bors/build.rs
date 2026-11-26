@@ -330,7 +330,7 @@ pub async fn start_build(
         .client
         .path_exists(".circleci", Some(build_commit_sha.clone()))
         .await
-        .map_err(|error| StartBuildError::GithubError(error.into()))?;
+        .map_err(StartBuildError::GithubError)?;
     tracing::debug!(
         repo = %repo.repository(),
         pr = %pr.number,
